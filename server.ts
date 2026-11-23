@@ -4,12 +4,27 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
-import { registerBlingRoutes, blingRouter, blingAuthInterceptorMiddleware, fetchFromBling, loadBlingTokens, ensureBlingAuthorized, refreshBlingToken } from './server-bling';
-import { registerMelhorEnvioRoutes, startMelhorEnvioAutoSync } from './server-melhor-envio';
-import { hasFirebaseAdminEnv, hasFirestoreBlingToken, getValidBlingToken as getFirestoreValidToken } from './lib/blingToken';
-import { syncAllBlingProdutosToFirestore } from './lib/blingSyncProdutos';
-import { BLING_STOCK_PRODUCTS, BLING_CATALOG_META } from './src/data/blingCatalog';
-import { filterVisibleProducts } from './src/lib/hiddenProducts';
+import {
+  registerBlingRoutes,
+  blingRouter,
+  blingAuthInterceptorMiddleware,
+  fetchFromBling,
+  loadBlingTokens,
+  ensureBlingAuthorized,
+  refreshBlingToken,
+} from './server-bling.js';
+import {
+  registerMelhorEnvioRoutes,
+  startMelhorEnvioAutoSync,
+} from './server-melhor-envio.js';
+import {
+  hasFirebaseAdminEnv,
+  hasFirestoreBlingToken,
+  getValidBlingToken as getFirestoreValidToken,
+} from './lib/blingToken.js';
+import { syncAllBlingProdutosToFirestore } from './lib/blingSyncProdutos.js';
+import { BLING_STOCK_PRODUCTS, BLING_CATALOG_META } from './src/data/blingCatalog.js';
+import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
 import {
   applyBlingImageOverrides,
   recordProductImage,
@@ -26,13 +41,13 @@ import {
   isThumbnailLikeUrl,
   isImageSyncRunning,
   setCatalogFetchInProgress,
-  getLastBlingImageSyncTime
-} from './server-bling-images';
+  getLastBlingImageSyncTime,
+} from './server-bling-images.js';
 import {
   createStoreOrder,
   trackStoreOrders,
-  requestStoreOrderReturn
-} from './server-orders';
+  requestStoreOrderReturn,
+} from './server-orders.js';
 
 dotenv.config({ override: !process.env.VERCEL });
 
