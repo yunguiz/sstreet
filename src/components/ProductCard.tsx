@@ -2,6 +2,7 @@ import React, { useState, useRef } from 'react';
 import { motion } from 'motion/react';
 import { Eye, Plus, Star, Crown } from 'lucide-react';
 import { Product } from '../types';
+import { ProductImage } from './ProductImage';
 
 interface ProductCardProps {
   product: Product;
@@ -80,10 +81,10 @@ export function ProductCard({
         onClick={() => onOpenDetails(product)}
         className="relative aspect-[4/3] sm:aspect-[1/1] w-full overflow-hidden bg-zinc-950 cursor-pointer"
       >
-        <img
+        <ProductImage
           src={product.images[0]}
+          candidates={product.images}
           alt={product.name}
-          referrerPolicy="no-referrer"
           className={`w-full h-full object-cover object-center group-hover:scale-108 transition-transform duration-500 ease-out ${
             isOutOfStock ? 'grayscale-[40%] contrast-90' : ''
           }`}

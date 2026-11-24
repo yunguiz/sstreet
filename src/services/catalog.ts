@@ -1,7 +1,8 @@
+import { collection, getDocs, query, where } from 'firebase/firestore';
 import { Product } from '../types';
-import { PRODUCTS as FALLBACK_PRODUCTS } from '../data/products';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
+import { db } from '../lib/firebase';
 
 export interface TrackedOrderProduct {
   name: string;
@@ -49,8 +50,103 @@ export interface ReturnRequestResult {
   error?: string;
 }
 
+function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Product | null {
+  const variacoesRaw =
+    data.variacoes && typeof data.variacoes === 'object' ? Object.values(data.variacoes) as any[] : [];
+  const variacoesStock = variacoesRaw.reduce((sum, v) => sum + Math.max(0, Number(v?.estoque || 0)), 0);
+  const directStock = Math.max(0, Number(data.estoque || 0));
+  const stockCount = variacoesRaw.length > 0 ? Math.max(variacoesStock, directStock) : directStock;
+  if (stockCount <= 0) return null;
+
+  const nome = String(data.nome || '').trim();
+  if (!nome) return null;
+
+  const preco = Number(data.preco || 0) > 0 ? Number(data.preco) : 119.9;
+  const rawImages = Array.isArray(data.imagens) ? data.imagens.filter((u: unknown) => typeof u === 'string' && u.length > 0) : [];
+  if (rawImages.length === 0 && typeof data.imagemURL === 'string' && data.imagemURL.trim()) {
+    rawImages.push(data.imagemURL.trim());
+  }
+
+  const variantsList = variacoesRaw.map((v: any) => ({
+    id: Number(v.blingId || v.id || 0),
+    sku: String(v.codigo || ''),
+    price: Number(v.preco || preco),
+    stock: Math.max(0, Number(v.estoque || 0)),
+    size: String(v.tamanho || 'Único'),
+  }));
+
+  const activeVariantSizes = Array.from(
+    new Set(variantsList.filter((v) => v.stock > 0 && v.size).map((v) => v.size))
+  );
+  const docSizes = Array.isArray(data.tamanhos) ? data.tamanhos.filter((s: unknown) => typeof s === 'string' && s.trim()) : [];
+  const sizes = activeVariantSizes.length > 0 ? activeVariantSizes : (docSizes.length > 0 ? docSizes : ['Tamanho Único']);
+
+  const docColors = Array.isArray(data.cores)
+    ? data.cores
+        .filter((c: unknown) => typeof c === 'string' && c.trim() && c !== 'Padrão')
+        .map((c: string) => ({ name: c, hex: '#1C1C1C' }))
+    : [];
+
+  const category = (data.categoriaStore === 'calcados' || data.categoriaStore === 'acessorios' || data.categoriaStore === 'roupas')
+    ? data.categoriaStore
+    : 'roupas';
+  const subcategory = data.subcategoriaStore || (category === 'calcados' ? 'sneakers' : category === 'acessorios' ? 'acessorios-metal' : 'camisetas');
+
+  return {
+    id: `bling-${data.blingId || docId}`,
+    name: nome,
+    category,
+    subcategory,
+    price: preco,
+    originalPrice: Math.round(preco * 1.3),
+    tag: stockCount <= 3 ? 'POUCAS UNIDADES' : null,
+    rating: 4.9,
+    reviewsCount: 24,
+    images: rawImages.length > 0 ? rawImages : ['/assets/streetstore-fallback.svg'],
+    sizes,
+    colors: docColors.length > 0 ? docColors : [{ name: 'Cor Única', hex: '#1C1C1C' }],
+    description: cleanDescription(String(data.descricao || `${nome} - Street Store Itabira`)),
+    stockCount,
+    details: {
+      composition: category === 'calcados' ? 'Solado em borracha vulcanizada de alta durabilidade' : '100% Algodão Premium Heavyweight',
+      weight: category === 'calcados' ? '900g o par' : '380g/m² Heavyweight',
+      modelInfo: 'Modelagem autêntica da marca',
+      origin: 'Itabira - MG // Fabricado no Brasil',
+    },
+    integration: {
+      sku: String(data.codigo || `BLING-${data.blingId || docId}`),
+      barcode: String(data.codigo || `789${docId}`),
+      blingId: String(data.blingId || docId),
+      weightGrams: 450,
+      dimensionsCm: { width: 28, height: 12, depth: 32 },
+    },
+    canonicalUrl: 'https://www.streetstore.com.br',
+    variantsList,
+  };
+}
+
+async function fetchProductsFromClientFirestore(): Promise<Product[]> {
+  try {
+    const q = query(collection(db, 'products'), where('ativo', '==', true));
+    const snap = await getDocs(q);
+    if (snap.empty) return [];
+
+    const parsed: Product[] = [];
+    snap.forEach((docSnap) => {
+      const mapped = mapFirestoreDocToProduct(docSnap.id, docSnap.data() as Record<string, any>);
+      if (mapped) parsed.push(mapped);
+    });
+
+    parsed.sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0));
+    return filterVisibleProducts<Product>(parsed);
+  } catch (err) {
+    console.warn('[Catalog] Aviso ao consultar Firestore direto:', err);
+    return [];
+  }
+}
+
 /**
- * Fetch live products from Bling ERP & official store catalog via backend proxy
+ * Fetch live products from Bling ERP / Firestore via backend proxy (with direct Firestore fallback)
  */
 export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
   products: Product[];
@@ -63,9 +159,10 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
   try {
     const url = forceRefresh
       ? `/api/catalog/products?refresh=true&_t=${Date.now()}`
-      : '/api/catalog/products';
+      : `/api/catalog/products?_t=${Date.now()}`;
 
     const res = await fetch(url, {
+      cache: 'no-store',
       headers: {
         'Accept': 'application/json'
       }
@@ -76,12 +173,45 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
     }
 
     const data = await res.json();
+    if (data.success && Array.isArray(data.products) && data.products.length > 0 && data.blingConnected !== false) {
+      const rawList: Product[] = data.products.map((p: Product) => ({
+        ...p,
+        description: cleanDescription(p.description),
+      }));
+      const sanitizedProducts = filterVisibleProducts<Product>(rawList).sort(
+        (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
+      );
+      return {
+        products: sanitizedProducts,
+        isLive: true,
+        blingConnected: Boolean(data.blingConnected),
+        blingCount: Number(data.blingCount || sanitizedProducts.length),
+        blingError: data.blingError || null,
+        statusText: `Catálogo Oficial Ativo (${sanitizedProducts.length} peças em estoque)`,
+      };
+    }
+
+    // Se API respondeu sem blingConnected=true, tenta ler diretamente da coleção products do Firestore
+    const firestoreLive = await fetchProductsFromClientFirestore();
+    if (firestoreLive.length > 0) {
+      return {
+        products: firestoreLive,
+        isLive: true,
+        blingConnected: true,
+        blingCount: firestoreLive.length,
+        blingError: data.blingError || null,
+        statusText: `Catálogo Oficial Firestore (${firestoreLive.length} peças em estoque)`,
+      };
+    }
+
     if (data.success && Array.isArray(data.products) && data.products.length > 0) {
       const rawList: Product[] = data.products.map((p: Product) => ({
         ...p,
         description: cleanDescription(p.description),
       }));
-      const sanitizedProducts = filterVisibleProducts<Product>(rawList);
+      const sanitizedProducts = filterVisibleProducts<Product>(rawList).sort(
+        (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
+      );
       return {
         products: sanitizedProducts,
         isLive: true,
@@ -93,22 +223,34 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
     }
 
     return {
-      products: filterVisibleProducts(FALLBACK_PRODUCTS),
+      products: [],
       isLive: false,
       blingConnected: false,
       blingCount: 0,
       blingError: data.blingError || null,
-      statusText: 'Catálogo de Drops Street Store Oficial',
+      statusText: 'Aguardando sincronização com Bling ERP',
     };
   } catch (error) {
-    console.warn('Usando catálogo local de reserva:', error);
+    console.warn('Tentando leitura direta no Firestore:', error);
+    const firestoreLive = await fetchProductsFromClientFirestore();
+    if (firestoreLive.length > 0) {
+      return {
+        products: firestoreLive,
+        isLive: true,
+        blingConnected: true,
+        blingCount: firestoreLive.length,
+        blingError: null,
+        statusText: `Catálogo Oficial Firestore (${firestoreLive.length} peças em estoque)`,
+      };
+    }
+
     return {
-      products: filterVisibleProducts(FALLBACK_PRODUCTS),
+      products: [],
       isLive: false,
       blingConnected: false,
       blingCount: 0,
       blingError: null,
-      statusText: 'Catálogo de Drops Street Store Oficial',
+      statusText: 'Aguardando sincronização com Bling ERP',
     };
   }
 }

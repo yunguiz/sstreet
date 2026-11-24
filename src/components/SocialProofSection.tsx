@@ -18,11 +18,14 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { REVIEWS as DEFAULT_REVIEWS, INSTAGRAM_POSTS } from '../data/reviews';
-import { CustomerReview } from '../types';
+import { CustomerReview, Product } from '../types';
 import { getCommunityReviews, submitCommunityReview, compressImageFile } from '../services/reviews';
-import { PRODUCTS } from '../data/products';
 
-export function SocialProofSection() {
+interface SocialProofSectionProps {
+  products?: Product[];
+}
+
+export function SocialProofSection({ products = [] }: SocialProofSectionProps) {
   const [onlyWithPhotos, setOnlyWithPhotos] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<string | null>(null);
@@ -603,7 +606,7 @@ export function SocialProofSection() {
                         {r.productName}
                       </option>
                     ))}
-                    {PRODUCTS.slice(0, 10).map((p) => (
+                    {products.slice(0, 15).map((p) => (
                       <option key={p.id} value={p.name} className="bg-[#181818] text-white">
                         {p.name}
                       </option>

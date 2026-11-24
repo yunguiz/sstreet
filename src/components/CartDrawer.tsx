@@ -39,6 +39,7 @@ import {
   ShippingOption
 } from '../services/shipping';
 import { CustomerProfile } from '../services/auth';
+import { ProductImage } from './ProductImage';
 
 interface CartDrawerProps {
   isOpen: boolean;
@@ -1040,8 +1041,9 @@ export function CartDrawer({
                     className="flex gap-3 p-3 bg-zinc-900/60 rounded-xl border border-zinc-800/80"
                   >
                     <div className="w-16 h-16 rounded-lg bg-zinc-950 border border-zinc-800 overflow-hidden shrink-0">
-                      <img
+                      <ProductImage
                         src={item.product.images[0]}
+                        candidates={item.product.images}
                         alt={item.product.name}
                         className="w-full h-full object-cover"
                       />

@@ -48,11 +48,21 @@ const COLOR_HEX_MAP: Record<string, string> = {
   amarelo: '#EAB308',
 };
 
-const FALLBACK_IMAGES_BY_CATEGORY: Record<ProductCategory, string[]> = {
-  calcados: ['/src/assets/images/product_sneaker_chunky_1793275501375.jpg'],
-  acessorios: ['/src/assets/images/product_cap_streetwear_1793275501370.jpg'],
-  roupas: ['/src/assets/images/product_hoodie_oversized_1793275501387.jpg'],
-};
+const DEFAULT_PRODUCT_IMAGE = '/assets/streetstore-fallback.svg';
+
+function getNumericBlingId(product: Product): number {
+  const raw = String(product.integration?.blingId || product.id || '').replace(/\D/g, '');
+  return parseInt(raw, 10) || 0;
+}
+
+function isLowResOrBrokenImage(url?: string): boolean {
+  const u = String(url || '').toLowerCase().trim();
+  if (!u) return true;
+  if (u.includes('/src/assets/')) return true;
+  if (u.includes('streetstore-fallback')) return true;
+  if (u.includes('/t/') || u.includes('/p/') || u.includes('miniatura')) return true;
+  return false;
+}
 
 function inferStoreCategoryAndSubcategory(
   rawCat: unknown,
@@ -121,10 +131,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
     rawImages.unshift(data.imagemURL.trim());
   }
 
-  const images =
-    rawImages.length > 0
-      ? rawImages
-      : FALLBACK_IMAGES_BY_CATEGORY[category] || ['/src/assets/images/product_hoodie_oversized_1793275501387.jpg'];
+  const images = rawImages.length > 0 ? rawImages : [DEFAULT_PRODUCT_IMAGE];
 
   const rawSizes = Array.isArray(data.tamanhos)
     ? data.tamanhos
@@ -191,7 +198,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
     subcategory,
     price,
     originalPrice,
-    tag: stockCount > 0 && stockCount <= 3 ? 'POUCAS UNIDADES' : 'NOVO DROP',
+    tag: stockCount > 0 && stockCount <= 3 ? 'POUCAS UNIDADES' : null,
     rating: Number((4.8 + (numericIdSeed % 3) / 10).toFixed(1)),
     reviewsCount: 14 + (numericIdSeed % 35),
     images,
@@ -258,7 +265,12 @@ export function CatalogSection({
           if (data?.ativo === false) return;
           mapped.push(mapFirestoreDocToProduct(docSnap.id, data));
         });
-        setFirestoreProducts(filterVisibleProducts<Product>(mapped));
+        mapped.sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
+        const visibleSorted = filterVisibleProducts<Product>(mapped).map((p, idx) => ({
+          ...p,
+          tag: p.tag || (idx < 16 ? 'NOVO DROP' : null),
+        }));
+        setFirestoreProducts(visibleSorted);
         setIsLoadingFirestore(false);
       },
       (error) => {
@@ -274,13 +286,34 @@ export function CatalogSection({
     return () => unsubscribe();
   }, []);
 
-  // Prefer live Firestore products when synced; fall back to API products if richer or Firestore is empty
-  const catalogSourceProducts =
-    firestoreProducts.length > 0 && firestoreProducts.length >= products.length
-      ? firestoreProducts
-      : products.length > 0
+  // Merge API & Firestore products so newest drops and highest-resolution images always win
+  const catalogSourceProducts = useMemo(() => {
+    const apiByBlingId = new Map<string, Product>();
+    for (const ap of products) {
+      const bid = String(ap.integration?.blingId || ap.id || '').replace(/^bling-/, '');
+      if (bid) apiByBlingId.set(bid, ap);
+    }
+
+    const baseList =
+      products.length > 0 && products.length >= firestoreProducts.length
         ? products
-        : firestoreProducts;
+        : firestoreProducts.length > 0
+          ? firestoreProducts.map((fp) => {
+              const bid = String(fp.integration?.blingId || fp.id || '').replace(/^bling-/, '');
+              const apiMatch = bid ? apiByBlingId.get(bid) : undefined;
+              if (apiMatch && apiMatch.images?.length > 0) {
+                const fpHasGood = fp.images?.some((u) => !isLowResOrBrokenImage(u));
+                const apiHasGood = apiMatch.images?.some((u) => !isLowResOrBrokenImage(u));
+                if (!fpHasGood && apiHasGood) {
+                  return { ...fp, images: apiMatch.images };
+                }
+              }
+              return fp;
+            })
+          : products;
+
+    return [...baseList].sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
+  }, [products, firestoreProducts]);
 
   // Reset pagination whenever user changes category, subcategory, brand, or sort
   useEffect(() => {
@@ -327,13 +360,15 @@ export function CatalogSection({
       }
     }
 
-    // Sort by selected option
+    // Sort by selected option (default: newest registered Bling products first)
     if (sortBy === 'price-asc') {
       list.sort((a, b) => a.price - b.price);
     } else if (sortBy === 'price-desc') {
       list.sort((a, b) => b.price - a.price);
     } else if (sortBy === 'rating') {
       list.sort((a, b) => b.rating - a.rating);
+    } else {
+      list.sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
     }
 
     return list;
@@ -401,7 +436,7 @@ export function CatalogSection({
                 className="bg-transparent text-zinc-200 focus:outline-none cursor-pointer font-semibold text-xs pr-1"
                 aria-label="Ordenar produtos"
               >
-                <option value="relevance" className="bg-zinc-900 text-white">Mais Populares</option>
+                <option value="relevance" className="bg-zinc-900 text-white">Mais Recentes (Últimos Drops)</option>
                 <option value="price-asc" className="bg-zinc-900 text-white">Menor Preço</option>
                 <option value="price-desc" className="bg-zinc-900 text-white">Maior Preço</option>
                 <option value="rating" className="bg-zinc-900 text-white">Melhor Avaliados</option>

@@ -1,921 +1,1501 @@
+import express, { Request, Response, NextFunction } from 'express';
+import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { ensureBlingAuthorized, fetchFromBling } from './server-bling.js';
-import type { Product } from './src/types/index.js';
+import { isProductHidden } from './src/lib/hiddenProducts.js';
+import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images.js';
+import {
+  getBlingTokenFromDb,
+  upsertBlingTokenInDb,
+  clearBlingTokenFromDb,
+  BLING_ACCESS_TTL_MS
+} from './server-bling-db.js';
+import {
+  BLING_AUTHORIZE_URL,
+  BLING_TOKEN_ENDPOINT,
+  BLING_TOKEN_FALLBACK_ENDPOINT,
+  BLING_OFFICIAL_API_BASE,
+  BLING_API_BASE,
+  getValidBlingToken as getFirestoreBlingToken,
+  hasFirebaseAdminEnv,
+  hasFirestoreBlingToken,
+  getBlingTokenStatusFromFirestore,
+  saveBlingTokensToFirestore,
+  refreshBlingTokenInFirestore,
+  isBlingTokenExpiringOrExpired,
+  acquireBlingRateLimitSlot,
+} from './lib/blingToken.js';
+import {
+  syncAllBlingProdutosToFirestore,
+  syncBlingProdutosPageToFirestore,
+  verifySyncSecret,
+} from './lib/blingSyncProdutos.js';
 
-const BUNDLED_IMAGES_STORE_FILE = path.resolve(process.cwd(), '.bling_product_images.json');
-const IMAGES_STORE_FILE = process.env.VERCEL
-  ? path.resolve('/tmp', '.bling_product_images.json')
-  : BUNDLED_IMAGES_STORE_FILE;
+dotenv.config({ override: !process.env.VERCEL });
 
-const IMAGE_STORE_VERSION = 3;
+export const BLING_AUTH_BASE = BLING_AUTHORIZE_URL;
+export const BLING_TOKEN_URL = BLING_TOKEN_ENDPOINT;
+export const BLING_TOKEN_FALLBACK_URL = BLING_TOKEN_FALLBACK_ENDPOINT;
+export { BLING_OFFICIAL_API_BASE, BLING_API_BASE };
+const TEN_MINUTES_MS = 10 * 60 * 1000;
 
-export interface BlingImageStore {
-  version?: number;
-  updatedAt: string;
-  bySku: Record<string, string[]>;
-  byName: Record<string, string[]>;
-  byId: Record<string, string[]>;
+const DATA_DIR = process.env.VERCEL ? '/tmp' : process.cwd();
+const TOKENS_FILE = path.resolve(DATA_DIR, '.bling_tokens.json');
+
+export const blingRouter = express.Router();
+
+export interface BlingTokens {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+  expires_at?: number; // UTC timestamp in ms
+  token_type?: string;
+  scope?: string;
+  obtained_at: number; // timestamp in ms
 }
 
-let cachedImageStore: BlingImageStore | null = null;
-let lastSyncCompletedAt = 0;
+// In-memory cache + single-flight refresh lock (prevents race condition on single-use refresh_token)
+let cachedTokens: BlingTokens | null = null;
+let activeRefreshPromise: Promise<BlingTokens> | null = null;
 
-export function getLastBlingImageSyncTime(): number {
-  return lastSyncCompletedAt;
+// Read tokens from bling_tokens SQLite table (with automatic env/file bootstrap)
+export function loadBlingTokens(): BlingTokens | null {
+  const dbRow = getBlingTokenFromDb();
+  if (dbRow && (dbRow.access_token || dbRow.refresh_token)) {
+    const cleanAccess = String(dbRow.access_token || '').trim();
+    const cleanRefresh = String(dbRow.refresh_token || '').trim();
+    // Ignora/limpa registros locais corrompidos ou inválidos (< 16 chars)
+    if ((cleanAccess && cleanAccess.length < 16) || (cleanRefresh && cleanRefresh.length < 16)) {
+      clearBlingTokens();
+      return null;
+    }
+    cachedTokens = {
+      access_token: cleanAccess,
+      refresh_token: cleanRefresh || undefined,
+      expires_in: dbRow.expires_in || 21600,
+      expires_at: dbRow.expires_at,
+      token_type: dbRow.token_type || 'Bearer',
+      scope: dbRow.scope || '',
+      obtained_at: dbRow.obtained_at
+    };
+    return cachedTokens;
+  }
+
+  return cachedTokens;
 }
 
-function isManualLocalUpload(url: string): boolean {
-  const u = (url || '').trim();
-  return u.startsWith('/assets/uploads/') || u.startsWith('/assets/aistudio/');
+// Save/overwrite access_token, refresh_token & expires_at atomically in bling_tokens DB + JSON backup
+export function saveBlingTokens(tokens: BlingTokens): void {
+  const obtainedAt = tokens.obtained_at || Date.now();
+  const expiresInSec = Number(tokens.expires_in) || 21600;
+  const expiresAt = tokens.expires_at ?? (obtainedAt + (tokens.access_token ? expiresInSec * 1000 : 0));
+
+  const stored = upsertBlingTokenInDb({
+    access_token: tokens.access_token,
+    refresh_token: tokens.refresh_token || '',
+    expires_at: expiresAt,
+    expires_in: expiresInSec,
+    token_type: tokens.token_type || 'Bearer',
+    scope: tokens.scope || '',
+    obtained_at: obtainedAt
+  });
+
+  cachedTokens = {
+    access_token: stored.access_token,
+    refresh_token: stored.refresh_token || undefined,
+    expires_in: stored.expires_in,
+    expires_at: stored.expires_at,
+    token_type: stored.token_type,
+    scope: stored.scope,
+    obtained_at: stored.obtained_at
+  };
+
+  try {
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(cachedTokens, null, 2), 'utf-8');
+    console.log(`[Bling DB] Tokens salvos/sobrescritos em bling_tokens (expira em ${stored.expires_at_iso}).`);
+  } catch (err) {
+    console.error('[Bling] Could not mirror tokens to disk:', err);
+  }
+}
+
+// Clear tokens from bling_tokens DB & cache
+export function clearBlingTokens(): void {
+  cachedTokens = null;
+  clearBlingTokenFromDb();
+  try {
+    if (fs.existsSync(TOKENS_FILE)) {
+      fs.unlinkSync(TOKENS_FILE);
+    }
+  } catch (err) {
+    console.warn('[Bling] Could not delete token file:', err);
+  }
+}
+
+function getClientCredentials(requireSecret: boolean = false) {
+  const clientId = (process.env.BLING_CLIENT_ID || '').trim();
+  const clientSecret = (process.env.BLING_CLIENT_SECRET || '').trim();
+  const state = (process.env.BLING_STATE || '').trim();
+  if (requireSecret && (!clientId || !clientSecret)) {
+    throw new Error('Credenciais BLING_CLIENT_ID e BLING_CLIENT_SECRET não configuradas em process.env.');
+  }
+  return { clientId, clientSecret, state };
 }
 
 /**
- * Clears the cached Bling image store (preserving manual local file uploads by default)
- * and resets sync timestamp so original high-res images are re-fetched cleanly.
+ * Exchange Authorization Code for Access & Refresh Tokens
  */
-export function clearImageCache(preserveManualUploads: boolean = true): BlingImageStore {
-  const prev = cachedImageStore || (() => {
-    try {
-      if (fs.existsSync(IMAGES_STORE_FILE)) {
-        return JSON.parse(fs.readFileSync(IMAGES_STORE_FILE, 'utf-8'));
-      }
-    } catch {
-      // ignore
-    }
-    return null;
-  })();
+export async function exchangeCodeForTokens(code: string, redirectUri?: string): Promise<BlingTokens> {
+  const { clientId, clientSecret } = getClientCredentials(true);
+  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
-  const fresh: BlingImageStore = {
-    version: IMAGE_STORE_VERSION,
-    updatedAt: new Date().toISOString(),
-    bySku: {},
-    byName: {},
-    byId: {}
+  const bodyParams = new URLSearchParams();
+  bodyParams.append('grant_type', 'authorization_code');
+  bodyParams.append('code', code.trim());
+  if (redirectUri) {
+    bodyParams.append('redirect_uri', redirectUri);
+  }
+
+  console.log(`[Bling] Exchanging code for token with client_id: ${clientId}`);
+
+  let res = await fetch(BLING_TOKEN_URL, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${basicAuth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': 'application/json',
+      'User-Agent': 'StreetStore/1.0'
+    },
+    body: bodyParams.toString()
+  });
+
+  if (res.status === 403) {
+    res = await fetch(BLING_TOKEN_FALLBACK_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'User-Agent': 'StreetStore/1.0'
+      },
+      body: bodyParams.toString()
+    });
+  }
+
+  const responseText = await res.text();
+  let json: any;
+  try {
+    json = JSON.parse(responseText);
+  } catch {
+    throw new Error(`Bling token endpoint returned non-JSON [${res.status}]: ${responseText}`);
+  }
+
+  if (!res.ok || json.error) {
+    console.error('[Bling Token Error]:', JSON.stringify(json));
+    const errDesc = json.error?.message || json.error_description || json.error || responseText;
+    throw new Error(`Erro Bling OAuth: ${errDesc}`);
+  }
+
+  const obtainedAt = Date.now();
+  const expiresInSec = Number(json.expires_in) || 21600; // 6 hours
+  const expiresAt = obtainedAt + (json.expires_in ? expiresInSec * 1000 : BLING_ACCESS_TTL_MS);
+
+  const tokenData: BlingTokens = {
+    access_token: json.access_token,
+    refresh_token: json.refresh_token,
+    expires_in: expiresInSec,
+    expires_at: expiresAt,
+    token_type: json.token_type || 'Bearer',
+    scope: json.scope || '',
+    obtained_at: obtainedAt
   };
 
-  if (preserveManualUploads && prev) {
-    for (const bucket of ['bySku', 'byName', 'byId'] as const) {
-      const src = prev[bucket] || {};
-      for (const [k, urls] of Object.entries(src)) {
-        if (Array.isArray(urls)) {
-          const kept = urls.filter((u) => typeof u === 'string' && isManualLocalUpload(u));
-          if (kept.length > 0) fresh[bucket][k] = kept;
+  saveBlingTokens(tokenData);
+
+  if (hasFirebaseAdminEnv()) {
+    await saveBlingTokensToFirestore({
+      access_token: tokenData.access_token,
+      refresh_token: tokenData.refresh_token || '',
+      expires_in: tokenData.expires_in,
+      token_type: tokenData.token_type,
+      scope: tokenData.scope,
+    }).catch((err) => {
+      console.warn('[Bling] Aviso ao espelhar tokens no Firestore:', err?.message || err);
+    });
+  }
+
+  return tokenData;
+}
+
+/**
+ * Refresh access_token using rolling refresh_token (single-flight lock prevents parallel race conditions).
+ * Overwrites BOTH access_token & refresh_token and sets new expires_at = now + 6 hours in bling_tokens.
+ */
+export async function refreshBlingToken(options?: {
+  force?: boolean;
+  failedAccessToken?: string;
+}): Promise<BlingTokens> {
+  if (activeRefreshPromise) {
+    return activeRefreshPromise;
+  }
+
+  if (hasFirebaseAdminEnv()) {
+    const fsStatus = await getBlingTokenStatusFromFirestore();
+    if (fsStatus?.refresh_token) {
+      const freshAccess = await refreshBlingTokenInFirestore(fsStatus.refresh_token, options);
+      const updatedFs = await getBlingTokenStatusFromFirestore();
+      const mirrored: BlingTokens = {
+        access_token: freshAccess,
+        refresh_token: updatedFs?.refresh_token || fsStatus.refresh_token,
+        expires_in: updatedFs?.expires_in || 21600,
+        expires_at: updatedFs?.expires_at || Date.now() + BLING_ACCESS_TTL_MS,
+        token_type: updatedFs?.token_type || 'Bearer',
+        scope: updatedFs?.scope || '',
+        obtained_at: updatedFs?.obtained_at || Date.now(),
+      };
+      saveBlingTokens(mirrored);
+      return mirrored;
+    }
+  }
+
+  activeRefreshPromise = (async () => {
+    const tokens = loadBlingTokens();
+    if (!tokens?.refresh_token) {
+      throw new Error('Nenhum refresh_token disponível no banco para renovar sessão do Bling.');
+    }
+
+    const { clientId, clientSecret } = getClientCredentials(true);
+    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+
+    const bodyParams = new URLSearchParams();
+    bodyParams.append('grant_type', 'refresh_token');
+    bodyParams.append('refresh_token', tokens.refresh_token);
+
+    console.log('[Bling] Renovando par de tokens (access_token + refresh_token) via OAuth v3...');
+
+    let res = await fetch(BLING_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${basicAuth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json',
+        'User-Agent': 'StreetStore/1.0'
+      },
+      body: bodyParams.toString()
+    });
+
+    if (res.status === 403) {
+      res = await fetch(BLING_TOKEN_FALLBACK_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${basicAuth}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Accept': 'application/json',
+          'User-Agent': 'StreetStore/1.0'
+        },
+        body: bodyParams.toString()
+      });
+    }
+
+    const responseText = await res.text();
+    let json: any;
+    try {
+      json = JSON.parse(responseText);
+    } catch {
+      throw new Error(`Bling refresh endpoint returned non-JSON [${res.status}]: ${responseText}`);
+    }
+
+    if (!res.ok || json.error || !json.access_token) {
+      const errorMsg = json.error?.message || json.error_description || json.error || responseText;
+      const isInvalidGrant = String(errorMsg).includes('invalid_grant') || String(responseText).includes('invalid_grant');
+
+      if (isInvalidGrant) {
+        console.warn('[Bling] Refresh token inválido ou expirado (invalid_grant). Limpando registro de bling_tokens.');
+        clearBlingTokens();
+      }
+      throw new Error(`Erro ao renovar token Bling: ${errorMsg}`);
+    }
+
+    const now = Date.now();
+    const expiresInSec = Number(json.expires_in) || 21600; // 6 hours
+    const expiresAt = now + (json.expires_in ? expiresInSec * 1000 : BLING_ACCESS_TTL_MS);
+
+    // CRITICAL BLING v3 RULE: Overwrite BOTH access_token and the new refresh_token + expires_at (now + 6h)
+    const newTokens: BlingTokens = {
+      access_token: json.access_token,
+      refresh_token: json.refresh_token || tokens.refresh_token,
+      expires_in: expiresInSec,
+      expires_at: expiresAt,
+      token_type: json.token_type || 'Bearer',
+      scope: json.scope || tokens.scope,
+      obtained_at: now
+    };
+
+    saveBlingTokens(newTokens);
+    return newTokens;
+  })().finally(() => {
+    activeRefreshPromise = null;
+  });
+
+  return activeRefreshPromise;
+}
+
+/**
+ * Função Automática (getValidBlingToken):
+ * Busca o token no banco (bling_tokens). Se faltar menos de 10 minutos para o expires_at
+ * (ou se já venceu), renova automaticamente antes de retornar o access_token.
+ */
+export async function getValidBlingToken(): Promise<string> {
+  if (hasFirebaseAdminEnv()) {
+    return getFirestoreBlingToken();
+  }
+
+  const tokens = loadBlingTokens();
+  if (!tokens || (!tokens.access_token && !tokens.refresh_token)) {
+    throw new Error('Bling ERP não conectado. Realize a autorização inicial via OAuth (/bling/callback).');
+  }
+
+  const expiresAtMs =
+    tokens.expires_at !== undefined
+      ? tokens.expires_at
+      : tokens.obtained_at + (tokens.expires_in || 21600) * 1000;
+
+  const needsRefresh = isBlingTokenExpiringOrExpired(tokens.access_token, expiresAtMs, TEN_MINUTES_MS);
+
+  if (needsRefresh) {
+    if (tokens.refresh_token) {
+      try {
+        const refreshed = await refreshBlingToken();
+        return refreshed.access_token;
+      } catch (err: any) {
+        const isInvalidGrant = String(err?.message || '').includes('invalid_grant');
+        if (isInvalidGrant || !tokens.access_token || expiresAtMs <= Date.now()) {
+          throw new Error(err?.message || 'Sessão do Bling expirada (invalid_grant).');
+        }
+        console.warn('[Bling] Aviso ao renovar antecipadamente (<10min):', err?.message || err);
+        return tokens.access_token;
+      }
+    } else {
+      clearBlingTokens();
+      throw new Error('Sessão do Bling expirada sem refresh_token.');
+    }
+  }
+
+  return tokens.access_token;
+}
+
+export const getValidAccessToken = getValidBlingToken;
+
+export interface BlingAuthorizedRequest extends Request {
+  blingAccessToken?: string;
+}
+
+/**
+ * Middleware de Interrupção Express para requisições à API v3 do Bling e rotas de sincronização:
+ * Verifica a validade (expiração) do access_token e usa o refresh_token para renovar
+ * as credenciais de forma transparente ANTES de qualquer chamada de sincronização.
+ */
+export function createBlingAuthMiddleware(options?: { allowLocalFallback?: boolean }) {
+  return async function blingAuthMiddleware(req: Request, res: Response, next: NextFunction) {
+    if (req.query.verify === 'true') {
+      return next();
+    }
+
+    try {
+      const validToken = await getValidBlingToken();
+      (req as BlingAuthorizedRequest).blingAccessToken = validToken;
+      res.locals.blingToken = validToken;
+      return next();
+    } catch (err: any) {
+      const message = err instanceof Error ? err.message : String(err);
+
+      if (options?.allowLocalFallback) {
+        const hasLocal = Boolean(loadBlingTokens()?.access_token || loadBlingTokens()?.refresh_token);
+        const hasRemote = hasFirebaseAdminEnv() ? await hasFirestoreBlingToken() : false;
+        if (!hasLocal && !hasRemote) {
+          return next();
         }
       }
+
+      const isPendingAuth =
+        message.includes('não encontrado') ||
+        message.includes('não conectado') ||
+        message.includes('sem refresh_token');
+
+      console.warn('[Bling Middleware Interruption]:', message);
+      return res.status(401).json({
+        success: false,
+        ok: false,
+        tokenInvalid: true,
+        pendingAuth: isPendingAuth,
+        error: message || 'Token do Bling expirado ou inválido. Reconecte via OAuth.',
+      });
     }
-  }
-
-  lastSyncCompletedAt = 0;
-  saveImageStore(fresh);
-  console.log('[Bling Images] Image cache cleared cleanly (high-res schema v2).');
-  return fresh;
-}
-
-export function loadImageStore(): BlingImageStore {
-  if (cachedImageStore && cachedImageStore.version === IMAGE_STORE_VERSION) {
-    return cachedImageStore;
-  }
-  try {
-    const sourceFile = fs.existsSync(IMAGES_STORE_FILE)
-      ? IMAGES_STORE_FILE
-      : (fs.existsSync(BUNDLED_IMAGES_STORE_FILE) ? BUNDLED_IMAGES_STORE_FILE : null);
-    if (sourceFile) {
-      const raw = fs.readFileSync(sourceFile, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (parsed.version !== IMAGE_STORE_VERSION) {
-        return clearImageCache(true);
-      }
-      cachedImageStore = {
-        version: parsed.version,
-        updatedAt: parsed.updatedAt || new Date().toISOString(),
-        bySku: parsed.bySku || {},
-        byName: parsed.byName || {},
-        byId: parsed.byId || {}
-      };
-      return cachedImageStore;
-    }
-  } catch (err) {
-    console.warn('[Bling Images] Could not read image store file:', err);
-  }
-
-  cachedImageStore = {
-    version: IMAGE_STORE_VERSION,
-    updatedAt: new Date().toISOString(),
-    bySku: {},
-    byName: {},
-    byId: {}
   };
-  return cachedImageStore;
 }
 
-export function saveImageStore(store: BlingImageStore): void {
-  store.version = IMAGE_STORE_VERSION;
-  cachedImageStore = store;
-  store.updatedAt = new Date().toISOString();
+export const blingAuthInterceptorMiddleware = createBlingAuthMiddleware();
+
+/**
+ * Automatically ensures Bling OAuth session is valid/refreshed in background (without any manual click).
+ * When verifyLive is true, confirms token acceptance against Bling API v3 (cached 30s).
+ */
+export async function ensureBlingAuthorized(options?: { verifyLive?: boolean }): Promise<boolean> {
+  const hasLocal = Boolean(loadBlingTokens());
+  const hasRemote = hasFirebaseAdminEnv() ? await hasFirestoreBlingToken() : false;
+  if (!hasLocal && !hasRemote) return false;
   try {
-    fs.writeFileSync(IMAGES_STORE_FILE, JSON.stringify(store, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[Bling Images] Could not save image store file:', err);
-  }
-}
+    const token = await getValidBlingToken();
+    if (!token) return false;
 
-export function isLegacyExternalUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return false;
-  const u = url.toLowerCase();
-  return u.includes('mitiendanube.com') || u.includes('tiendanube.com');
-}
+    if (options?.verifyLive) {
+      if (
+        lastVerifiedAuth &&
+        lastVerifiedAuth.token === token &&
+        Date.now() - lastVerifiedAuth.checkedAt < 30 * 1000
+      ) {
+        return lastVerifiedAuth.valid;
+      }
+      await fetchFromBling('/produtos?pagina=1&limite=1');
+    } else if (
+      lastVerifiedAuth &&
+      lastVerifiedAuth.token === token &&
+      !lastVerifiedAuth.valid &&
+      Date.now() - lastVerifiedAuth.checkedAt < 30 * 1000
+    ) {
+      return false;
+    }
 
-export function isPlaceholderImageUrl(url?: string): boolean {
-  if (!url || typeof url !== 'string') return true;
-  const u = url.trim().toLowerCase();
-  if (!u) return true;
-  if (u.includes('unsplash.com')) return true;
-  if (
-    u.startsWith('/src/assets/images/product_') ||
-    u.startsWith('/src/assets/images/lookview_') ||
-    u.startsWith('/src/assets/images/hero_')
-  ) {
     return true;
+  } catch (err: any) {
+    console.warn('[Bling Auto-Auth] Sessão do Bling indisponível ou expirada:', err?.message || err);
+    return false;
   }
-  return false;
+}
+
+// Track last verified status so /api/bling/status can confirm live token health without spamming Bling
+let lastVerifiedAuth: {
+  token: string;
+  valid: boolean;
+  error?: string;
+  checkedAt: number;
+} | null = null;
+
+export function clearBlingAuthCache(): void {
+  lastVerifiedAuth = null;
 }
 
 /**
- * Normalizes product name for robust matching (e.g. "TENIS TESLA HERTZ BLACK:39" -> "tenis tesla hertz black")
+ * Fetch authenticated resource from Bling v3 API (com interceptor pré-requisição + retry pós-401)
  */
-export function normalizeProductName(name: string): string {
-  let n = (name || '').toLowerCase().trim();
-  if (n.includes(':')) n = n.split(':')[0].trim();
-  if (n.includes(' // ')) n = n.split(' // ')[0].trim();
-  n = n.replace(/\s+-\s+(pp|p|m|g|gg|xg|xgg|g1|g2|g3|g4|\d{2})$/i, '').trim();
-  return n.replace(/\s+/g, ' ');
-}
+export async function fetchFromBling(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
+  const token = await getValidAccessToken();
+  const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
 
-const RESIZE_QUERY_PARAMS = new Set([
-  'w', 'h', 'width', 'height', 'max-w', 'max-h', 'maxwidth', 'maxheight',
-  'size', 'resize', 'quality', 'q', 'auto', 'fit', 'crop', 'dpr',
-  'compress', 'compression', 'format', 'fm', 'fl', 'scale',
-  'thumb', 'thumbnail', 'mini', 'miniatura', 'mode', 'blur', 'pixel', 'opt', 'optimize'
-]);
+  await acquireBlingRateLimitSlot();
 
-/**
- * Strips resize/compression query parameters and filename suffixes from external image URLs
- * while preserving signed URL tokens/auth params (X-Amz-*, Signature, Expires, Policy, etc.).
- */
-export function stripResizeAndCompressionParams(rawUrl: string): string {
-  const trimmed = (rawUrl || '').trim();
-  if (!trimmed || trimmed.startsWith('data:image') || trimmed.startsWith('/')) {
-    return trimmed;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'StreetStore/1.0',
+      ...(options.headers || {})
+    }
+  });
+
+  if (res.status === 429 && retryCount < 4) {
+    const retryAfterSec = Number(res.headers.get('retry-after') || '0');
+    const waitMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(8000, retryAfterSec * 1000)
+        : 1000 * (retryCount + 1);
+    console.warn(`[Bling] 429 Rate Limit em ${endpoint}. Aguardando ${waitMs}ms antes de tentar novamente...`);
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    return fetchFromBling(endpoint, options, retryCount + 1);
   }
 
-  try {
-    const parsed = new URL(trimmed);
-    const keysToDelete: string[] = [];
-    parsed.searchParams.forEach((_val, key) => {
-      if (RESIZE_QUERY_PARAMS.has(key.toLowerCase())) {
-        keysToDelete.push(key);
+  if (!res.ok) {
+    const errorText = await res.text();
+    if (res.status === 401) {
+      const currentTokens = loadBlingTokens();
+      const hasRemote = hasFirebaseAdminEnv() ? await hasFirestoreBlingToken() : false;
+      if (currentTokens?.refresh_token || hasRemote) {
+        console.log('[Bling Interceptor] 401 recebido. Forçando renovação automática via refresh_token...');
+        try {
+          const refreshed = await refreshBlingToken({ force: true, failedAccessToken: token });
+          await acquireBlingRateLimitSlot();
+          const retryRes = await fetch(url, {
+            ...options,
+            headers: {
+              'Authorization': `Bearer ${refreshed.access_token}`,
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+              'User-Agent': 'StreetStore/1.0',
+              ...(options.headers || {})
+            }
+          });
+          if (retryRes.ok) {
+            lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
+            return retryRes.json();
+          }
+          if (retryRes.status === 401) {
+            const msg = 'Token do Bling inválido ou expirado (401). Por favor, reconecte via OAuth.';
+            lastVerifiedAuth = { token: refreshed.access_token, valid: false, error: msg, checkedAt: Date.now() };
+            if (!hasRemote) clearBlingTokens();
+            throw new Error(msg);
+          }
+        } catch (refreshErr: any) {
+          const errDetail = refreshErr?.message || String(refreshErr);
+          const msg = 'Sessão do Bling expirada ou inválida (401). Por favor, reconecte via OAuth.';
+          console.warn('[Bling] Tentativa de renovação pós-401 falhou:', errDetail);
+          lastVerifiedAuth = { token, valid: false, error: msg, checkedAt: Date.now() };
+          if (!hasRemote) clearBlingTokens();
+          throw new Error(msg);
+        }
+      } else {
+        const msg = 'Token do Bling inválido ou expirado (401). Por favor, autorize novamente via OAuth.';
+        console.warn('[Bling] 401 recebido e não há refresh_token. Limpando cache.');
+        lastVerifiedAuth = { token, valid: false, error: msg, checkedAt: Date.now() };
+        clearBlingTokens();
+        throw new Error(msg);
+      }
+    }
+    const compactErr = errorText.replace(/\s+/g, ' ').trim();
+    throw new Error(`Bling API [${res.status}]: ${compactErr}`);
+  }
+
+  lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
+  return res.json();
+}
+
+/**
+ * Register all Bling ERP routes on the Express app
+ */
+export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpdated?: () => void }) {
+  const { clientId, state } = getClientCredentials();
+
+  function resolveAppUrl(req: Request): string {
+    const envUrl = process.env.APP_URL;
+    if (envUrl) return envUrl.replace(/\/$/, '');
+    const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || req.get('host');
+    return `${proto}://${host}`.replace(/\/$/, '');
+  }
+
+  // 1. Get OAuth Authorization URL & Status Info
+  app.get('/api/bling/auth-url', (req: Request, res: Response) => {
+    const appUrl = resolveAppUrl(req);
+    const redirectUri = `${appUrl}/auth/callback`;
+
+    const authUrlWithoutRedirect = `${BLING_AUTH_BASE}?response_type=code&client_id=${clientId}&state=${state}`;
+    const authUrlWithRedirect = `${BLING_AUTH_BASE}?response_type=code&client_id=${clientId}&state=${state}&redirect_uri=${encodeURIComponent(redirectUri)}`;
+
+    res.json({
+      url: authUrlWithoutRedirect,
+      urlWithRedirect: authUrlWithRedirect,
+      redirectUri,
+      clientId,
+      state
+    });
+  });
+
+  // Direct 1-click redirect to Bling authorization
+  app.get('/api/bling/authorize', (req: Request, res: Response) => {
+    const appUrl = resolveAppUrl(req);
+    const redirectUri = `${appUrl}/auth/callback`;
+    const authUrl = req.query.strict === 'true'
+      ? `${BLING_AUTH_BASE}?response_type=code&client_id=${clientId}&state=${state}&redirect_uri=${encodeURIComponent(redirectUri)}`
+      : `${BLING_AUTH_BASE}?response_type=code&client_id=${clientId}&state=${state}`;
+    res.redirect(authUrl);
+  });
+
+  // Helper to verify a candidate token against Bling API v3 before saving
+  async function validateAndSaveToken(rawInput: string, refreshToken?: string, expiresIn: number = 21600, scope: string = '', redirectUri?: string) {
+    const trimmed = rawInput.trim();
+
+    // If user pasted a callback URL (?code=...) or explicitly flagged code, exchange it via OAuth
+    let extractedCode: string | null = null;
+    if (trimmed.includes('code=')) {
+      try {
+        const parsed = new URL(trimmed.startsWith('http') ? trimmed : `https://dummy.local/?${trimmed.replace(/^\?/, '')}`);
+        extractedCode = parsed.searchParams.get('code');
+      } catch {
+        const m = trimmed.match(/[?&]code=([^&\s]+)/);
+        if (m) extractedCode = m[1];
+      }
+    }
+
+    if (extractedCode) {
+      const tokens = await exchangeCodeForTokens(extractedCode, redirectUri);
+      clearBlingAuthCache();
+      return { tokens, mode: 'code_exchange' as const };
+    }
+
+    const candidate: BlingTokens = {
+      access_token: trimmed,
+      refresh_token: refreshToken ? String(refreshToken).trim() : undefined,
+      expires_in: Number(expiresIn) || 21600,
+      token_type: 'Bearer',
+      scope,
+      obtained_at: Date.now()
+    };
+
+    // Test the token live on Bling v3 API
+    const testRes = await fetch(`${BLING_API_BASE}/produtos?pagina=1&limite=1`, {
+      headers: {
+        'Authorization': `Bearer ${candidate.access_token}`,
+        'Accept': 'application/json'
       }
     });
-    for (const key of keysToDelete) {
-      parsed.searchParams.delete(key);
+
+    if (testRes.ok) {
+      saveBlingTokens(candidate);
+      lastVerifiedAuth = { token: candidate.access_token, valid: true, checkedAt: Date.now() };
+      return { tokens: candidate, mode: 'direct_token' as const };
     }
 
-    // Remove common resize/compression path suffixes before extension (skipping mitiendanube fixed asset hashes)
-    if (!parsed.hostname.includes('mitiendanube.com') && !parsed.hostname.includes('tiendanube.com')) {
-      parsed.pathname = parsed.pathname.replace(
-        /(?:_miniatura|-miniatura|_mini|-mini|_thumb|-thumb|_small|-small|_medium|-medium|_low|-low|_\d{2,4}x\d{2,4}|-\d{2,4}x\d{2,4})(?=\.(?:jpe?g|png|webp|avif|gif)$)/i,
-        ''
+    // If 401 and input looks like an OAuth authorization code (40 hex chars without refresh_token), try exchanging it as code as fallback
+    if (testRes.status === 401 && !refreshToken && /^[a-f0-9]{32,64}$/i.test(trimmed)) {
+      try {
+        const exchanged = await exchangeCodeForTokens(trimmed);
+        clearBlingAuthCache();
+        return { tokens: exchanged, mode: 'code_exchange' as const };
+      } catch {
+        // Fall through to clear invalid token message
+      }
+    }
+
+    const errText = await testRes.text().catch(() => '');
+    clearBlingTokens();
+    clearBlingAuthCache();
+    throw new Error(`Token rejeitado pelo Bling (${testRes.status}). Gere um novo token clicando em "Autorizar Conexão no Bling ERP (1 Clique)". Detalhe: ${errText.slice(0, 120)}`);
+  }
+
+  // Set or update Bling API tokens directly (supports access_token, callback URL with ?code=, or OAuth code)
+  app.post('/api/bling/token', async (req: Request, res: Response) => {
+    try {
+      const { access_token, refresh_token, expires_in = 21600, code } = req.body;
+      const inputVal = String(code || access_token || '').trim();
+      if (!inputVal) {
+        return res.status(400).json({ success: false, error: 'Informe o token de acesso ou link de retorno com ?code= do Bling.' });
+      }
+      const appUrl = resolveAppUrl(req);
+      const { mode } = await validateAndSaveToken(inputVal, refresh_token, Number(expires_in), '', `${appUrl}/auth/callback`);
+      hooks?.onTokensUpdated?.();
+      res.json({
+        success: true,
+        mode,
+        message: 'Bling ERP validado e conectado com sucesso!'
+      });
+    } catch (err: any) {
+      res.status(401).json({
+        success: false,
+        error: err.message || 'Token do Bling inválido ou expirado.'
+      });
+    }
+  });
+
+  // 2. OAuth Callback Route (/bling/callback & /auth/callback - exchanges code for initial tokens & saves to DB)
+  app.get(['/bling/callback', '/bling/callback/', '/auth/callback', '/auth/callback/'], async (req: Request, res: Response) => {
+    const code = req.query.code as string;
+    const reqState = req.query.state as string;
+    const error = req.query.error as string;
+
+    console.log(`[Bling Callback] Path: ${req.path}, Received code: ${code ? code.slice(0, 8) + '...' : 'none'}, state: ${reqState}, error: ${error}`);
+
+    if (error) {
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>Erro de Autenticação Bling</title>
+            <style>
+              body { background: #0E0E0E; color: #fff; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+              .card { background: #181818; border: 1px solid #333; border-radius: 16px; padding: 32px; max-width: 480px; text-align: center; }
+              h2 { color: #E50914; margin-top: 0; }
+              p { color: #888; font-size: 14px; }
+              button { background: #E50914; color: #fff; border: 0; padding: 10px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h2>Falha na Autorização</h2>
+              <p>O Bling retornou o seguinte erro: ${error}</p>
+              <button onclick="window.close()">Fechar Janela</button>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+
+    if (!code) {
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta charset="utf-8" /><title>Código não informado</title></head>
+          <body style="background:#0E0E0E;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+            <div style="background:#181818;border:1px solid #333;border-radius:16px;padding:32px;text-align:center;">
+              <h3 style="color:#E50914;">Nenhum código de autorização recebido</h3>
+              <p style="color:#888;">Por favor, tente autorizar novamente pela Street Store.</p>
+              <button onclick="window.close()" style="background:#333;color:#fff;border:0;padding:8px 16px;border-radius:8px;cursor:pointer;">Fechar</button>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+
+    try {
+      // Exchange authorization code for token using identical APP_URL resolution & matched callback path
+      const appUrl = resolveAppUrl(req);
+      const callbackPath = req.path.startsWith('/bling/callback') ? '/bling/callback' : '/auth/callback';
+      const redirectUri = `${appUrl}${callbackPath}`;
+
+      await exchangeCodeForTokens(code, redirectUri);
+      hooks?.onTokensUpdated?.();
+
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head>
+            <meta charset="utf-8" />
+            <title>Bling ERP Conectado com Sucesso</title>
+            <style>
+              body {
+                background: #0E0E0E;
+                color: #ffffff;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                height: 100vh;
+                margin: 0;
+              }
+              .card {
+                background: #141414;
+                border: 1px solid #282828;
+                border-radius: 16px;
+                padding: 40px;
+                max-width: 440px;
+                text-align: center;
+                box-shadow: 0 20px 40px rgba(0, 0, 0, 0.8);
+              }
+              .badge {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 60px;
+                height: 60px;
+                background: #166534;
+                color: #4ade80;
+                border-radius: 50%;
+                font-size: 28px;
+                margin-bottom: 20px;
+              }
+              h2 {
+                font-size: 20px;
+                font-weight: 800;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                margin: 0 0 8px 0;
+                color: #fff;
+              }
+              p {
+                color: #9ca3af;
+                font-size: 13px;
+                line-height: 1.5;
+                margin: 0 0 20px 0;
+              }
+              .status {
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+                color: #22c55e;
+                font-weight: 700;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <div class="badge">✓</div>
+              <h2>Bling ERP Conectado!</h2>
+              <p>Sua conta da Street Store agora está autorizada e sincronizada com o Bling ERP v3.</p>
+              <div class="status">Sincronizando dados com o site...</div>
+              <script>
+                if (window.opener) {
+                  window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', provider: 'bling' }, '*');
+                  setTimeout(function() {
+                    window.close();
+                  }, 1200);
+                } else {
+                  setTimeout(function() {
+                    window.location.href = '/';
+                  }, 1500);
+                }
+              </script>
+            </div>
+          </body>
+        </html>
+      `);
+    } catch (err: any) {
+      console.error('[Bling Callback Exchange Error]:', err);
+      return res.send(`
+        <!DOCTYPE html>
+        <html>
+          <head><meta charset="utf-8" /><title>Erro na troca do token Bling</title></head>
+          <body style="background:#0E0E0E;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
+            <div style="background:#181818;border:1px solid #441111;border-radius:16px;padding:32px;max-width:500px;text-align:center;">
+              <h3 style="color:#E50914;">Erro ao trocar código por token no Bling</h3>
+              <p style="color:#bbb;font-size:13px;">${err.message || String(err)}</p>
+              <p style="color:#888;font-size:12px;">Dica: Verifique se a URL de redirecionamento está configurada no app do Bling ou cole o token manualmente no painel.</p>
+              <button onclick="window.close()" style="background:#E50914;color:#fff;border:0;padding:10px 20px;border-radius:8px;font-weight:bold;cursor:pointer;">Fechar</button>
+            </div>
+          </body>
+        </html>
+      `);
+    }
+  });
+
+  // 3. Manual exchange of code via API
+  app.post('/api/bling/exchange-code', async (req: Request, res: Response) => {
+    try {
+      const { code, redirectUri } = req.body;
+      if (!code) {
+        return res.status(400).json({ error: 'Parâmetro code é obrigatório' });
+      }
+      const tokens = await exchangeCodeForTokens(code, redirectUri);
+      hooks?.onTokensUpdated?.();
+      res.json({
+        success: true,
+        message: 'Conectado com sucesso ao Bling ERP!',
+        tokens: {
+          scope: tokens.scope,
+          expires_in: tokens.expires_in,
+          obtained_at: tokens.obtained_at
+        }
+      });
+    } catch (err: any) {
+      console.error('[API Exchange Error]:', err);
+      res.status(500).json({
+        success: false,
+        error: err.message || 'Falha ao trocar código do Bling'
+      });
+    }
+  });
+
+  // 4. Manual set token (direct paste for instant connection)
+  app.post('/api/bling/set-token', async (req: Request, res: Response) => {
+    try {
+      const { access_token, refresh_token, expires_in, scope } = req.body;
+      if (!access_token) {
+        return res.status(400).json({ success: false, error: 'access_token é obrigatório' });
+      }
+
+      const appUrl = resolveAppUrl(req);
+      const { tokens } = await validateAndSaveToken(
+        String(access_token),
+        refresh_token,
+        Number(expires_in) || 21600,
+        scope || '',
+        `${appUrl}/auth/callback`
       );
-    }
+      hooks?.onTokensUpdated?.();
 
-    return parsed.toString();
-  } catch {
-    return trimmed;
-  }
-}
-
-export function isThumbnailLikeUrl(url: string): boolean {
-  const u = (url || '').toLowerCase();
-  if (!u) return false;
-  if (
-    u.includes('miniatura') ||
-    u.includes('/thumb/') ||
-    u.includes('_thumb.') ||
-    u.includes('-thumb.') ||
-    u.includes('_mini.') ||
-    u.includes('-mini.')
-  ) {
-    return true;
-  }
-  // Bling S3 thumbnails live under /<tenant>/t/<hash> while full-res originals omit /t/
-  if (u.includes('orgbling.s3.amazonaws.com') || u.includes('bling.com')) {
-    try {
-      const parsed = new URL(u);
-      if (/\/t\/[^/]+$/i.test(parsed.pathname) || /\/t\/[a-z0-9_-]{8,}/i.test(parsed.pathname)) {
-        return true;
-      }
-    } catch {
-      if (/\/t\/[a-z0-9_-]{8,}/i.test(u)) return true;
-    }
-  }
-  return false;
-}
-
-const AUTH_SIGNATURE_PARAMS = new Set([
-  'awsaccesskeyid',
-  'expires',
-  'signature',
-  'x-amz-algorithm',
-  'x-amz-credential',
-  'x-amz-date',
-  'x-amz-expires',
-  'x-amz-signedheaders',
-  'x-amz-signature',
-  'x-amz-security-token'
-]);
-
-/**
- * Produces a canonical comparison key for image deduplication so the exact same
- * Bling S3 object with different Expires/Signature timestamps isn't saved multiple times.
- */
-function getCanonicalImageKey(url: string): string {
-  const clean = (url || '').trim();
-  if (!clean || clean.startsWith('data:image') || clean.startsWith('/')) return clean;
-  try {
-    const parsed = new URL(clean);
-    const toDelete: string[] = [];
-    parsed.searchParams.forEach((_v, k) => {
-      if (AUTH_SIGNATURE_PARAMS.has(k.toLowerCase())) {
-        toDelete.push(k);
-      }
-    });
-    for (const k of toDelete) {
-      parsed.searchParams.delete(k);
-    }
-    return parsed.toString();
-  } catch {
-    return clean;
-  }
-}
-
-function normalizeImageUrl(val: any, allowThumbnailFallback: boolean = false): string | null {
-  if (!val) return null;
-  if (typeof val === 'object') {
-    const primaryCandidate =
-      val.link ||
-      val.url ||
-      val.caminho ||
-      val.src ||
-      val.imagemURL ||
-      val.urlImagem ||
-      val.foto ||
-      val.anexo?.link ||
-      val.anexo?.url;
-    if (typeof primaryCandidate === 'string' && primaryCandidate.trim()) {
-      return normalizeImageUrl(primaryCandidate, allowThumbnailFallback);
-    }
-    if (allowThumbnailFallback) {
-      const thumbCandidate = val.linkMiniatura || val.thumbnail;
-      if (typeof thumbCandidate === 'string' && thumbCandidate.trim()) {
-        return normalizeImageUrl(thumbCandidate, true);
-      }
-    }
-    return null;
-  }
-  if (typeof val !== 'string') return null;
-  let clean = val.trim();
-  if (!clean || clean === 'null' || clean === 'undefined') return null;
-  if (clean.startsWith('//')) {
-    clean = `https:${clean}`;
-  }
-  if (
-    clean.startsWith('http://') ||
-    clean.startsWith('https://') ||
-    clean.startsWith('/') ||
-    clean.startsWith('data:image')
-  ) {
-    return stripResizeAndCompressionParams(clean);
-  }
-  return null;
-}
-
-function extractImagesFromSingleObject(
-  item: any,
-  urls: string[],
-  allowThumbnailFallback: boolean = false
-) {
-  if (!item || typeof item !== 'object') return;
-
-  const push = (val: any, forceAllowThumb: boolean = allowThumbnailFallback) => {
-    const normalized = normalizeImageUrl(val, forceAllowThumb);
-    if (normalized && !urls.includes(normalized)) {
-      urls.push(normalized);
-    }
-  };
-
-  const pushArray = (arr: any, forceAllowThumb: boolean = allowThumbnailFallback) => {
-    if (!Array.isArray(arr)) return;
-    const sorted = [...arr].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-    for (const entry of sorted) {
-      push(entry, forceAllowThumb);
-    }
-  };
-
-  if (!allowThumbnailFallback) {
-    // PRIMARY PASS: High-resolution original URLs ONLY (never read linkMiniatura or thumbnail here)
-    // 1. item.midia.imagens.internas[x].link & externas[x].link first
-    if (item.midia) {
-      const imagens = item.midia.imagens;
-      if (Array.isArray(imagens)) {
-        pushArray(imagens, false);
-      } else if (imagens && typeof imagens === 'object') {
-        if (Array.isArray(imagens.internas)) {
-          const sortedInternas = [...imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-          for (const imgObj of sortedInternas) {
-            if (typeof imgObj === 'string') {
-              push(imgObj, false);
-            } else if (imgObj && typeof imgObj === 'object') {
-              push(imgObj.link || imgObj.url, false);
-            }
-          }
+      res.json({
+        success: true,
+        message: 'Token do Bling validado e configurado com sucesso!',
+        status: {
+          connected: true,
+          expires_in: tokens.expires_in
         }
-        if (Array.isArray(imagens.externas)) {
-          const sortedExternas = [...imagens.externas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-          for (const imgObj of sortedExternas) {
-            if (typeof imgObj === 'string') {
-              push(imgObj, false);
-            } else if (imgObj && typeof imgObj === 'object') {
-              push(imgObj.link || imgObj.url, false);
-            }
-          }
-        }
-        pushArray(imagens.imagensURL, false);
-        pushArray(imagens.url, false);
-      }
-      if (Array.isArray(item.midia.fotos)) {
-        pushArray(item.midia.fotos, false);
-      }
+      });
+    } catch (err: any) {
+      res.status(401).json({ success: false, error: err.message });
     }
+  });
 
-    // 2. item.imagens (nested internas/externas or array)
-    if (Array.isArray(item.imagens)) {
-      pushArray(item.imagens, false);
-    } else if (item.imagens && typeof item.imagens === 'object') {
-      if (Array.isArray(item.imagens.internas)) pushArray(item.imagens.internas, false);
-      if (Array.isArray(item.imagens.externas)) pushArray(item.imagens.externas, false);
-      if (Array.isArray(item.imagens.imagensURL)) pushArray(item.imagens.imagensURL, false);
-    }
+  // 5. Connection Status (verifies token health against Bling API v3 & Firestore)
+  app.get('/api/bling/status', async (req: Request, res: Response) => {
+    const appUrl = resolveAppUrl(req);
+    const redirectUri = `${appUrl}/auth/callback`;
+    const authorizeUrl = `${BLING_AUTH_BASE}?response_type=code&client_id=${clientId}&state=${state}`;
 
-    // 3. Standard Bling direct URL fields (high-res only)
-    push(item.imagemURL, false);
-    push(item.urlImagem, false);
-    push(item.imagem, false);
-
-    // 4. item.anexos / item.anexo
-    if (Array.isArray(item.anexos)) pushArray(item.anexos, false);
-    if (item.anexo) push(item.anexo, false);
-
-    // 5. item.fotos
-    if (Array.isArray(item.fotos)) {
-      pushArray(item.fotos, false);
-    } else if (item.fotos && typeof item.fotos === 'object' && Array.isArray(item.fotos.foto)) {
-      pushArray(item.fotos.foto, false);
-    }
-  } else {
-    // LAST-RESORT FALLBACK PASS: Only executed if zero .link / original high-res URLs were found anywhere
-    if (item.midia?.imagens && typeof item.midia.imagens === 'object' && !Array.isArray(item.midia.imagens)) {
-      if (Array.isArray(item.midia.imagens.internas)) {
-        const sortedInternas = [...item.midia.imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-        for (const imgObj of sortedInternas) {
-          if (imgObj && typeof imgObj === 'object') {
-            push(imgObj.linkMiniatura || imgObj.thumbnail, true);
-          }
-        }
-      }
-      if (Array.isArray(item.midia.imagens.externas)) {
-        const sortedExternas = [...item.midia.imagens.externas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-        for (const imgObj of sortedExternas) {
-          if (imgObj && typeof imgObj === 'object') {
-            push(imgObj.linkMiniatura || imgObj.thumbnail, true);
-          }
-        }
-      }
-    }
-    if (item.imagens && typeof item.imagens === 'object' && !Array.isArray(item.imagens)) {
-      if (Array.isArray(item.imagens.internas)) pushArray(item.imagens.internas, true);
-      if (Array.isArray(item.imagens.externas)) pushArray(item.imagens.externas, true);
-    }
-    push(item.thumbnail, true);
-  }
-}
-
-/**
- * Extracts all valid image URLs from any Bling API v3 or webhook product payload.
- * Always prioritizes original high-resolution URLs (midia.imagens.internas[x].link / externas[x].link),
- * leaving linkMiniatura strictly as a last-resort fallback when .link is empty.
- */
-export function extractImagesFromBlingItem(rawItem: any, includeVariations: boolean = true): string[] {
-  if (!rawItem) return [];
-  const item = rawItem?.data && typeof rawItem.data === 'object' && !Array.isArray(rawItem.data)
-    ? rawItem.data
-    : rawItem;
-
-  const highResUrls: string[] = [];
-  extractImagesFromSingleObject(item, highResUrls, false);
-
-  if (includeVariations && Array.isArray(item.variacoes)) {
-    for (const v of item.variacoes) {
-      extractImagesFromSingleObject(v, highResUrls, false);
-    }
-  }
-
-  // Filter out thumbnail-like URLs if true full-res URLs are present
-  const nonThumbHighRes = highResUrls.filter(u => !isThumbnailLikeUrl(u));
-  if (nonThumbHighRes.length > 0) {
-    return nonThumbHighRes;
-  }
-  if (highResUrls.length > 0) {
-    return highResUrls;
-  }
-
-  // Last resort fallback to linkMiniatura / thumbnail ONLY if no .link / original URL exists
-  const fallbackUrls: string[] = [];
-  extractImagesFromSingleObject(item, fallbackUrls, true);
-  if (includeVariations && Array.isArray(item.variacoes)) {
-    for (const v of item.variacoes) {
-      extractImagesFromSingleObject(v, fallbackUrls, true);
-    }
-  }
-
-  return fallbackUrls;
-}
-
-function mergeImageArrays(existing: string[] | undefined, incoming: string[]): string[] {
-  const cleanedIncoming = incoming
-    .map(u => stripResizeAndCompressionParams(u))
-    .filter(Boolean);
-  const cleanedExisting = (Array.isArray(existing) ? existing : [])
-    .map(u => stripResizeAndCompressionParams(u))
-    .filter(img => Boolean(img) && !isPlaceholderImageUrl(img) && !isLegacyExternalUrl(img));
-
-  const incomingHasFullRes = cleanedIncoming.some(u => !isThumbnailLikeUrl(u));
-  const existingHasFullRes = cleanedExisting.some(u => !isThumbnailLikeUrl(u));
-  const preferFullResOnly = incomingHasFullRes || existingHasFullRes;
-
-  const result: string[] = [];
-  const seenKeys = new Set<string>();
-  const addUnique = (img: string) => {
-    if (!img) return;
-    if (preferFullResOnly && isThumbnailLikeUrl(img)) return;
-    const key = getCanonicalImageKey(img);
-    if (!seenKeys.has(key)) {
-      seenKeys.add(key);
-      result.push(img);
-    }
-  };
-
-  for (const img of cleanedIncoming) {
-    addUnique(img);
-  }
-  for (const img of cleanedExisting) {
-    addUnique(img);
-  }
-  return result.slice(0, 12);
-}
-
-/**
- * Mutates an in-memory store object without writing disk yet (used for batch sync)
- */
-export function applyImageRecordToStore(
-  store: BlingImageStore,
-  identifier: { sku?: string; name?: string; id?: string | number; parentId?: string | number },
-  images: string[]
-): boolean {
-  if (!images || images.length === 0) return false;
-  const validImages = images
-    .map(u => normalizeImageUrl(u, true))
-    .filter((u): u is string => Boolean(u) && !isPlaceholderImageUrl(u!));
-
-  if (validImages.length === 0) return false;
-
-  if (identifier.sku) {
-    const s = String(identifier.sku).toUpperCase().trim();
-    if (s) store.bySku[s] = mergeImageArrays(store.bySku[s], validImages);
-  }
-  if (identifier.id) {
-    const i = String(identifier.id).trim();
-    if (i) store.byId[i] = mergeImageArrays(store.byId[i], validImages);
-  }
-  if (identifier.parentId) {
-    const pid = String(identifier.parentId).trim();
-    if (pid) store.byId[pid] = mergeImageArrays(store.byId[pid], validImages);
-  }
-  if (identifier.name) {
-    const n = normalizeProductName(identifier.name);
-    if (n) store.byName[n] = mergeImageArrays(store.byName[n], validImages);
-  }
-
-  return true;
-}
-
-/**
- * Saves image URLs for a specific product
- */
-export function recordProductImage(
-  identifier: { sku?: string; name?: string; id?: string | number; parentId?: string | number },
-  images: string[]
-): void {
-  const store = loadImageStore();
-  if (applyImageRecordToStore(store, identifier, images)) {
-    saveImageStore(store);
-  }
-}
-
-/**
- * Gets real Bling images for a given product
- */
-export function getBlingImagesForProduct(product: Partial<Product> | any): string[] | null {
-  const store = loadImageStore();
-
-  const sanitizeUrls = (urls?: string[]): string[] | null => {
-    if (!urls || urls.length === 0) return null;
-    const cleaned = urls
-      .filter((u): u is string => typeof u === 'string' && u.trim().length > 0 && !isPlaceholderImageUrl(u))
-      .map(u => stripResizeAndCompressionParams(u));
-    if (cleaned.length === 0) return null;
-    const fullRes = cleaned.filter(u => !isThumbnailLikeUrl(u));
-    return fullRes.length > 0 ? fullRes : cleaned;
-  };
-
-  // 1. By SKU
-  const sku = product.integration?.sku || product.sku;
-  if (sku) {
-    const s = String(sku).toUpperCase().trim();
-    if (store.bySku[s] && store.bySku[s].length > 0) {
-      const clean = sanitizeUrls(store.bySku[s]);
-      if (clean) return clean;
-    }
-  }
-
-  // 2. By variant SKUs or IDs
-  if (Array.isArray(product.variantsList)) {
-    for (const v of product.variantsList) {
-      if (v.sku) {
-        const vs = String(v.sku).toUpperCase().trim();
-        if (store.bySku[vs] && store.bySku[vs].length > 0) {
-          const clean = sanitizeUrls(store.bySku[vs]);
-          if (clean) return clean;
-        }
-      }
-      if (v.id) {
-        const vId = String(v.id).trim();
-        if (store.byId[vId] && store.byId[vId].length > 0) {
-          const clean = sanitizeUrls(store.byId[vId]);
-          if (clean) return clean;
-        }
-      }
-    }
-  }
-
-  // 3. By Bling ID
-  const blingId = product.integration?.blingId || product.blingId;
-  if (blingId) {
-    const bId = String(blingId).trim();
-    if (store.byId[bId] && store.byId[bId].length > 0) {
-      const clean = sanitizeUrls(store.byId[bId]);
-      if (clean) return clean;
-    }
-  }
-
-  // 4. By normalized product name
-  if (product.name) {
-    const n = normalizeProductName(product.name);
-    if (store.byName[n] && store.byName[n].length > 0) {
-      const clean = sanitizeUrls(store.byName[n]);
-      if (clean) return clean;
-    }
-
-    // Substring / fuzzy match across stored names
-    for (const [storedName, imgs] of Object.entries(store.byName)) {
-      if (imgs.length > 0 && storedName.length >= 8 && (n.includes(storedName) || storedName.includes(n))) {
-        const clean = sanitizeUrls(imgs);
-        if (clean) return clean;
-      }
-    }
-  }
-
-  return null;
-}
-
-/**
- * Injects real Bling images into products array, giving them top priority and eliminating placeholders
- */
-export function applyBlingImageOverrides<T extends { images?: string[]; [key: string]: any } = Product>(products: T[]): T[] {
-  return products.map(product => {
-    const realImages = getBlingImagesForProduct(product);
-    if (realImages && realImages.length > 0) {
-      const hasNativeBling = realImages.some(u => !isLegacyExternalUrl(u));
-      const hasFullRes = realImages.some(u => !isThumbnailLikeUrl(u));
-      const existingReal = Array.isArray(product.images)
-        ? product.images
-            .filter((img: string) =>
-              !isPlaceholderImageUrl(img) &&
-              (!hasNativeBling || !isLegacyExternalUrl(img)) &&
-              (!hasFullRes || !isThumbnailLikeUrl(img))
-            )
-            .map((img: string) => stripResizeAndCompressionParams(img))
-        : [];
-      const combined = [
-        ...realImages,
-        ...existingReal.filter((img: string) => !realImages.includes(img))
-      ];
-      return {
-        ...product,
-        images: combined
+    let tokens = loadBlingTokens();
+    const fsStatus = hasFirebaseAdminEnv() ? await getBlingTokenStatusFromFirestore() : null;
+    if ((!tokens || !tokens.access_token) && fsStatus?.refresh_token) {
+      tokens = {
+        access_token: fsStatus.access_token || '',
+        refresh_token: fsStatus.refresh_token,
+        expires_in: fsStatus.expires_in || 21600,
+        expires_at: fsStatus.expires_at,
+        token_type: fsStatus.token_type || 'Bearer',
+        scope: fsStatus.scope || '',
+        obtained_at: fsStatus.obtained_at || Date.now(),
       };
     }
-    return product;
+
+    if (!tokens || (!tokens.access_token && !tokens.refresh_token)) {
+      return res.json({
+        connected: false,
+        clientId,
+        redirectUri,
+        authorizeUrl
+      });
+    }
+
+    const forceVerify = req.query.verify === 'true';
+    const cacheRecent =
+      !forceVerify &&
+      lastVerifiedAuth &&
+      lastVerifiedAuth.token === tokens.access_token &&
+      Date.now() - lastVerifiedAuth.checkedAt < 25 * 1000;
+
+    if (cacheRecent && !lastVerifiedAuth!.valid) {
+      return res.json({
+        connected: false,
+        tokenInvalid: true,
+        error: lastVerifiedAuth!.error || 'Token do Bling expirado ou inválido. Reconecte via OAuth.',
+        clientId,
+        redirectUri,
+        authorizeUrl
+      });
+    }
+
+    if (!cacheRecent) {
+      try {
+        await fetchFromBling('/produtos?pagina=1&limite=1');
+        tokens = loadBlingTokens() || tokens;
+      } catch (verifyErr: any) {
+        return res.json({
+          connected: false,
+          tokenInvalid: true,
+          error: verifyErr?.message || 'Token do Bling expirado ou inválido. Reconecte via OAuth.',
+          clientId,
+          redirectUri,
+          authorizeUrl
+        });
+      }
+    }
+
+    const latestFs = hasFirebaseAdminEnv() ? await getBlingTokenStatusFromFirestore() : null;
+    const activeTokenData = latestFs?.access_token
+      ? {
+          access_token: latestFs.access_token,
+          refresh_token: latestFs.refresh_token || tokens.refresh_token,
+          expires_in: latestFs.expires_in || 21600,
+          expires_at: latestFs.expires_at,
+          scope: latestFs.scope || tokens.scope,
+          obtained_at: latestFs.obtained_at || tokens.obtained_at,
+        }
+      : tokens;
+
+    if (!activeTokenData || !activeTokenData.access_token) {
+      return res.json({
+        connected: false,
+        tokenInvalid: true,
+        clientId,
+        redirectUri,
+        authorizeUrl
+      });
+    }
+
+    const expiresInMs = (activeTokenData.expires_in || 21600) * 1000;
+    const expiresAt = activeTokenData.expires_at ?? (activeTokenData.obtained_at + expiresInMs);
+    const isExpired = Date.now() >= expiresAt;
+
+    res.json({
+      connected: true,
+      clientId,
+      redirectUri,
+      callbackUri: `${appUrl}/bling/callback`,
+      authorizeUrl,
+      scope: activeTokenData.scope,
+      hasRefreshToken: Boolean(activeTokenData.refresh_token),
+      isExpired,
+      expiresAt: new Date(expiresAt).toISOString(),
+      obtainedAt: new Date(activeTokenData.obtained_at).toISOString()
+    });
+  });
+
+  // 5b. Keep-Alive Cron Endpoint mounted on /api/bling/keep-alive & blingRouter
+  blingRouter.get('/keep-alive', async (req: Request, res: Response) => {
+    try {
+      const cronSecret = (process.env.CRON_SECRET || '').trim();
+      if (cronSecret) {
+        const authHeader = (req.headers.authorization || '').trim();
+        const xCron = typeof req.headers['x-cron-secret'] === 'string' ? req.headers['x-cron-secret'].trim() : '';
+        const qSecret = typeof req.query.secret === 'string' ? req.query.secret.trim() : '';
+        if (authHeader !== `Bearer ${cronSecret}` && xCron !== cronSecret && qSecret !== cronSecret) {
+          return res.status(401).json({ ok: false, error: 'Unauthorized' });
+        }
+      }
+      const token = await getValidBlingToken();
+      return res.status(200).json({
+        ok: true,
+        refreshedOrValid: Boolean(token),
+        checkedAt: new Date().toISOString(),
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      return res.status(200).json({
+        ok: false,
+        error: message,
+        checkedAt: new Date().toISOString(),
+      });
+    }
+  });
+
+  function verifySyncSecretMiddleware(req: Request, res: Response, next: NextFunction) {
+    if (req.method !== 'GET' && req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
+    }
+    const expectedCronSecret = (process.env.CRON_SECRET || '').trim();
+    if (!expectedCronSecret) {
+      return res.status(500).json({
+        error: 'Variável CRON_SECRET não configurada no servidor.',
+      });
+    }
+
+    const querySecret = typeof req.query.secret === 'string' ? req.query.secret : '';
+    const headerCron = typeof req.headers['x-cron-secret'] === 'string' ? req.headers['x-cron-secret'] : '';
+    const headerAdmin = typeof req.headers['x-admin-secret'] === 'string' ? req.headers['x-admin-secret'] : '';
+    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+    const bearerSecret = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+    const providedSecret = querySecret || headerCron || headerAdmin || bearerSecret;
+
+    if (!verifySyncSecret(providedSecret)) {
+      return res.status(401).json({
+        error: 'Não autorizado. Informe CRON_SECRET válido via header ou ?secret=.',
+      });
+    }
+    return next();
+  }
+
+  // 5c. Automated Auto-Loop / Paginated Catalog Sync (/api/bling/sync) com Middleware de Interrupção
+  blingRouter.all('/sync', verifySyncSecretMiddleware, blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+    if (req.query.verify === 'true') {
+      return res.status(200).json({ authorized: true });
+    }
+
+    try {
+      const hasExplicitPage = typeof req.query.pagina === 'string' && req.query.pagina.trim() !== '';
+      const autoAll = req.query.all === 'true' || !hasExplicitPage;
+
+      if (autoAll) {
+        const startPageRaw = typeof req.query.pagina === 'string' ? req.query.pagina : '1';
+        const startPage = Math.max(1, parseInt(startPageRaw, 10) || 1);
+        const maxMsRaw = typeof req.query.maxMs === 'string' ? parseInt(req.query.maxMs, 10) : 0;
+        const result = await syncAllBlingProdutosToFirestore({
+          startPage,
+          maxExecutionMs: maxMsRaw > 0 ? Math.min(55000, maxMsRaw) : (process.env.VERCEL ? 7500 : 45000),
+        });
+        return res.status(200).json(result);
+      }
+
+      const pagina = Math.max(1, parseInt(String(req.query.pagina), 10) || 1);
+      const result = await syncBlingProdutosPageToFirestore(pagina);
+      return res.status(200).json(result);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[Express /api/bling/sync Error]:', message);
+      return res.status(500).json({ success: false, error: message });
+    }
+  });
+
+  // 5d. Batch Catalog Sync (Bling API v3 -> Firestore WriteBatch) com Middleware de Interrupção
+  blingRouter.all('/sync-produtos', verifySyncSecretMiddleware, blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+    if (req.query.verify === 'true') {
+      return res.status(200).json({ authorized: true });
+    }
+
+    try {
+      const paginaRaw = typeof req.query.pagina === 'string' ? req.query.pagina : '1';
+      const pagina = Math.max(1, parseInt(paginaRaw, 10) || 1);
+      const resultado = await syncBlingProdutosPageToFirestore(pagina);
+      return res.status(200).json(resultado);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[Express /api/bling/sync-produtos Error]:', message);
+      return res.status(500).json({ error: message });
+    }
+  });
+
+  app.use('/api/bling', blingRouter);
+
+  // 6. Fetch Products from Bling API v3 (Interceptado por blingAuthInterceptorMiddleware)
+  app.get('/api/bling/products', blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+    try {
+      const pagina = req.query.pagina ? String(req.query.pagina) : '1';
+      const limiteParam = parseInt(String(req.query.limite || '100'), 10);
+      const maxProducts = Math.min(10000, parseInt(String(req.query.max || '10000'), 10) || 10000);
+      const includeZeroStock = req.query.includeZeroStock === 'true';
+      const fetchAll = req.query.all === 'true' || req.query.todos === 'true' || limiteParam > 100 || (!req.query.pagina && !req.query.limite);
+
+      let rawProducts: any[] = [];
+      if (fetchAll) {
+        const seenIds = new Set<number>();
+        const pushUnique = (items: any[]) => {
+          for (const it of items) {
+            if (it?.situacao === 'I' || it?.situacao === 'E') continue;
+            if (it?.id && !seenIds.has(it.id) && rawProducts.length < maxProducts) {
+              seenIds.add(it.id);
+              rawProducts.push(it);
+            }
+          }
+        };
+
+        // Paginate all active products (criterio=2: Ativos) until the end (up to 10,000 items)
+        for (let p = 1; p <= 100 && rawProducts.length < maxProducts; p++) {
+          try {
+            const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
+            const items = pageData?.data || [];
+            if (items.length > 0) pushUnique(items);
+            if (items.length < 100) break;
+            await new Promise(resolve => setTimeout(resolve, 140));
+          } catch (pageErr: any) {
+            console.warn(`[Bling Products] Stopped pagination at page ${p}:`, pageErr?.message || pageErr);
+            break;
+          }
+        }
+      } else {
+        const data = await fetchFromBling(`/produtos?pagina=${pagina}&limite=${limiteParam}&criterio=2`);
+        rawProducts = (data?.data || []).slice(0, maxProducts);
+      }
+
+      // Fetch real stock balances in chunks of 50 product IDs
+      const stockMap: Record<number, number> = {};
+      let stockApiSucceeded = false;
+      const allIds = rawProducts.map((p: any) => p.id).filter(Boolean);
+      for (let i = 0; i < allIds.length; i += 50) {
+        const chunk = allIds.slice(i, i + 50);
+        try {
+          const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
+          const stockData = await fetchFromBling(`/estoques/saldos?${qs}`);
+          stockApiSucceeded = true;
+          (stockData.data || []).forEach((item: any) => {
+            const pId = item.produto?.id;
+            const balance = item.saldoVirtualTotal ?? item.saldoFisicoTotal ?? item.saldoFisico ?? 0;
+            if (pId) stockMap[pId] = Number(balance) || 0;
+          });
+          if (i + 50 < allIds.length) {
+            await new Promise(resolve => setTimeout(resolve, 120));
+          }
+        } catch (stockErr) {
+          console.warn('[Bling] Could not fetch stock balances chunk:', stockErr);
+        }
+      }
+
+      // Map to consistent format extracting all Bling image fields & real stock
+      const formatted = rawProducts.map((p: any) => {
+        const directImages = extractImagesFromBlingItem(p);
+        const directFullRes = directImages.filter(u => !isThumbnailLikeUrl(u));
+        const cachedImgs = getBlingImagesForProduct({ name: p.nome, sku: p.codigo, blingId: String(p.id) }) || [];
+        const cachedFullRes = cachedImgs.filter(u => !isThumbnailLikeUrl(u));
+        const combinedFullRes = Array.from(new Set([...directFullRes, ...cachedFullRes]));
+        const storedImages = combinedFullRes.length > 0
+          ? combinedFullRes
+          : (cachedImgs.length > 0 ? cachedImgs : directImages);
+        const realStock = stockMap[p.id] !== undefined
+          ? stockMap[p.id]
+          : (p.estoque?.saldoVirtualTotal ?? p.estoque?.saldoFisicoTotal ?? p.estoque?.saldoFisico ?? (stockApiSucceeded ? 0 : 0));
+        return {
+          id: `bling-${p.id}`,
+          blingId: p.id,
+          idProdutoPai: p.idProdutoPai || null,
+          name: p.nome,
+          code: p.codigo,
+          sku: p.codigo,
+          price: p.preco || 0,
+          stock: Math.max(0, Number(realStock) || 0),
+          stockCount: Math.max(0, Number(realStock) || 0),
+          status: p.situacao,
+          format: p.formato,
+          type: p.tipo,
+          shortDescription: p.descricaoCurta || '',
+          imageUrl: storedImages[0] || '',
+          images: storedImages,
+        };
+      });
+
+      const visible = formatted
+        .filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0))
+        .sort((a: any, b: any) => Number(b.blingId || 0) - Number(a.blingId || 0));
+
+      res.json({
+        success: true,
+        count: visible.length,
+        products: visible,
+        rawCount: rawProducts.length
+      });
+    } catch (err: any) {
+      console.error('[Bling Products Error]:', err);
+      const isAuthErr = String(err?.message || '').includes('401') || String(err?.message || '').includes('OAuth');
+      res.status(isAuthErr ? 401 : 500).json({
+        success: false,
+        error: err.message || 'Falha ao buscar produtos do Bling ERP',
+        connected: Boolean(loadBlingTokens())
+      });
+    }
+  });
+
+  // 7. Fetch Sales Orders from Bling API v3 (Interceptado; fallback local se nunca autorizado)
+  app.get('/api/bling/orders', createBlingAuthMiddleware({ allowLocalFallback: true }), async (req: Request, res: Response) => {
+    try {
+      if (!(req as BlingAuthorizedRequest).blingAccessToken) {
+        const localOrders = loadLocalBlingOrders();
+        return res.json({
+          success: true,
+          count: localOrders.length,
+          orders: localOrders
+        });
+      }
+      const pagina = req.query.pagina || '1';
+      const limite = req.query.limite || '50';
+
+      const data = await fetchFromBling(`/pedidos/vendas?pagina=${pagina}&limite=${limite}`);
+      const rawOrders = data.data || [];
+
+      const formatted = rawOrders.map((o: any) => ({
+        id: o.id,
+        numero: o.numero,
+        data: o.data,
+        total: o.total,
+        situacao: o.situacao?.valor || o.situacao?.id || 'Pendente',
+        cliente: o.contato?.nome || 'Cliente Street Store',
+        documento: o.contato?.numeroDocumento || '',
+        itens: (o.itens || []).map((it: any) => ({
+          codigo: it.codigo,
+          descricao: it.descricao,
+          quantidade: it.quantidade,
+          valor: it.valor
+        }))
+      }));
+
+      res.json({
+        success: true,
+        count: formatted.length,
+        orders: formatted
+      });
+    } catch (err: any) {
+      console.error('[Bling Orders Error]:', err);
+      // Fallback to local stored orders
+      const localOrders = loadLocalBlingOrders();
+      res.json({
+        success: true,
+        count: localOrders.length,
+        orders: localOrders
+      });
+    }
+  });
+
+  // 7.1 Create Sales Order in Bling ERP
+  app.post('/api/bling/orders', blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+    try {
+      const result = await createBlingOrder(req.body);
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({
+        success: false,
+        error: err.message || 'Falha ao criar pedido no Bling'
+      });
+    }
+  });
+
+  // 8. Fetch Stock Balances
+  app.get('/api/bling/stock', blingAuthInterceptorMiddleware, async (_req: Request, res: Response) => {
+    try {
+      const data = await fetchFromBling('/estoques/saldos?pagina=1&limite=100');
+      res.json({
+        success: true,
+        stock: data.data || []
+      });
+    } catch (err: any) {
+      const msg = String(err?.message || '');
+      const isAuthErr = msg.includes('401') || msg.includes('OAuth') || msg.includes('expirad');
+      res.status(isAuthErr ? 401 : 500).json({
+        success: false,
+        tokenInvalid: isAuthErr,
+        error: msg || 'Falha ao buscar estoque do Bling'
+      });
+    }
+  });
+
+  // 9. Disconnect / Logout Bling
+  app.post('/api/bling/disconnect', (_req: Request, res: Response) => {
+    clearBlingTokens();
+    res.json({ success: true, message: 'Bling desconectado com sucesso.' });
   });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+const LOCAL_ORDERS_FILE = path.resolve(process.env.VERCEL ? '/tmp' : process.cwd(), '.bling_orders.json');
+
+export interface BlingOrderParams {
+  numero?: string | number;
+  customer: {
+    name: string;
+    email: string;
+    cpf?: string;
+    phone?: string;
+  };
+  shippingAddress?: {
+    address: string;
+    number: string;
+    locality?: string;
+    city: string;
+    province: string;
+    zipcode: string;
+    complement?: string;
+  };
+  shippingCarrier?: string;
+  shippingCost?: number;
+  items: Array<{
+    id?: string | number;
+    name: string;
+    sku?: string;
+    quantity: number;
+    price: number;
+    selectedSize?: string;
+  }>;
+  total: number;
+  paymentMethod: 'pix' | 'credit_card' | string;
+  paymentId?: string | number;
 }
 
-let activeSyncPromise: Promise<any> | null = null;
-let catalogFetchInProgress = false;
-
-export function isImageSyncRunning(): boolean {
-  return Boolean(activeSyncPromise);
+export function loadLocalBlingOrders(): any[] {
+  try {
+    if (fs.existsSync(LOCAL_ORDERS_FILE)) {
+      const raw = fs.readFileSync(LOCAL_ORDERS_FILE, 'utf-8');
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.warn('[Bling] Could not read local orders file:', err);
+  }
+  return [];
 }
 
-export function setCatalogFetchInProgress(val: boolean): void {
-  catalogFetchInProgress = val;
+export function saveLocalBlingOrder(order: any): void {
+  try {
+    const list = loadLocalBlingOrders();
+    const updated = [order, ...list.filter((o: any) => o.numero !== order.numero && o.id !== order.id)];
+    fs.writeFileSync(LOCAL_ORDERS_FILE, JSON.stringify(updated.slice(0, 200), null, 2), 'utf-8');
+  } catch (err) {
+    console.error('[Bling] Could not save order to local store:', err);
+  }
 }
 
 /**
- * Synchronizes all internal/external images directly from Bling ERP API v3.
- * Queries /produtos to list all products and calls GET /produtos/{id} on each unique product
- * to extract data.midia.imagens.internas (.link / .linkMiniatura), data.midia.imagens.externas (.link), and imagemURL.
+ * Creates sales order in Bling ERP (API v3 /pedidos/vendas) with local store backup
  */
-export async function syncImagesFromBling(options?: {
-  maxDetailFetches?: number;
-  clearCache?: boolean;
-  onBatchSaved?: () => void;
-}): Promise<{
+export async function createBlingOrder(params: BlingOrderParams): Promise<{
   success: boolean;
-  updatedCount: number;
-  detailedFetched: number;
-  totalWithImages: number;
-  sources: { bling: number };
-  connected: boolean;
-  message: string;
+  orderNumber: string;
+  orderId: string | number;
+  status: string;
+  order: any;
+  blingSynced: boolean;
   error?: string;
 }> {
-  if (activeSyncPromise) {
-    return activeSyncPromise;
+  const orderNumber = params.numero 
+    ? String(params.numero) 
+    : `ST-${Date.now().toString().slice(-6)}`;
+  
+  const todayStr = new Date().toISOString().split('T')[0];
+
+  const blingPayload = {
+    numero: parseInt(orderNumber.replace(/\D/g, '') || String(Date.now()).slice(-5), 10),
+    data: todayStr,
+    dataPrevista: todayStr,
+    contato: {
+      nome: params.customer.name || 'Cliente Street Store',
+      tipoPessoa: 'F',
+      numeroDocumento: (params.customer.cpf || '').replace(/\D/g, ''),
+      email: params.customer.email,
+      telefone: (params.customer.phone || '').replace(/\D/g, '')
+    },
+    itens: params.items.map((it) => ({
+      codigo: it.sku || `SKU-${String(it.id || 'ITEM').replace(/\D/g, '') || '01'}`,
+      descricao: `${it.name}${it.selectedSize ? ` - Tam ${it.selectedSize}` : ''}`,
+      quantidade: it.quantity || 1,
+      valor: it.price || 139.90
+    })),
+    transporte: {
+      transportadora: {
+        nome: params.shippingCarrier || 'Melhor Envio'
+      },
+      etiqueta: params.shippingAddress ? {
+        nome: params.customer.name || 'Cliente Street Store',
+        endereco: params.shippingAddress.address || '',
+        numero: params.shippingAddress.number || 'S/N',
+        complemento: params.shippingAddress.complement || '',
+        bairro: params.shippingAddress.locality || '',
+        municipio: params.shippingAddress.city || '',
+        uf: params.shippingAddress.province || 'MG',
+        cep: (params.shippingAddress.zipcode || '').replace(/\D/g, '')
+      } : undefined
+    },
+    pagamento: {
+      formas: [
+        {
+          valor: params.total,
+          formaPagamento: {
+            id: 1
+          }
+        }
+      ]
+    },
+    observacoes: `Street Store Oficial - Pedido #${orderNumber} | Pagamento: ${params.paymentMethod} (${params.paymentId || 'Aprovado Mercado Pago'}) | Frete: ${params.shippingCarrier || 'Melhor Envio'}`
+  };
+
+  let blingSynced = false;
+  let remoteId: any = orderNumber;
+
+  try {
+    if (await ensureBlingAuthorized()) {
+      console.log(`[Bling] Submitting order #${orderNumber} to Bling API v3...`);
+      const res = await fetchFromBling('/pedidos/vendas', {
+        method: 'POST',
+        body: JSON.stringify(blingPayload)
+      });
+      if (res?.data?.id) {
+        remoteId = res.data.id;
+        blingSynced = true;
+        console.log(`[Bling] Order #${orderNumber} registered successfully in Bling ERP (ID: ${remoteId})`);
+      }
+    }
+  } catch (apiErr: any) {
+    console.warn('[Bling] Notice syncing order to remote Bling API (saved locally):', apiErr.message);
   }
 
-  activeSyncPromise = (async () => {
-    const store = options?.clearCache ? clearImageCache(true) : loadImageStore();
-    let blingCount = 0;
-    let detailedFetched = 0;
-    const maxDetailFetches = options?.maxDetailFetches ?? Infinity;
+  const storedOrder = {
+    id: remoteId,
+    numero: orderNumber,
+    data: todayStr,
+    total: params.total,
+    situacao: 'Em Aberto / Pago',
+    cliente: params.customer.name,
+    email: params.customer.email,
+    documento: params.customer.cpf || '',
+    transporte: params.shippingCarrier || 'Melhor Envio',
+    rastreio: null,
+    itens: params.items.map((it) => ({
+      codigo: it.sku || `SKU-${it.id || 'ITEM'}`,
+      descricao: `${it.name}${it.selectedSize ? ` (${it.selectedSize})` : ''}`,
+      quantidade: it.quantity,
+      valor: it.price
+    })),
+    blingSynced,
+    createdAt: new Date().toISOString()
+  };
 
-    const authorized = await ensureBlingAuthorized({ verifyLive: true });
-    if (!authorized) {
-      console.log('[Bling Image Sync] Bling OAuth token not connected or expired; skipped direct API fetch.');
-      const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
-      return {
-        success: true,
-        updatedCount: 0,
-        detailedFetched: 0,
-        totalWithImages,
-        sources: { bling: 0 },
-        connected: false,
-        message: `Banco de imagens local ativo (${totalWithImages} mapeamentos). Conecte o Bling ERP para puxar as fotos armazenadas no Bling.`
-      };
-    }
+  saveLocalBlingOrder(storedOrder);
 
-    try {
-      console.log('[Bling Image Sync] Querying Bling API v3 /produtos to collect all active product IDs...');
-      const allItems: any[] = [];
-      const seenItemIds = new Set<number>();
-      const MAX_ITEMS = 10000;
-
-      const pushUniqueItems = (items: any[]) => {
-        for (const it of items) {
-          if (it?.situacao === 'I' || it?.situacao === 'E') continue;
-          if (it?.id && !seenItemIds.has(it.id) && allItems.length < MAX_ITEMS) {
-            seenItemIds.add(it.id);
-            allItems.push(it);
-          }
-        }
-      };
-
-      // Prioritize newest registered products first (criterio=1, pages 1..3) so new drops always sync images immediately
-      for (let p = 1; p <= 3 && allItems.length < MAX_ITEMS; p++) {
-        const latestPage = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=1&tipo=T`);
-        const latestItems = latestPage?.data || [];
-        if (latestItems.length === 0) break;
-        pushUniqueItems(latestItems);
-        if (latestItems.length < 100) break;
-        await sleep(160);
-      }
-
-      for (let p = 1; p <= 100 && allItems.length < MAX_ITEMS; p++) {
-        const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2&tipo=T`);
-        const items = pageData?.data || [];
-        if (items.length === 0) break;
-        pushUniqueItems(items);
-        if (items.length < 100) break;
-        await sleep(180);
-      }
-
-      console.log(`[Bling Image Sync] Listed ${allItems.length} Bling items. Extracting summary & preparing GET /produtos/{id} detail sync...`);
-
-      // Collect unique parent/standalone product IDs first (in Bling v3, GET /produtos/{id} returns full midia.imagens.internas + variacoes)
-      const detailTargetMap = new Map<number, any>();
-      const childItems: any[] = [];
-
-      for (const item of allItems) {
-        // Save ONLY non-thumbnail URLs from /produtos list summary; /t/ thumbnails await GET /produtos/{id} full-res .link
-        const listImgs = extractImagesFromBlingItem(item).filter(u => !isThumbnailLikeUrl(u));
-        if (listImgs.length > 0) {
-          applyImageRecordToStore(store, {
-            sku: item.codigo,
-            id: item.id,
-            parentId: item.idProdutoPai,
-            name: item.nome
-          }, listImgs);
-        }
-
-        if (item.id && !item.idProdutoPai) {
-          detailTargetMap.set(item.id, item);
-        } else if (item.id) {
-          childItems.push(item);
-        }
-      }
-
-      // If any child item references a parent ID not present in page results, ensure parent ID is fetched too
-      for (const child of childItems) {
-        if (child.idProdutoPai && !detailTargetMap.has(child.idProdutoPai)) {
-          detailTargetMap.set(child.idProdutoPai, {
-            id: child.idProdutoPai,
-            nome: child.nome,
-            codigo: child.codigo
-          });
-        }
-      }
-
-      const detailTargets = Array.from(detailTargetMap.values()).slice(0, maxDetailFetches);
-      console.log(`[Bling Image Sync] Fetching GET /produtos/{id} for ${detailTargets.length} products to read midia.imagens.internas...`);
-
-      const parentsWithImages = new Set<number>();
-
-      for (let idx = 0; idx < detailTargets.length; idx++) {
-        while (catalogFetchInProgress) {
-          await sleep(400);
-        }
-        const item = detailTargets[idx];
-        try {
-          const detail = await fetchFromBling(`/produtos/${item.id}`);
-          const fullData = detail?.data || detail;
-          detailedFetched++;
-
-          const fullImgs = extractImagesFromBlingItem(fullData);
-          if (fullImgs.length > 0) {
-            parentsWithImages.add(item.id);
-            applyImageRecordToStore(store, {
-              sku: fullData?.codigo || item.codigo,
-              id: fullData?.id || item.id,
-              parentId: fullData?.idProdutoPai || item.idProdutoPai,
-              name: fullData?.nome || item.nome
-            }, fullImgs);
-            blingCount++;
-          }
-
-          // Map all variations returned by GET /produtos/{id}
-          if (Array.isArray(fullData?.variacoes)) {
-            for (const v of fullData.variacoes) {
-              const vImgs = extractImagesFromBlingItem(v, false);
-              const effectiveVarImgs = vImgs.length > 0 ? vImgs : fullImgs;
-              if (effectiveVarImgs.length > 0) {
-                applyImageRecordToStore(store, {
-                  sku: v.codigo,
-                  id: v.id,
-                  parentId: fullData?.id || item.id,
-                  name: v.nome || fullData?.nome || item.nome
-                }, effectiveVarImgs);
-              }
-            }
-          }
-
-          // Save incrementally every 20 items so the storefront reflects new photos right away
-          if (detailedFetched % 20 === 0) {
-            saveImageStore(store);
-            options?.onBatchSaved?.();
-          }
-
-          // Respect Bling API v3 rate limit (~2.3 req/sec leaving headroom for live storefront calls)
-          await sleep(420);
-        } catch (detailErr: any) {
-          console.warn(`[Bling Image Sync] Detail fetch skipped for ID ${item.id}:`, detailErr?.message || detailErr);
-        }
-      }
-
-      // Fallback: if a child variation has no images from its parent yet, fetch its own /produtos/{child.id}
-      if (detailedFetched < maxDetailFetches) {
-        const orphanChildren = childItems.filter(
-          c => c.id && (!c.idProdutoPai || !parentsWithImages.has(c.idProdutoPai))
-        );
-        for (const child of orphanChildren) {
-          if (detailedFetched >= maxDetailFetches) break;
-          while (catalogFetchInProgress) {
-            await sleep(400);
-          }
-          const normName = child.nome ? normalizeProductName(child.nome) : '';
-          const alreadyHasByName = normName && store.byName[normName]?.some(u => !isLegacyExternalUrl(u));
-          if (alreadyHasByName) continue;
-
-          try {
-            const detail = await fetchFromBling(`/produtos/${child.id}`);
-            const fullData = detail?.data || detail;
-            detailedFetched++;
-            const childImgs = extractImagesFromBlingItem(fullData);
-            if (childImgs.length > 0) {
-              applyImageRecordToStore(store, {
-                sku: fullData?.codigo || child.codigo,
-                id: fullData?.id || child.id,
-                parentId: fullData?.idProdutoPai || child.idProdutoPai,
-                name: fullData?.nome || child.nome
-              }, childImgs);
-              blingCount++;
-            }
-            await sleep(340);
-          } catch {
-            // continue
-          }
-        }
-      }
-
-      saveImageStore(store);
-      lastSyncCompletedAt = Date.now();
-      options?.onBatchSaved?.();
-
-      console.log(`[Bling Image Sync] Finished: ${blingCount} Bling products synced (${detailedFetched} /produtos/{id} detail requests).`);
-
-      const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
-
-      return {
-        success: true,
-        updatedCount: blingCount,
-        detailedFetched,
-        totalWithImages,
-        sources: { bling: blingCount },
-        connected: true,
-        message: blingCount > 0
-          ? `Sincronização concluída! ${blingCount} produtos atualizados com fotos reais armazenadas no Bling ERP.`
-          : `Conexão com Bling verificada (${allItems.length} itens consultados), porém nenhuma imagem interna/externa foi retornada em midia.imagens ou imagemURL.`
-      };
-    } catch (blingErr: any) {
-      const errMessage = blingErr?.message || String(blingErr);
-      const isAuthErr =
-        errMessage.includes('401') ||
-        errMessage.includes('OAuth') ||
-        errMessage.includes('invalid_grant') ||
-        errMessage.includes('expirad');
-      saveImageStore(store);
-      const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
-      if (isAuthErr) {
-        console.log('[Bling Image Sync] Sessão OAuth do Bling pendente de nova autorização; mantendo banco de imagens local.');
-        return {
-          success: true,
-          updatedCount: blingCount,
-          detailedFetched,
-          totalWithImages,
-          sources: { bling: blingCount },
-          connected: false,
-          error: errMessage,
-          message: `Banco de imagens local ativo (${totalWithImages} mapeamentos). Reconecte o Bling ERP via OAuth para atualizar fotos.`
-        };
-      }
-      console.warn('[Bling Image Sync] Notice during Bling API fetch:', errMessage);
-      return {
-        success: false,
-        updatedCount: blingCount,
-        detailedFetched,
-        totalWithImages,
-        sources: { bling: blingCount },
-        connected: await ensureBlingAuthorized(),
-        error: errMessage,
-        message: `Erro ao consultar API do Bling: ${errMessage}`
-      };
-    }
-  })().finally(() => {
-    activeSyncPromise = null;
-  });
-
-  return activeSyncPromise;
+  return {
+    success: true,
+    orderNumber,
+    orderId: remoteId,
+    status: 'pago',
+    order: storedOrder,
+    blingSynced
+  };
 }

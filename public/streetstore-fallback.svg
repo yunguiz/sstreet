@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 600" width="600" height="600" role="img" aria-label="Street Store Oficial">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0a0a0c"/>
+      <stop offset="50%" stop-color="#121216"/>
+      <stop offset="100%" stop-color="#09090b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="46%" r="52%">
+      <stop offset="0%" stop-color="#E50914" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#E50914" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="600" height="600" fill="url(#bg)"/>
+  <rect width="600" height="600" fill="url(#glow)"/>
+  <rect x="28" y="28" width="544" height="544" rx="16" fill="none" stroke="#27272a" stroke-width="1.5"/>
+  <line x1="210" y1="224" x2="390" y2="224" stroke="#E50914" stroke-width="3"/>
+  <text x="300" y="288" text-anchor="middle" fill="#ffffff" font-family="Arial Black, Impact, sans-serif" font-size="48" font-weight="900" letter-spacing="6">STREET</text>
+  <text x="300" y="344" text-anchor="middle" fill="#E50914" font-family="Arial Black, Impact, sans-serif" font-size="48" font-weight="900" letter-spacing="8">STORE</text>
+  <text x="300" y="390" text-anchor="middle" fill="#a1a1aa" font-family="Arial, sans-serif" font-size="14" font-weight="700" letter-spacing="5">STREETWEAR OFICIAL</text>
+  <line x1="240" y1="416" x2="360" y2="416" stroke="#27272a" stroke-width="1.5"/>
+</svg>

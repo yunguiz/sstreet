@@ -413,7 +413,7 @@ function StorefrontApp() {
       <VipBanner />
 
       {/* 7. Instagram Feed (@streetstoreitabira) & Customer Social Proof */}
-      <SocialProofSection />
+      <SocialProofSection products={products} />
 
       {/* 8. Complete Official Footer */}
       <Footer

@@ -455,7 +455,12 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
               if (group.price > 0) match.price = group.price;
               if (blingExtractedImages.length > 0) {
                 const existingReal = (match.images || []).filter((u: string) => !isPlaceholderImageUrl(u));
-                match.images = Array.from(new Set([...blingExtractedImages, ...existingReal]));
+                const existingFullRes = existingReal.filter((u: string) => !isThumbnailLikeUrl(u));
+                const incomingFullRes = blingExtractedImages.filter((u: string) => !isThumbnailLikeUrl(u));
+                const preferred = [...incomingFullRes, ...existingFullRes];
+                match.images = Array.from(
+                  new Set(preferred.length > 0 ? preferred : [...blingExtractedImages, ...existingReal])
+                );
               }
             }
             continue;
@@ -650,12 +655,28 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                 const fullData = detail?.data || detail;
                 const detailImgs = extractImagesFromBlingItem(fullData);
                 if (detailImgs.length > 0) {
-                  target.productRef.images = detailImgs;
+                  const detailFull = detailImgs.filter((u: string) => !isThumbnailLikeUrl(u));
+                  const existingImgs: string[] = Array.isArray(target.productRef.images)
+                    ? target.productRef.images.filter((u: unknown): u is string => typeof u === 'string')
+                    : [];
+                  const existingFull = existingImgs.filter(
+                    (u: string) => !isPlaceholderImageUrl(u) && !isThumbnailLikeUrl(u)
+                  );
+                  const merged: string[] = Array.from(
+                    new Set<string>(
+                      detailFull.length > 0
+                        ? [...detailFull, ...existingFull]
+                        : existingFull.length > 0
+                        ? existingFull
+                        : detailImgs
+                    )
+                  );
+                  target.productRef.images = merged;
                   if (
                     applyImageRecordToStore(
                       imageStore,
                       { sku: target.sku, id: target.id, name: target.baseName },
-                      detailImgs
+                      merged
                     )
                   ) {
                     imageStoreDirty = true;
@@ -2007,7 +2028,7 @@ async function setupViteOrStatic() {
 
           if (hasFirebaseAdminEnv()) {
             jobs.push(
-              syncAllBlingProdutosToFirestore({ enrichHighResImages: false })
+              syncAllBlingProdutosToFirestore({ enrichHighResImages: true })
                 .then((syncFs) => {
                   console.log(`[Startup Bling Firestore] ${syncFs.totalImportado} itens sincronizados em ${syncFs.documentosGravados} docs.`);
                 })
@@ -2064,7 +2085,7 @@ async function setupViteOrStatic() {
         try {
           if (await ensureBlingAuthorized({ verifyLive: true })) {
             if (hasFirebaseAdminEnv()) {
-              syncAllBlingProdutosToFirestore({ enrichHighResImages: false }).catch(() => {});
+              syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
             }
             if (!isImageSyncRunning()) {
               syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })

@@ -388,10 +388,34 @@ export async function getValidBlingToken(): Promise<string> {
 
 export const interceptBlingTokenBeforeSync = getValidBlingToken;
 
+let blingRateLimitTail: Promise<void> = Promise.resolve();
+let lastBlingRequestAt = 0;
+const MIN_BLING_REQUEST_INTERVAL_MS = 360;
+
+export async function acquireBlingRateLimitSlot(): Promise<void> {
+  const prev = blingRateLimitTail;
+  let release!: () => void;
+  blingRateLimitTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+
+  await prev;
+  try {
+    const now = Date.now();
+    const elapsed = now - lastBlingRequestAt;
+    if (elapsed < MIN_BLING_REQUEST_INTERVAL_MS) {
+      await new Promise((r) => setTimeout(r, MIN_BLING_REQUEST_INTERVAL_MS - elapsed));
+    }
+    lastBlingRequestAt = Date.now();
+  } finally {
+    release();
+  }
+}
+
 /**
  * Interceptor HTTP completo para todas as requisições à API v3 do Bling:
  * 1. Antes da chamada, valida expiração e renova via refresh_token se expirado ou < 10 min.
- * 2. Trata 429 (Rate Limit) com backoff progressivo.
+ * 2. Respeita cadência <= 3 req/s e trata 429 (Rate Limit) com backoff progressivo.
  * 3. Em 401 inesperado, força renovação via refresh_token e reexecuta transparentemente.
  */
 export async function blingApiRequest<T = unknown>(
@@ -401,6 +425,8 @@ export async function blingApiRequest<T = unknown>(
 ): Promise<T> {
   const token = await getValidBlingToken();
   const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
+
+  await acquireBlingRateLimitSlot();
 
   const response = await fetch(url, {
     ...init,
@@ -413,8 +439,12 @@ export async function blingApiRequest<T = unknown>(
     },
   });
 
-  if (response.status === 429 && rateLimitAttempt < 3) {
-    const waitMs = 600 * (rateLimitAttempt + 1);
+  if (response.status === 429 && rateLimitAttempt < 5) {
+    const retryAfterSec = Number(response.headers.get('retry-after') || '0');
+    const waitMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(8000, retryAfterSec * 1000)
+        : 1100 * (rateLimitAttempt + 1);
     await new Promise((r) => setTimeout(r, waitMs));
     return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
   }
@@ -427,6 +457,7 @@ export async function blingApiRequest<T = unknown>(
         force: true,
         failedAccessToken: token,
       });
+      await acquireBlingRateLimitSlot();
       const retryRes = await fetch(url, {
         ...init,
         headers: {

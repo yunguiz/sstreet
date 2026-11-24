@@ -15,6 +15,7 @@ import {
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
 import { calculateShippingQuotes, ShippingOption } from '../services/shipping';
+import { ProductImage } from './ProductImage';
 
 interface ProductModalProps {
   product: Product | null;
@@ -145,9 +146,11 @@ export function ProductModal({
           <div className="p-4 sm:p-6 bg-zinc-950 flex flex-col justify-between border-b md:border-b-0 md:border-r border-[#262626]">
             {/* Main Active Image */}
             <div className="relative aspect-square w-full rounded-xl overflow-hidden bg-[#181818] border border-zinc-800">
-              <img
+              <ProductImage
                 src={product.images[selectedImage] || product.images[0]}
+                candidates={product.images}
                 alt={product.name}
+                loading="eager"
                 className="w-full h-full object-cover object-center"
               />
               {product.tag && (
@@ -170,7 +173,7 @@ export function ProductModal({
                         : 'border-zinc-800 opacity-60 hover:opacity-100'
                     }`}
                   >
-                    <img src={img} alt="" className="w-full h-full object-cover" />
+                    <ProductImage src={img} alt="" className="w-full h-full object-cover" />
                   </button>
                 ))}
               </div>

@@ -1,6 +1,7 @@
 import { motion } from 'motion/react';
 import { Crown, X, ShoppingBag, Trash2, ArrowRight } from 'lucide-react';
 import { Product } from '../types';
+import { ProductImage } from './ProductImage';
 
 interface FavoritesDrawerProps {
   isOpen: boolean;
@@ -87,8 +88,9 @@ export function FavoritesDrawer({
                     }}
                     className="w-18 h-18 rounded-lg bg-zinc-900 border border-zinc-800 overflow-hidden shrink-0 cursor-pointer"
                   >
-                    <img
+                    <ProductImage
                       src={product.images[0]}
+                      candidates={product.images}
                       alt={product.name}
                       className="w-full h-full object-cover hover:scale-105 transition-transform"
                     />

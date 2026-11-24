@@ -1,5 +1,4 @@
 import { Product } from '../types';
-import { PRODUCTS as FALLBACK_PRODUCTS } from '../data/products';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
 
@@ -177,9 +176,9 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
   statusText: string;
 }> {
   try {
-    const url = forceRefresh 
-      ? `/api/products?refresh=true&_t=${Date.now()}` 
-      : '/api/products';
+    const url = forceRefresh
+      ? `/api/catalog/products?refresh=true&_t=${Date.now()}`
+      : '/api/catalog/products';
 
     const res = await fetch(url, {
       headers: {
@@ -205,18 +204,17 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
       };
     }
 
-    // Fallback if needed
     return {
-      products: filterVisibleProducts(FALLBACK_PRODUCTS),
+      products: [],
       isLive: false,
-      statusText: 'Catálogo de Drops Street Store Oficial',
+      statusText: 'Aguardando sincronização com Bling ERP',
     };
   } catch (error) {
-    console.warn('Usando catálogo local de reserva:', error);
+    console.warn('Catálogo Bling indisponível:', error);
     return {
-      products: filterVisibleProducts(FALLBACK_PRODUCTS),
+      products: [],
       isLive: false,
-      statusText: 'Catálogo de Drops Street Store Oficial',
+      statusText: 'Aguardando sincronização com Bling ERP',
     };
   }
 }
