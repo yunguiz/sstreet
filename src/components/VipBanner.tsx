@@ -51,7 +51,7 @@ export function VipBanner() {
 
             <div className="lg:col-span-4 flex flex-col items-start lg:items-end justify-center">
               <a
-                href="https://wa.me/5531984806556?text=Ol%C3%A1%20Street%20Store%2C%20gostaria%20de%20entrar%20no%20Grupo%20VIP%20do%20WhatsApp!"
+                href="https://chat.whatsapp.com/Ko13sIOfJ0vGSEkteDFJI8?s=cl&p=i&iam=2"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="w-full sm:w-auto px-8 py-4 rounded-xl bg-green-600 hover:bg-green-500 text-white font-black text-sm uppercase tracking-wider transition-all duration-200 active:scale-95 shadow-xl shadow-green-950/80 flex items-center justify-center gap-3 whitespace-nowrap cursor-pointer"
