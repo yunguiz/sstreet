@@ -1,0 +1,126 @@
+﻿
+api\index.ts:5:app.use('/api/bling', blingRouter);
+functions\lib\index.js:67:        const forwardedHost = req.headers['x-forwarded-host'] || 
+req.get('host') || '';
+functions\src\index.ts:40:      const forwardedHost = (req.headers['x-forwarded-host'] as string) || 
+req.get('host') || '';
+lib\blingSyncProdutos.ts:175:      parsed.searchParams.delete(key);
+lib\blingSyncProdutos.ts:429:    return realStockMap.get(idKey)!;
+lib\blingSyncProdutos.ts:458:  const results = await Promise.all(
+lib\blingSyncProdutos.ts:574:    let entry = grouped.get(docId);
+lib\blingSyncProdutos.ts:710:      const existingData = existingByDocId.get(g.docId);
+lib\blingSyncProdutos.ts:729:      await Promise.all(
+lib\blingSyncProdutos.ts:814:      const existingData = existingByDocId.get(group.docId);
+lib\blingSyncProdutos.ts:883:        sizeSet.delete('Único');
+lib\blingSyncProdutos.ts:891:        colorSet.delete('Padrão');
+lib\blingSyncProdutos.ts:1046:  const snap = await db.collection('products').get();
+lib\blingToken.ts:168:    const snap = await getAdminFirestore().doc(BLING_FIRESTORE_DOC).get();
+lib\blingToken.ts:248:        const snap = await tx.get(docRef);
+lib\blingToken.ts:283:        const afterWait = await docRef.get();
+lib\blingToken.ts:325:      const fallbackSnap = await docRef.get().catch(() => null);
+lib\blingToken.ts:365:  const snap = await db.doc(BLING_FIRESTORE_DOC).get();
+lib\blingToken.ts:443:    const retryAfterSec = Number(response.headers.get('retry-after') || '0');
+lib\blingToken.ts:453:    const snap = await getAdminFirestore().doc(BLING_FIRESTORE_DOC).get();
+scripts\sync-bling.js:28:    cleanCode = params.get('code') || cleanCode;
+server-bling-db.ts:89:        .get() as BlingTokenRecord | undefined;
+server-bling-images.ts:508:    const retryAfterSec = Number(res.headers.get('retry-after') || '0');
+server-bling-images.ts:582:    const host = (req.headers['x-forwarded-host'] as string) || 
+req.headers.host || req.get('host');
+server-bling-images.ts:587:  app.get('/api/bling/auth-url', (req: Request, res: Response) => {
+server-bling-images.ts:604:  app.get('/api/bling/authorize', (req: Request, res: Response) => {
+server-bling-images.ts:622:        extractedCode = parsed.searchParams.get('code');
+server-bling-images.ts:676:  app.post('/api/bling/token', async (req: Request, res: Response) => {
+server-bling-images.ts:700:  app.get(['/bling/callback', '/bling/callback/', '/auth/callback', 
+'/auth/callback/'], async (req: Request, res: Response) => {
+server-bling-images.ts:861:  app.post('/api/bling/exchange-code', async (req: Request, res: Response) 
+=> {
+server-bling-images.ts:888:  app.post('/api/bling/set-token', async (req: Request, res: Response) => {
+server-bling-images.ts:919:  app.get('/api/bling/status', async (req: Request, res: Response) => {
+server-bling-images.ts:1022:  blingRouter.get('/keep-alive', async (req: Request, res: Response) => {
+server-bling-images.ts:1076:  blingRouter.all('/sync', verifySyncSecretMiddleware, 
+blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+server-bling-images.ts:1107:  blingRouter.all('/sync-produtos', verifySyncSecretMiddleware, 
+blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+server-bling-images.ts:1124:  app.use('/api/bling', blingRouter);
+server-bling-images.ts:1127:  app.get('/api/bling/products', blingAuthInterceptorMiddleware, async 
+(req: Request, res: Response) => {
+server-bling-images.ts:1243:  app.get('/api/bling/orders', createBlingAuthMiddleware({ 
+allowLocalFallback: true }), async (req: Request, res: Response) => {
+server-bling-images.ts:1293:  app.post('/api/bling/orders', blingAuthInterceptorMiddleware, async (req: 
+Request, res: Response) => {
+server-bling-images.ts:1306:  app.get('/api/bling/stock', blingAuthInterceptorMiddleware, async (_req: 
+Request, res: Response) => {
+server-bling-images.ts:1325:  app.post('/api/bling/disconnect', (_req: Request, res: Response) => {
+server-bling.ts:573:    const host = (req.headers['x-forwarded-host'] as string) || req.headers.host || 
+req.get('host');
+server-bling.ts:578:  app.get('/api/bling/auth-url', (req: Request, res: Response) => {
+server-bling.ts:595:  app.get('/api/bling/authorize', (req: Request, res: Response) => {
+server-bling.ts:613:        extractedCode = parsed.searchParams.get('code');
+server-bling.ts:667:  app.post('/api/bling/token', async (req: Request, res: Response) => {
+server-bling.ts:691:  app.get(['/bling/callback', '/bling/callback/', '/auth/callback', 
+'/auth/callback/'], async (req: Request, res: Response) => {
+server-bling.ts:852:  app.post('/api/bling/exchange-code', async (req: Request, res: Response) => {
+server-bling.ts:879:  app.post('/api/bling/set-token', async (req: Request, res: Response) => {
+server-bling.ts:910:  app.get('/api/bling/status', async (req: Request, res: Response) => {
+server-bling.ts:1013:  blingRouter.get('/keep-alive', async (req: Request, res: Response) => {
+server-bling.ts:1067:  blingRouter.all('/sync', verifySyncSecretMiddleware, 
+blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+server-bling.ts:1098:  blingRouter.all('/sync-produtos', verifySyncSecretMiddleware, 
+blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+server-bling.ts:1115:  app.use('/api/bling', blingRouter);
+server-bling.ts:1118:  app.get('/api/bling/products', blingAuthInterceptorMiddleware, async (req: 
+Request, res: Response) => {
+server-bling.ts:1232:  app.get('/api/bling/orders', createBlingAuthMiddleware({ allowLocalFallback: 
+true }), async (req: Request, res: Response) => {
+server-bling.ts:1282:  app.post('/api/bling/orders', blingAuthInterceptorMiddleware, async (req: 
+Request, res: Response) => {
+server-bling.ts:1295:  app.get('/api/bling/stock', blingAuthInterceptorMiddleware, async (_req: 
+Request, res: Response) => {
+server-bling.ts:1314:  app.post('/api/bling/disconnect', (_req: Request, res: Response) => {
+server-melhor-envio.ts:414:  const [meRes, balanceRes] = await Promise.all([
+server-melhor-envio.ts:471:    const [info, companiesRes] = await Promise.all([
+server-melhor-envio.ts:571:  app.get('/api/melhor-envio/status', async (_req: Request, res: Response) 
+=> {
+server-melhor-envio.ts:589:  app.post(['/api/shipping/calculate', '/api/shipping/quote'], async (req: 
+Request, res: Response) => {
+server-melhor-envio.ts:617:  app.get('/api/shipping/track/:code', async (req: Request, res: Response) 
+=> {
+server-melhor-envio.ts:665:  app.post('/api/melhor-envio/webhook', (req: Request, res: Response) => {
+server.ts:48:app.use(express.json({ limit: '50mb' }));
+server.ts:49:app.use(express.urlencoded({ limit: '50mb', extended: true }));
+server.ts:278:          await Promise.all(
+server.ts:332:          const parentItem = parentId ? byBlingId.get(parentId) : null;
+server.ts:518:              return realStockMap.get(Number(it.id))!;
+server.ts:750:        const canonical = consolidatedMap.get(key);
+server.ts:865:app.get('/api/catalog/products', async (req: Request, res: Response) => {
+server.ts:905:app.post(['/api/webhooks/bling', '/api/bling/webhook'], async (req: Request, res: 
+Response) => {
+server.ts:947:app.all('/api/catalog/refresh', (req: Request, res: Response) => {
+server.ts:956:app.all(['/api/bling/clear-cache', '/api/bling/clear-image-cache'], (_req: Request, res: 
+Response) => {
+server.ts:963:app.all(['/api/bling/sync-images', '/api/bling/sync-media'], 
+blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+server.ts:981:app.post('/api/products/update-image', (req: Request, res: Response) => {
+server.ts:1011:app.post('/api/products/upload-image', (req: Request, res: Response) => {
+server.ts:1064:app.get('/api/bling/catalog-meta', (_req: Request, res: Response) => {
+server.ts:1081:app.post('/api/newsletter', (req: Request, res: Response) => {
+server.ts:1110:app.get('/api/orders/track', async (req: Request, res: Response) => {
+server.ts:1133:app.post('/api/orders/:id/return', (req: Request, res: Response) => {
+server.ts:1173:app.get('/api/mercadopago/status', async (_req: Request, res: Response) => {
+server.ts:1209:app.post('/api/mercadopago/create-preference', async (req: Request, res: Response) => {
+server.ts:1383:app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
+server.ts:1516:app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response) => {
+server.ts:1523:      const payment = localPaymentsMap.get(id);
+server.ts:1676:app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Response) => {
+server.ts:1681:      const p = localPaymentsMap.get(id);
+server.ts:1774:app.post('/api/mercadopago/process-card', async (req: Request, res: Response) => {
+server.ts:1949:app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
+server.ts:1956:app.all(['/checkout/api_integration', '/checkout/api_integration/*'], (_req: Request, 
+res: Response) => {
+server.ts:1973:app.use('/api/bling', blingRouter);
+server.ts:1994:    app.use(vite.middlewares);
+server.ts:1998:    app.use(express.static(distPath));
+server.ts:1999:    app.get('*', (_req: Request, res: Response) => {
+server.ts:2041:          return Promise.all(jobs).finally(async () => {
+
+

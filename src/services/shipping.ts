@@ -78,30 +78,6 @@ export interface ReturnRequestResult {
   error?: string;
 }
 
-async function parseSafeJson<T>(res: Response, fallbackError: string): Promise<T> {
-  const rawText = await res.text();
-  if (!rawText) {
-    return {
-      success: false,
-      connected: false,
-      orders: [],
-      error: `${fallbackError} (HTTP ${res.status})`,
-    } as unknown as T;
-  }
-
-  try {
-    return JSON.parse(rawText) as T;
-  } catch {
-    const cleanSnippet = rawText.replace(/\s+/g, ' ').trim().slice(0, 140);
-    return {
-      success: false,
-      connected: false,
-      orders: [],
-      error: `${fallbackError} (HTTP ${res.status}): ${cleanSnippet}`,
-    } as unknown as T;
-  }
-}
-
 /**
  * Calculates live shipping rates using Melhor Envio API v2 (Correios, Jadlog, Loggi, etc.)
  */
@@ -127,29 +103,27 @@ export async function calculateShippingQuotes(params: {
   }
 
   try {
-    const res = await fetch('/api/frete/calcular', {
+    const res = await fetch('/api/shipping/calculate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({
         cep: cleanCep,
-        cepDestino: cleanCep,
         items: params.items,
-        produtos: params.items,
-        cartTotal: params.cartTotal,
-      }),
+        cartTotal: params.cartTotal
+      })
     });
 
     if (!res.ok) {
       throw new Error(`Servidor de frete respondeu com status ${res.status}`);
     }
 
-    return await parseSafeJson<ShippingCalculationResult>(
-      res,
-      'Falha ao interpretar resposta do cálculo de frete'
-    );
+    const data = await res.json();
+    return data;
   } catch (error: any) {
     console.warn('[Melhor Envio] Falha na consulta de frete:', error);
-    // Fallback com PAC, SEDEX e Jadlog caso a API falhe
+    // Graceful fallback with standard Correios Sedex/PAC & Local pickup
     return {
       success: true,
       from: '35900539',
@@ -216,11 +190,7 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
       throw new Error(`Servidor respondeu com status ${res.status}`);
     }
 
-    const data = await parseSafeJson<{ success?: boolean; products?: Product[] }>(
-      res,
-      'Resposta inválida do catálogo'
-    );
-
+    const data = await res.json();
     if (data.success && Array.isArray(data.products) && data.products.length > 0) {
       const rawList: Product[] = data.products.map((p: Product) => ({
         ...p,
@@ -263,14 +233,7 @@ export async function checkStoreStatus(): Promise<{
   try {
     const res = await fetch('/api/status');
     if (!res.ok) throw new Error('Status failed');
-    const data = await parseSafeJson<{
-      connected?: boolean;
-      platform?: string;
-      storeName?: string;
-      city?: string;
-      cep?: string;
-    }>(res, 'Status inválido');
-
+    const data = await res.json();
     return {
       connected: data.connected ?? true,
       platform: data.platform || 'Bling ERP + Mercado Pago + Melhor Envio',
@@ -303,12 +266,12 @@ export async function trackOrder(query: string): Promise<{
   try {
     const cleanQuery = encodeURIComponent(query.trim().replace(/^#/, ''));
     const res = await fetch(`/api/orders/track?q=${cleanQuery}`);
-    return await parseSafeJson(res, 'Falha ao buscar pedido no sistema Bling / Melhor Envio');
+    return await res.json();
   } catch (error: any) {
     return {
       success: false,
       orders: [],
-      error: error?.message || 'Falha ao buscar pedido no sistema Bling / Melhor Envio'
+      error: error.message || 'Falha ao buscar pedido no sistema Bling / Melhor Envio'
     };
   }
 }
@@ -335,11 +298,11 @@ export async function requestOrderReturn(params: {
       },
       body: JSON.stringify(params)
     });
-    return await parseSafeJson(res, 'Erro ao registrar solicitação de devolução');
+    return await res.json();
   } catch (error: any) {
     return {
       success: false,
-      error: error?.message || 'Erro ao registrar solicitação de devolução'
+      error: error.message || 'Erro ao registrar solicitação de devolução'
     };
   }
 }
@@ -364,12 +327,8 @@ export interface MelhorEnvioStatus {
 }
 
 export async function getMelhorEnvioStatus(): Promise<MelhorEnvioStatus> {
-  try {
-    const res = await fetch('/api/melhor-envio/status');
-    return await parseSafeJson<MelhorEnvioStatus>(res, 'Falha ao consultar status do Melhor Envio');
-  } catch (error: any) {
-    return { connected: false, error: error?.message || 'Falha ao consultar status do Melhor Envio' };
-  }
+  const res = await fetch('/api/melhor-envio/status');
+  return res.json();
 }
 
 export async function getMelhorEnvioAuthUrl(): Promise<{
@@ -380,27 +339,20 @@ export async function getMelhorEnvioAuthUrl(): Promise<{
 }> {
   const res = await fetch('/api/melhor-envio/auth-url');
   if (!res.ok) throw new Error('Falha ao obter URL de autorização do Melhor Envio');
-  return parseSafeJson(res, 'Falha ao obter URL de autorização do Melhor Envio');
+  return res.json();
 }
 
 export async function saveMelhorEnvioToken(accessToken: string): Promise<{ success: boolean; message?: string; error?: string }> {
-  try {
-    const res = await fetch('/api/melhor-envio/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ access_token: accessToken })
-    });
-    return await parseSafeJson(res, 'Falha ao salvar token do Melhor Envio');
-  } catch (error: any) {
-    return { success: false, error: error?.message || 'Falha ao salvar token do Melhor Envio' };
-  }
+  const res = await fetch('/api/melhor-envio/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ access_token: accessToken })
+  });
+  return res.json();
 }
 
 export async function disconnectMelhorEnvio(): Promise<{ success: boolean }> {
-  try {
-    const res = await fetch('/api/melhor-envio/disconnect', { method: 'POST' });
-    return await parseSafeJson<{ success: boolean }>(res, 'Falha ao desconectar Melhor Envio');
-  } catch {
-    return { success: false };
-  }
+  const res = await fetch('/api/melhor-envio/disconnect', { method: 'POST' });
+  return res.json();
 }
+
