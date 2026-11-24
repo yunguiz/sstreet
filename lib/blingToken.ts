@@ -1,5 +1,5 @@
 import { Timestamp } from 'firebase-admin/firestore';
-import { getAdminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin';
+import { getAdminFirestore, isFirebaseAdminConfigured } from './firebaseAdmin.js';
 
 export const BLING_AUTHORIZE_URL = 'https://www.bling.com.br/Api/v3/oauth/authorize';
 export const BLING_TOKEN_ENDPOINT = 'https://www.bling.com.br/Api/v3/oauth/token';

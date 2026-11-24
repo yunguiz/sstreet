@@ -1,4 +1,4 @@
-import { Product } from '../types';
+import type { Product } from '../types/index.js';
 
 /**
  * BLING ERP OFFICIAL CATALOG (MEU NEGÓCIO - ESTOQUE DE PRODUTOS)

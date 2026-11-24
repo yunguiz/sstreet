@@ -1,4 +1,4 @@
-import { Product } from '../types';
+import type { Product } from '../types/index.js';
 
 /**
  * List of products hidden from the storefront per user directive:

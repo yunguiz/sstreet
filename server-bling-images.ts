@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { ensureBlingAuthorized, fetchFromBling } from './server-bling';
-import { Product } from './src/types';
+import { ensureBlingAuthorized, fetchFromBling } from './server-bling.js';
+import type { Product } from './src/types/index.js';
 
 const BUNDLED_IMAGES_STORE_FILE = path.resolve(process.cwd(), '.bling_product_images.json');
 const IMAGES_STORE_FILE = process.env.VERCEL

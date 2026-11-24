@@ -1,10 +1,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { exchangeBlingCodeForTokens } from '../../lib/blingToken';
+import { exchangeBlingCodeForTokens } from '../../lib/blingToken.js';
 
 /**
  * Vercel Serverless Function: GET /api/bling/callback
  * Recebe ?code=... do OAuth 2.0 do Bling, troca pelos tokens iniciais via
- * POST https://api.bling.com.br/v3/oauth/token e grava access_token, refresh_token
+ * POST https://www.bling.com.br/Api/v3/oauth/token e grava access_token, refresh_token
  * e expires_at no documento integrations/bling do Firestore.
  */
 export default async function handler(req: VercelRequest, res: VercelResponse) {

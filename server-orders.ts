@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { fetchFromBling, ensureBlingAuthorized } from './server-bling';
-import { addOrderToMelhorEnvioCart } from './server-melhor-envio';
+import { fetchFromBling, ensureBlingAuthorized } from './server-bling.js';
+import { addOrderToMelhorEnvioCart } from './server-melhor-envio.js';
 
 const ORDERS_STORE_PATH = path.resolve(
   process.env.VERCEL ? '/tmp' : process.cwd(),

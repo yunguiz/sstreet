@@ -2,14 +2,14 @@ import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { isProductHidden } from './src/lib/hiddenProducts';
-import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images';
+import { isProductHidden } from './src/lib/hiddenProducts.js';
+import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images.js';
 import {
   getBlingTokenFromDb,
   upsertBlingTokenInDb,
   clearBlingTokenFromDb,
   BLING_ACCESS_TTL_MS
-} from './server-bling-db';
+} from './server-bling-db.js';
 import {
   BLING_AUTHORIZE_URL,
   BLING_TOKEN_ENDPOINT,
@@ -23,12 +23,12 @@ import {
   saveBlingTokensToFirestore,
   refreshBlingTokenInFirestore,
   isBlingTokenExpiringOrExpired,
-} from './lib/blingToken';
+} from './lib/blingToken.js';
 import {
   syncAllBlingProdutosToFirestore,
   syncBlingProdutosPageToFirestore,
   verifySyncSecret,
-} from './lib/blingSyncProdutos';
+} from './lib/blingSyncProdutos.js';
 
 dotenv.config({ override: !process.env.VERCEL });
 

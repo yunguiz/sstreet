@@ -122,14 +122,6 @@ function findMatchingCatalogProduct(products: Product[], preset: CutoutCatalogPr
   });
 }
 
-function inferGarmentKind(product: Product): GarmentKind {
-  const lower = `${product.subcategory} ${product.name}`.toLowerCase();
-  if (lower.includes('moletom') || lower.includes('hoodie')) return 'hoodie';
-  if (lower.includes('jaqueta') || lower.includes('jacket') || lower.includes('corta vento')) return 'jacket';
-  if (lower.includes('casaco') || lower.includes('coat')) return 'coat';
-  if (lower.includes('polo') || lower.includes('camisa ')) return 'shirt';
-  return 'tee';
-}
 
 export const StreetwearRailSection: React.FC<StreetwearRailSectionProps> = ({
   products,
@@ -179,41 +171,6 @@ export const StreetwearRailSection: React.FC<StreetwearRailSectionProps> = ({
         backImage: preset.backImage || preset.image,
         sideImage: preset.sideImage,
         originalProduct: match,
-      });
-    }
-
-    // 2. Complementa com moletons/jaquetas/camisetas reais com recorte PNG transparente se houver no catálogo
-    const extraTransparentApparel = products.filter((p) => {
-      if (usedProductIds.has(p.id)) return false;
-      if (p.category !== 'roupas' || p.stockCount <= 0) return false;
-      const img = p.images?.[0] || '';
-      return /\.png(\?|$)/i.test(img);
-    });
-
-    for (const prod of extraTransparentApparel.slice(0, 4)) {
-      usedProductIds.add(prod.id);
-      const priceFormatted = formatBrl(prod.price);
-      const frontImg = prod.images[0];
-      const backImg = prod.images[1] && /\.png(\?|$)/i.test(prod.images[1]) ? prod.images[1] : frontImg;
-      const validSizes = (prod.sizes || []).filter(Boolean).slice(0, 5);
-
-      mapped.push({
-        id: prod.id,
-        name: prod.name,
-        kind: inferGarmentKind(prod),
-        color: prod.colors?.[0]?.hex || '#18181B',
-        trim: '#DC2626',
-        tag: priceFormatted,
-        priceFormatted,
-        description: prod.description,
-        details: [
-          ...(validSizes.length > 0 ? [`Tamanhos: ${validSizes.join(' · ')}`] : []),
-          ...(prod.details?.composition ? [prod.details.composition] : []),
-          `${prod.stockCount} un. em estoque`,
-        ].slice(0, 4),
-        image: frontImg,
-        backImage: backImg,
-        originalProduct: prod,
       });
     }
 

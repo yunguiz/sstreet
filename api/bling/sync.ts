@@ -3,8 +3,8 @@ import {
   syncAllBlingProdutosToFirestore,
   syncBlingProdutosPageToFirestore,
   verifySyncSecret,
-} from '../../lib/blingSyncProdutos';
-import { interceptBlingTokenBeforeSync } from '../../lib/blingToken';
+} from '../../lib/blingSyncProdutos.js';
+import { interceptBlingTokenBeforeSync } from '../../lib/blingToken.js';
 
 function extractSecretFromReq(req: VercelRequest): string {
   const querySecret = typeof req.query.secret === 'string' ? req.query.secret : '';
@@ -33,13 +33,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const cronSecret = (process.env.CRON_SECRET || '').trim();
-  if (cronSecret) {
-    const providedSecret = extractSecretFromReq(req);
-    if (!verifySyncSecret(providedSecret)) {
-      return res.status(401).json({
-        error: 'Não autorizado. Informe CRON_SECRET válido via header ou ?secret=.',
-      });
-    }
+  if (!cronSecret) {
+    return res.status(500).json({
+      error: 'Variável CRON_SECRET não configurada no servidor.',
+    });
+  }
+
+  const providedSecret = extractSecretFromReq(req);
+  if (!verifySyncSecret(providedSecret)) {
+    return res.status(401).json({
+      error: 'Não autorizado. Informe CRON_SECRET válido via header ou ?secret=.',
+    });
   }
 
   if (req.query.verify === 'true') {

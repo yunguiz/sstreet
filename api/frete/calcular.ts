@@ -4,7 +4,7 @@ import {
   isValidBrazilianCep,
   MelhorEnvioValidationError,
   ProdutoFreteInput,
-} from '../../lib/melhorEnvio';
+} from '../../lib/melhorEnvio.js';
 
 function parseRequestBody(rawBody: unknown): Record<string, unknown> {
   if (rawBody === null || rawBody === undefined || rawBody === '') {

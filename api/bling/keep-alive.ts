@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { getValidBlingToken } from '../../lib/blingToken';
+import { getValidBlingToken } from '../../lib/blingToken.js';
 
 /**
  * Vercel Cron Job Endpoint: GET /api/bling/keep-alive

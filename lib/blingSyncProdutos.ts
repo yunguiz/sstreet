@@ -2,13 +2,13 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { FieldValue } from 'firebase-admin/firestore';
-import { getAdminFirestore } from './firebaseAdmin';
+import { getAdminFirestore } from './firebaseAdmin.js';
 import {
   blingApiRequest,
   interceptBlingTokenBeforeSync,
   BLING_OFFICIAL_API_BASE,
   BLING_API_BASE,
-} from './blingToken';
+} from './blingToken.js';
 
 export { BLING_OFFICIAL_API_BASE, BLING_API_BASE };
 
