@@ -169,12 +169,12 @@ export async function calculateMelhorEnvioShipping(params: {
   const productsPayload = (params.items && params.items.length > 0)
     ? params.items.map((item, idx) => ({
         id: String(item.id || `item-${idx + 1}`),
-        width: Math.max(12, item.width || 25),
-        height: Math.max(4, item.height || 5),
-        length: Math.max(16, item.length || 25),
-        weight: Math.max(0.2, item.weight || 0.35),
-        insurance_value: Math.max(50, item.price || 139.9),
-        quantity: Math.max(1, item.quantity || 1)
+        width: Math.max(11, Number(item.width) || 25),
+        height: Math.max(2, Number(item.height) || 5),
+        length: Math.max(16, Number(item.length) || 25),
+        weight: Math.max(0.1, Number(item.weight) || 0.35),
+        insurance_value: Math.max(20, Number(item.price) || 139.9),
+        quantity: Math.max(1, Math.round(Number(item.quantity) || 1))
       }))
     : [
         {
@@ -183,7 +183,7 @@ export async function calculateMelhorEnvioShipping(params: {
           height: 5,
           length: 25,
           weight: 0.35,
-          insurance_value: params.cartTotal || 139.9,
+          insurance_value: Math.max(20, Number(params.cartTotal) || 139.9),
           quantity: 1
         }
       ];
@@ -320,17 +320,18 @@ export async function addOrderToMelhorEnvioCart(params: {
     const payload = {
       service: params.serviceId || 1,
       from: {
-        name: fromUser?.name || 'Street Store Itabira',
-        phone: fromUser?.phone || '31984806556',
-        email: fromUser?.email || 'streetstore364@gmail.com',
-        document: (fromUser?.document || '45892109000132').replace(/\D/g, ''),
-        address: 'Avenida João Pinheiro',
-        number: '353',
-        district: 'Centro',
-        city: 'Itabira',
-        state_abbr: 'MG',
+        name: (process.env.MELHOR_ENVIO_FROM_NAME || fromUser?.name || 'Street Store Itabira').trim(),
+        phone: (process.env.MELHOR_ENVIO_FROM_PHONE || fromUser?.phone || '31984806556').replace(/\D/g, ''),
+        email: (process.env.MELHOR_ENVIO_FROM_EMAIL || fromUser?.email || 'streetstore364@gmail.com').trim(),
+        document: (process.env.MELHOR_ENVIO_FROM_DOCUMENT || fromUser?.document || '45892109000132').replace(/\D/g, ''),
+        address: (process.env.MELHOR_ENVIO_FROM_STREET || 'Avenida João Pinheiro').trim(),
+        number: (process.env.MELHOR_ENVIO_FROM_NUMBER || '353').trim(),
+        complement: (process.env.MELHOR_ENVIO_FROM_COMPLEMENT || '').trim(),
+        district: (process.env.MELHOR_ENVIO_FROM_DISTRICT || 'Centro').trim(),
+        city: (process.env.MELHOR_ENVIO_FROM_CITY || 'Itabira').trim(),
+        state_abbr: (process.env.MELHOR_ENVIO_FROM_STATE || 'MG').trim().slice(0, 2).toUpperCase(),
         country_id: 'BR',
-        postal_code: MELHOR_ENVIO_FROM_POSTAL_CODE
+        postal_code: sanitizeCep(MELHOR_ENVIO_FROM_POSTAL_CODE) || '35900539'
       },
       to: {
         name: params.customer.name || 'Cliente Street Store',

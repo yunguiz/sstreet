@@ -51,6 +51,7 @@ export interface ClothingRailHeroProps extends React.ComponentProps<"section"> {
   hanger?: "wood" | "matte" | "none";
   labels?: ClothingRailHeroLabels;
   onOpenChange?: (index: number | null) => void;
+  renderDetailAction?: (item: RailGarment, index: number, closeModal: () => void) => React.ReactNode;
 }
 
 const VB_W = 200;
@@ -501,7 +502,22 @@ function SideArt({ uid, kind, color, trim }: { uid: string; kind: GarmentKind; c
 }
 
 function Photo({ src, alt, full }: { src: string; alt: string; full: boolean }) {
-  return <img src={src} alt={alt} draggable={false} className={`pointer-events-none absolute inset-x-0 bottom-0 size-auto w-full select-none object-contain object-top ${full ? "top-0 h-full" : "top-[8%] h-[92%]"}`} />;
+  return (
+    <span
+      className={`pointer-events-none absolute inset-x-0 bottom-0 flex items-start justify-center overflow-hidden ${
+        full ? "top-0" : "top-[8%]"
+      }`}
+    >
+      <img
+        src={src}
+        alt={alt}
+        draggable={false}
+        loading="eager"
+        decoding="async"
+        className="h-full w-full select-none object-contain object-top"
+      />
+    </span>
+  );
 }
 
 type Sim = {
@@ -533,6 +549,7 @@ export function ClothingRailHero({
   hanger = "wood",
   labels = DEFAULT_LABELS,
   onOpenChange,
+  renderDetailAction,
   className,
   ...rest
 }: ClothingRailHeroProps) {
@@ -1056,6 +1073,7 @@ export function ClothingRailHero({
           hanger={hanger}
           labels={labels}
           reduced={reduced}
+          renderDetailAction={renderDetailAction}
           source={() => turns.current[openIndex]?.getBoundingClientRect() ?? null}
           onLift={(lift) => setLifted(lift ? openIndex : null)}
           onClose={() => { const index = openIndex; returnFocus.current = index; close(); impulse(index, (index % 2 ? 1 : -1) * 44); }}
@@ -1065,7 +1083,7 @@ export function ClothingRailHero({
   );
 }
 
-function Detail({ uid, item, index, total, hanger, labels, reduced, source, onLift, onClose }: {
+function Detail({ uid, item, index, total, hanger, labels, reduced, renderDetailAction, source, onLift, onClose }: {
   uid: string;
   item: RailGarment;
   index: number;
@@ -1073,6 +1091,7 @@ function Detail({ uid, item, index, total, hanger, labels, reduced, source, onLi
   hanger: "wood" | "matte" | "none";
   labels: ClothingRailHeroLabels;
   reduced: boolean;
+  renderDetailAction?: (item: RailGarment, index: number, closeModal: () => void) => React.ReactNode;
   source: () => DOMRect | null;
   onLift: (lifted: boolean) => void;
   onClose: () => void;
@@ -1234,6 +1253,11 @@ function Detail({ uid, item, index, total, hanger, labels, reduced, source, onLi
               </button>
             ))}
           </div>
+          {renderDetailAction && (
+            <div className="mt-3 flex flex-wrap justify-center gap-2 md:justify-start">
+              {renderDetailAction(item, index, dismiss)}
+            </div>
+          )}
         </div>
       </div>
     </div>,

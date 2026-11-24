@@ -1,10 +1,11 @@
+import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
 import { BLING_STOCK_PRODUCTS } from '../src/data/blingCatalog';
 
-const NUVEMSHOP_USER_ID = process.env.NUVEMSHOP_USER_ID || '6486155';
-const NUVEMSHOP_ACCESS_TOKEN = process.env.NUVEMSHOP_ACCESS_TOKEN || 'e2ec763eeec1a6dd2c1b07e00cddad99ff1bf133';
-const NUVEMSHOP_USER_AGENT = process.env.NUVEMSHOP_USER_AGENT || 'StreetStore (streetstore364@gmail.com)';
+const NUVEMSHOP_USER_ID = (process.env.NUVEMSHOP_USER_ID || '').trim();
+const NUVEMSHOP_ACCESS_TOKEN = (process.env.NUVEMSHOP_ACCESS_TOKEN || '').trim();
+const NUVEMSHOP_USER_AGENT = (process.env.NUVEMSHOP_USER_AGENT || 'StreetStore (streetstore364@gmail.com)').trim();
 
 interface ImageStore {
   updatedAt: string;
@@ -41,8 +42,11 @@ async function main() {
   }
 
   // 1. Fetch live products from Nuvemshop (which are synced from Bling)
+  if (!NUVEMSHOP_USER_ID || !NUVEMSHOP_ACCESS_TOKEN) {
+    console.warn('⚠️ Variáveis NUVEMSHOP_USER_ID / NUVEMSHOP_ACCESS_TOKEN não configuradas no ambiente; pulando consulta à API Nuvemshop e mantendo cache/ativos locais.');
+  } else {
   try {
-    const url = `https://api.nuvemshop.com.br/v1/${NUVEMSHOP_USER_ID}/products?per_page=200&page=1`;
+    const url = `https://api.nuvemshop.com.br/v1/${encodeURIComponent(NUVEMSHOP_USER_ID)}/products?per_page=200&page=1`;
     const res = await fetch(url, {
       headers: {
         'Authentication': `bearer ${NUVEMSHOP_ACCESS_TOKEN}`,
@@ -90,6 +94,7 @@ async function main() {
     }
   } catch (err) {
     console.warn('Erro ao consultar Nuvemshop:', err);
+  }
   }
 
   // 2. Real local product assets mapping

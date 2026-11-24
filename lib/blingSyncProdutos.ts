@@ -316,7 +316,12 @@ function parseVariantMeta(item: BlingProdutoRaw): {
   };
 }
 
-function getStockQuantity(item: BlingProdutoRaw, realStockMap?: Map<string, number>): number {
+interface StockResolution {
+  stock: number;
+  rawStock: number;
+}
+
+function resolveStockQuantity(item: BlingProdutoRaw, realStockMap?: Map<string, StockResolution>): StockResolution {
   const idKey = String(item.id);
   if (realStockMap && realStockMap.has(idKey)) {
     return realStockMap.get(idKey)!;
@@ -327,15 +332,21 @@ function getStockQuantity(item: BlingProdutoRaw, realStockMap?: Map<string, numb
     item.estoque?.saldoFisico ??
     0;
   const parsed = Number(raw);
-  return Number.isFinite(parsed) ? Math.max(0, parsed) : 0;
+  if (!Number.isFinite(parsed)) {
+    return { stock: 0, rawStock: 0 };
+  }
+  return {
+    stock: Math.max(0, parsed),
+    rawStock: parsed,
+  };
 }
 
 async function fetchBlingJson<T = unknown>(pathAndQuery: string): Promise<T> {
   return blingApiRequest<T>(pathAndQuery, { method: 'GET' });
 }
 
-async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, number>> {
-  const stockMap = new Map<string, number>();
+async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, StockResolution>> {
+  const stockMap = new Map<string, StockResolution>();
   const uniqueIds = Array.from(new Set(ids.filter(Boolean)));
   const chunks: string[][] = [];
   for (let i = 0; i < uniqueIds.length; i += 50) {
@@ -365,7 +376,12 @@ async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, numb
       const pId = entry?.produto?.id;
       if (pId !== undefined && pId !== null) {
         const bal = entry.saldoVirtualTotal ?? entry.saldoFisicoTotal ?? entry.saldoFisico ?? 0;
-        stockMap.set(String(pId), Math.max(0, Number(bal) || 0));
+        const parsed = Number(bal);
+        const safeRaw = Number.isFinite(parsed) ? parsed : 0;
+        stockMap.set(String(pId), {
+          stock: Math.max(0, safeRaw),
+          rawStock: safeRaw,
+        });
       }
     }
   }
@@ -375,7 +391,7 @@ async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, numb
 /**
  * Busca uma página (100 produtos ativos) na API v3 do Bling e grava em lote via WriteBatch
  * na coleção `products` do Firestore usando o `id` do Bling (ou `idProdutoPai` para variações)
- * como ID do documento com `{ merge: true }`.
+ * como ID do documento com `{ merge: true }` e mesclagem segura entre páginas.
  */
 export async function syncBlingProdutosPageToFirestore(
   paginaInput: number,
@@ -403,6 +419,32 @@ export async function syncBlingProdutosPageToFirestore(
   const itemIds = lista.map((item) => String(item.id));
   const realStockMap = await fetchStockBalancesForIds(itemIds);
   const imageSeed = loadReadOnlyImageSeed();
+  const loggedNegativeIds = new Set<string>();
+
+  const readStockWithLog = (targetItem: BlingProdutoRaw): number => {
+    const resolved = resolveStockQuantity(targetItem, realStockMap);
+    const idKey = String(targetItem.id);
+    if (resolved.rawStock < 0 && !loggedNegativeIds.has(idKey)) {
+      loggedNegativeIds.add(idKey);
+      console.warn(
+        `[Bling Sync][Estoque Negativo] pagina=${pagina} id=${idKey} codigo="${String(
+          targetItem.codigo || 'N/A'
+        )}" nome="${String(targetItem.nome || '')}" saldo_bling=${resolved.rawStock} -> ajustado para 0 na loja.`
+      );
+    }
+    return resolved.stock;
+  };
+
+  type GroupedVariation = {
+    blingId: string;
+    codigo: string;
+    nome: string;
+    tamanho: string;
+    cor: string;
+    preco: number;
+    estoque: number;
+    imagemURL: string;
+  };
 
   type GroupedProductWrite = {
     docId: string;
@@ -420,19 +462,7 @@ export async function syncBlingProdutosPageToFirestore(
     descricao?: string;
     sizes: Set<string>;
     colors: Set<string>;
-    variacoes: Record<
-      string,
-      {
-        blingId: string;
-        codigo: string;
-        nome: string;
-        tamanho: string;
-        cor: string;
-        preco: number;
-        estoque: number;
-        imagemURL: string;
-      }
-    >;
+    variacoes: Record<string, GroupedVariation>;
     hasParentRecord: boolean;
   };
 
@@ -456,8 +486,8 @@ export async function syncBlingProdutosPageToFirestore(
   };
 
   const mergeImages = (target: string[], incoming: string[]) => {
-    const combined = [...target];
-    for (const url of incoming) {
+    const combined: string[] = [];
+    for (const url of [...target, ...incoming]) {
       if (url && !combined.includes(url)) {
         combined.push(url);
       }
@@ -474,7 +504,7 @@ export async function syncBlingProdutosPageToFirestore(
 
     const group = ensureGroup(docId);
     const meta = parseVariantMeta(item);
-    const stock = getStockQuantity(item, realStockMap);
+    const stock = readStockWithLog(item);
     const price = Number(item.preco || 0);
     const skuKey = String(item.codigo || '').toUpperCase().trim();
     const seedImgs = [
@@ -508,7 +538,7 @@ export async function syncBlingProdutosPageToFirestore(
       if (Array.isArray(item.variacoes) && item.variacoes.length > 0) {
         for (const v of item.variacoes) {
           const vMeta = parseVariantMeta(v);
-          const vStock = getStockQuantity(v, realStockMap);
+          const vStock = readStockWithLog(v);
           const vPrice = Number(v.preco || price || 0);
           const vImgs = extractAllImageUrls(v);
           const vImg = vImgs[0] || primaryImg;
@@ -596,12 +626,75 @@ export async function syncBlingProdutosPageToFirestore(
   // Firestore WriteBatch suporta no máximo 500 operações por commit
   for (let i = 0; i < entries.length; i += 400) {
     const slice = entries.slice(i, i + 400);
+    const docRefs = slice.map((g) => db.collection('products').doc(g.docId));
+
+    // Lê os documentos existentes em lote para preservar variações/estoque e dados do pai entre páginas
+    const existingSnaps = docRefs.length > 0 ? await db.getAll(...docRefs) : [];
+    const existingByDocId = new Map<string, Record<string, unknown>>();
+    existingSnaps.forEach((snap) => {
+      if (snap.exists) {
+        existingByDocId.set(snap.id, (snap.data() || {}) as Record<string, unknown>);
+      }
+    });
+
     const batch = db.batch();
 
-    for (const group of slice) {
-      const docRef = db.collection('products').doc(group.docId);
-      const variacoesList = Object.values(group.variacoes);
-      const estoqueTotalVariacoes = variacoesList.reduce((acc, v) => acc + v.estoque, 0);
+    for (let idx = 0; idx < slice.length; idx++) {
+      const group = slice[idx];
+      const docRef = docRefs[idx];
+      const existingData = existingByDocId.get(group.docId);
+
+      const existingVariacoes =
+        existingData && typeof existingData.variacoes === 'object' && existingData.variacoes !== null
+          ? (existingData.variacoes as Record<string, GroupedVariation>)
+          : {};
+
+      const mergedVariacoes: Record<string, GroupedVariation> = {
+        ...existingVariacoes,
+        ...group.variacoes,
+      };
+      const mergedVariacoesList = Object.values(mergedVariacoes);
+      const estoqueTotalVariacoes = mergedVariacoesList.reduce((acc, v) => {
+        const parsedVarStock = Number(v?.estoque ?? 0);
+        return acc + (Number.isFinite(parsedVarStock) ? Math.max(0, parsedVarStock) : 0);
+      }, 0);
+
+      if (!group.hasParentRecord) {
+        const orphanKeys = Object.values(group.variacoes)
+          .map((v) => v.codigo || v.blingId)
+          .join(', ');
+        console.warn(
+          `[Bling Sync][Variação sem Pai na Página ${pagina}] produtoPaiId=${group.docId} não veio na página ${pagina} (${Object.keys(group.variacoes).length} variação(ões): ${orphanKeys}). Mesclagem preservando campos existentes do pai.`
+        );
+      }
+
+      const existingImagens = Array.isArray(existingData?.imagens)
+        ? (existingData.imagens as string[]).filter((u) => typeof u === 'string' && u.length > 0)
+        : [];
+      const mergedImagens = group.hasParentRecord
+        ? mergeImages(group.imagens, existingImagens)
+        : mergeImages(existingImagens, group.imagens);
+      const mergedImagemURL =
+        mergedImagens[0] ||
+        (typeof existingData?.imagemURL === 'string' ? existingData.imagemURL : '') ||
+        group.imagemURL ||
+        '';
+
+      const existingSizes = Array.isArray(existingData?.tamanhos)
+        ? (existingData.tamanhos as string[]).filter((s) => typeof s === 'string' && s.trim() !== '')
+        : [];
+      const sizeSet = new Set<string>([...existingSizes, ...Array.from(group.sizes)]);
+      if (sizeSet.size > 1 && sizeSet.has('Único')) {
+        sizeSet.delete('Único');
+      }
+
+      const existingColors = Array.isArray(existingData?.cores)
+        ? (existingData.cores as string[]).filter((c) => typeof c === 'string' && c.trim() !== '')
+        : [];
+      const colorSet = new Set<string>([...existingColors, ...Array.from(group.colors)]);
+      if (colorSet.size > 1 && colorSet.has('Padrão')) {
+        colorSet.delete('Padrão');
+      }
 
       const payload: Record<string, unknown> = {
         blingId: group.blingId,
@@ -614,36 +707,46 @@ export async function syncBlingProdutosPageToFirestore(
         payload.nome = group.nome;
         payload.codigo = group.codigo;
         payload.preco = group.preco ?? 0;
-        payload.estoque = variacoesList.length > 0 ? estoqueTotalVariacoes : (group.estoqueDireto ?? 0);
-        if (group.imagemURL) payload.imagemURL = group.imagemURL;
-        if (group.imagens.length > 0) payload.imagens = group.imagens;
+        payload.estoque =
+          mergedVariacoesList.length > 0 ? estoqueTotalVariacoes : (group.estoqueDireto ?? 0);
+        payload.pendingParentSync = false;
+        if (mergedImagemURL) payload.imagemURL = mergedImagemURL;
+        if (mergedImagens.length > 0) payload.imagens = mergedImagens;
         if (group.categoria) payload.categoria = group.categoria;
         if (group.categoriaStore) payload.categoriaStore = group.categoriaStore;
         if (group.subcategoriaStore) payload.subcategoriaStore = group.subcategoriaStore;
         if (group.categoriaId !== undefined) payload.categoriaId = group.categoriaId;
         if (group.descricao) payload.descricao = group.descricao;
       } else {
-        if (group.nome) payload.nome = group.nome;
-        if (group.categoria) payload.categoria = group.categoria;
-        if (group.categoriaStore) payload.categoriaStore = group.categoriaStore;
-        if (group.subcategoriaStore) payload.subcategoriaStore = group.subcategoriaStore;
-        if (group.imagemURL) payload.imagemURL = group.imagemURL;
-        if (group.imagens.length > 0) payload.imagens = group.imagens;
-        if (group.preco !== undefined && group.preco > 0) payload.preco = group.preco;
-        if (group.descricao) payload.descricao = group.descricao;
-        if (variacoesList.length > 0) {
+        // Variação sem pai na página: apenas preenche campos faltantes sem sobrescrever dados autoritativos do pai já salvos
+        if (group.nome && !existingData?.nome) payload.nome = group.nome;
+        if (group.categoria && !existingData?.categoria) payload.categoria = group.categoria;
+        if (group.categoriaStore && !existingData?.categoriaStore) payload.categoriaStore = group.categoriaStore;
+        if (group.subcategoriaStore && !existingData?.subcategoriaStore) {
+          payload.subcategoriaStore = group.subcategoriaStore;
+        }
+        if (mergedImagemURL && !existingData?.imagemURL) payload.imagemURL = mergedImagemURL;
+        if (mergedImagens.length > 0) payload.imagens = mergedImagens;
+        if (group.preco !== undefined && group.preco > 0 && !(Number(existingData?.preco || 0) > 0)) {
+          payload.preco = group.preco;
+        }
+        if (group.descricao && !existingData?.descricao) payload.descricao = group.descricao;
+        if (!existingData?.codigo) {
+          payload.pendingParentSync = true;
+        }
+        if (mergedVariacoesList.length > 0) {
           payload.estoque = estoqueTotalVariacoes;
         }
       }
 
-      if (group.sizes.size > 0) {
-        payload.tamanhos = FieldValue.arrayUnion(...Array.from(group.sizes));
+      if (sizeSet.size > 0) {
+        payload.tamanhos = Array.from(sizeSet);
       }
-      if (group.colors.size > 0) {
-        payload.cores = FieldValue.arrayUnion(...Array.from(group.colors));
+      if (colorSet.size > 0) {
+        payload.cores = Array.from(colorSet);
       }
-      if (Object.keys(group.variacoes).length > 0) {
-        payload.variacoes = group.variacoes;
+      if (mergedVariacoesList.length > 0) {
+        payload.variacoes = mergedVariacoes;
       }
 
       batch.set(docRef, payload, { merge: true });

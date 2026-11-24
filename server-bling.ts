@@ -2,15 +2,20 @@ import express, { Request, Response, NextFunction } from 'express';
 import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
-import { isProductHidden } from './src/lib/hiddenProducts.js';
-import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images.js';
+import { isProductHidden } from './src/lib/hiddenProducts';
+import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images';
 import {
   getBlingTokenFromDb,
   upsertBlingTokenInDb,
   clearBlingTokenFromDb,
   BLING_ACCESS_TTL_MS
-} from './server-bling-db.js';
+} from './server-bling-db';
 import {
+  BLING_AUTHORIZE_URL,
+  BLING_TOKEN_ENDPOINT,
+  BLING_TOKEN_FALLBACK_ENDPOINT,
+  BLING_OFFICIAL_API_BASE,
+  BLING_API_BASE,
   getValidBlingToken as getFirestoreBlingToken,
   hasFirebaseAdminEnv,
   hasFirestoreBlingToken,
@@ -18,21 +23,19 @@ import {
   saveBlingTokensToFirestore,
   refreshBlingTokenInFirestore,
   isBlingTokenExpiringOrExpired,
-} from './lib/blingToken.js';
+} from './lib/blingToken';
 import {
   syncAllBlingProdutosToFirestore,
   syncBlingProdutosPageToFirestore,
   verifySyncSecret,
-} from './lib/blingSyncProdutos.js';
+} from './lib/blingSyncProdutos';
 
 dotenv.config({ override: !process.env.VERCEL });
 
-// Bling API v3 Official Constants
-export const BLING_AUTH_BASE = 'https://www.bling.com.br/Api/v3/oauth/authorize';
-export const BLING_TOKEN_URL = 'https://www.bling.com.br/Api/v3/oauth/token';
-export const BLING_TOKEN_FALLBACK_URL = 'https://api.bling.com.br/v3/oauth/token';
-export const BLING_OFFICIAL_API_BASE = 'https://www.bling.com.br/Api/v3';
-export const BLING_API_BASE = 'https://api.bling.com.br/v3';
+export const BLING_AUTH_BASE = BLING_AUTHORIZE_URL;
+export const BLING_TOKEN_URL = BLING_TOKEN_ENDPOINT;
+export const BLING_TOKEN_FALLBACK_URL = BLING_TOKEN_FALLBACK_ENDPOINT;
+export { BLING_OFFICIAL_API_BASE, BLING_API_BASE };
 const TEN_MINUTES_MS = 10 * 60 * 1000;
 
 const DATA_DIR = process.env.VERCEL ? '/tmp' : process.cwd();
@@ -127,10 +130,13 @@ export function clearBlingTokens(): void {
   }
 }
 
-function getClientCredentials() {
-  const clientId = (process.env.BLING_CLIENT_ID || '66ada183edd39b7215178f3d05bbb4b13c013fdd').trim();
-  const clientSecret = (process.env.BLING_CLIENT_SECRET || '92efd4ff0b3ca6219adf7ecdc2df633bece0925c4f4c888f071065eaa046').trim();
-  const state = (process.env.BLING_STATE || '2b41de06512249e4b701e9c4fcdcef0e').trim();
+function getClientCredentials(requireSecret: boolean = false) {
+  const clientId = (process.env.BLING_CLIENT_ID || '').trim();
+  const clientSecret = (process.env.BLING_CLIENT_SECRET || '').trim();
+  const state = (process.env.BLING_STATE || '').trim();
+  if (requireSecret && (!clientId || !clientSecret)) {
+    throw new Error('Credenciais BLING_CLIENT_ID e BLING_CLIENT_SECRET não configuradas em process.env.');
+  }
   return { clientId, clientSecret, state };
 }
 
@@ -138,7 +144,7 @@ function getClientCredentials() {
  * Exchange Authorization Code for Access & Refresh Tokens
  */
 export async function exchangeCodeForTokens(code: string, redirectUri?: string): Promise<BlingTokens> {
-  const { clientId, clientSecret } = getClientCredentials();
+  const { clientId, clientSecret } = getClientCredentials(true);
   const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
   const bodyParams = new URLSearchParams();
@@ -256,7 +262,7 @@ export async function refreshBlingToken(options?: {
       throw new Error('Nenhum refresh_token disponível no banco para renovar sessão do Bling.');
     }
 
-    const { clientId, clientSecret } = getClientCredentials();
+    const { clientId, clientSecret } = getClientCredentials(true);
     const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
 
     const bodyParams = new URLSearchParams();
@@ -1035,19 +1041,24 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
     if (req.method !== 'GET' && req.method !== 'POST') {
       return res.status(405).json({ error: 'Method not allowed. Use GET or POST.' });
     }
-    if (process.env.CRON_SECRET?.trim()) {
-      const querySecret = typeof req.query.secret === 'string' ? req.query.secret : '';
-      const headerCron = typeof req.headers['x-cron-secret'] === 'string' ? req.headers['x-cron-secret'] : '';
-      const headerAdmin = typeof req.headers['x-admin-secret'] === 'string' ? req.headers['x-admin-secret'] : '';
-      const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
-      const bearerSecret = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
-      const providedSecret = querySecret || headerCron || headerAdmin || bearerSecret;
+    const expectedCronSecret = (process.env.CRON_SECRET || '').trim();
+    if (!expectedCronSecret) {
+      return res.status(500).json({
+        error: 'Variável CRON_SECRET não configurada no servidor.',
+      });
+    }
 
-      if (!verifySyncSecret(providedSecret)) {
-        return res.status(401).json({
-          error: 'Não autorizado. Informe CRON_SECRET válido via header ou ?secret=.',
-        });
-      }
+    const querySecret = typeof req.query.secret === 'string' ? req.query.secret : '';
+    const headerCron = typeof req.headers['x-cron-secret'] === 'string' ? req.headers['x-cron-secret'] : '';
+    const headerAdmin = typeof req.headers['x-admin-secret'] === 'string' ? req.headers['x-admin-secret'] : '';
+    const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+    const bearerSecret = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+    const providedSecret = querySecret || headerCron || headerAdmin || bearerSecret;
+
+    if (!verifySyncSecret(providedSecret)) {
+      return res.status(401).json({
+        error: 'Não autorizado. Informe CRON_SECRET válido via header ou ?secret=.',
+      });
     }
     return next();
   }
