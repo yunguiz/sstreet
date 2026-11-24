@@ -30,15 +30,60 @@ export interface MercadoPagoStatusResponse {
   error?: string;
 }
 
+async function parseApiResponse<T extends { error?: string }>(
+  res: Response,
+  fallbackErrorMessage: string
+): Promise<T> {
+  const rawText = await res.text();
+
+  if (!rawText) {
+    return {
+      success: false,
+      connected: false,
+      approved: false,
+      error: `${fallbackErrorMessage} (HTTP ${res.status})`,
+    } as unknown as T;
+  }
+
+  try {
+    const parsed = JSON.parse(rawText) as T;
+    if (!res.ok && !parsed.error) {
+      return {
+        ...parsed,
+        success: false,
+        connected: false,
+        approved: false,
+        error: `${fallbackErrorMessage} (HTTP ${res.status})`,
+      };
+    }
+    return parsed;
+  } catch {
+    const cleanSnippet = rawText.replace(/\s+/g, ' ').trim().slice(0, 140);
+    const friendlyMessage = cleanSnippet.startsWith('A server error')
+      ? `Erro interno no servidor (HTTP ${res.status}). Tente novamente em instantes.`
+      : `${fallbackErrorMessage} (HTTP ${res.status}): ${cleanSnippet}`;
+
+    return {
+      success: false,
+      connected: false,
+      approved: false,
+      error: friendlyMessage,
+    } as unknown as T;
+  }
+}
+
 // Check Mercado Pago connectivity
 export async function checkMercadoPagoStatus(): Promise<MercadoPagoStatusResponse> {
   try {
     const res = await fetch('/api/mercadopago/status');
-    return await res.json();
+    return await parseApiResponse<MercadoPagoStatusResponse>(
+      res,
+      'Erro de conexão com Mercado Pago'
+    );
   } catch (error: any) {
     return {
       connected: false,
-      error: error.message || 'Erro de conexão com Mercado Pago'
+      error: error?.message || 'Erro de conexão com Mercado Pago',
     };
   }
 }
@@ -70,12 +115,14 @@ export async function createCheckoutPreference(params: {
       body: JSON.stringify(params),
     });
 
-    const data = await res.json();
-    return data;
+    return await parseApiResponse<MercadoPagoPreferenceResponse>(
+      res,
+      'Falha ao iniciar checkout Mercado Pago'
+    );
   } catch (error: any) {
     return {
       success: false,
-      error: error.message || 'Falha ao iniciar checkout Mercado Pago'
+      error: error?.message || 'Falha ao iniciar checkout Mercado Pago',
     };
   }
 }
@@ -119,12 +166,14 @@ export async function createDirectPix(params: {
       body: JSON.stringify(params),
     });
 
-    const data = await res.json();
-    return data;
+    return await parseApiResponse<MercadoPagoPixResponse>(
+      res,
+      'Falha ao gerar Pix no Mercado Pago'
+    );
   } catch (error: any) {
     return {
       success: false,
-      error: error.message || 'Falha ao gerar Pix no Mercado Pago'
+      error: error?.message || 'Falha ao gerar Pix no Mercado Pago',
     };
   }
 }
@@ -143,12 +192,12 @@ export async function getPaymentStatus(paymentId: string | number): Promise<{
 }> {
   try {
     const res = await fetch(`/api/mercadopago/payment-status/${paymentId}`);
-    return await res.json();
+    return await parseApiResponse(res, 'Falha ao consultar status de pagamento');
   } catch (error: any) {
     return {
       success: false,
       approved: false,
-      error: error.message || 'Falha ao consultar status de pagamento'
+      error: error?.message || 'Falha ao consultar status de pagamento',
     };
   }
 }
@@ -168,14 +217,14 @@ export async function confirmPixPayment(paymentId: string | number): Promise<{
     const res = await fetch(`/api/mercadopago/confirm-pix/${paymentId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ verified: true })
+      body: JSON.stringify({ verified: true }),
     });
-    return await res.json();
+    return await parseApiResponse(res, 'Falha ao validar pagamento no Mercado Pago');
   } catch (error: any) {
     return {
       success: false,
       approved: false,
-      error: error.message || 'Falha ao validar pagamento no Mercado Pago'
+      error: error?.message || 'Falha ao validar pagamento no Mercado Pago',
     };
   }
 }
@@ -248,12 +297,14 @@ export async function processTransparentCardPayment(
       body: JSON.stringify(params),
     });
 
-    const data = await res.json();
-    return data;
+    return await parseApiResponse<TransparentCardPaymentResponse>(
+      res,
+      'Falha de comunicação ao processar cartão'
+    );
   } catch (error: any) {
     return {
       success: false,
-      error: error.message || 'Falha de comunicação ao processar cartão'
+      error: error?.message || 'Falha de comunicação ao processar cartão',
     };
   }
 }
