@@ -202,6 +202,7 @@ export function CartDrawer({
     method?: string;
     orderNumber?: string;
     customerEmail?: string;
+    raffleTicketCode?: string;
   } | null>(null);
 
   const pollIntervalRef = useRef<any>(null);
@@ -407,7 +408,8 @@ export function CartDrawer({
               amount: total,
               method: 'Pix Instantâneo (Aprovado)',
               orderNumber: res.orderNumber,
-              customerEmail: customerEmail
+              customerEmail: customerEmail,
+              raffleTicketCode: (res as any).raffleTicketCode
             });
             confetti({
               particleCount: 120,
@@ -573,7 +575,8 @@ export function CartDrawer({
           amount: total,
           method: `Cartão de Crédito ${installments}x sem juros`,
           orderNumber: res.orderNumber,
-          customerEmail: customerEmail
+          customerEmail: customerEmail,
+          raffleTicketCode: (res as any).raffleTicketCode
         });
         confetti({
           particleCount: 130,
@@ -704,7 +707,8 @@ export function CartDrawer({
           amount: total,
           method: 'Pix Instantâneo (Aprovado)',
           orderNumber: res.orderNumber,
-          customerEmail: customerEmail
+          customerEmail: customerEmail,
+          raffleTicketCode: (res as any).raffleTicketCode
         });
         confetti({
           particleCount: 130,
@@ -840,6 +844,21 @@ export function CartDrawer({
                     <strong className="text-white underline">{customerEmail || approvedPaymentDetails?.customerEmail || 'seu e-mail'}</strong>.
                   </p>
                 </div>
+
+                {approvedPaymentDetails?.raffleTicketCode && (
+                  <div className="p-4 rounded-xl bg-gradient-to-r from-red-950/40 via-[#161616] to-red-950/40 border border-red-500/50 text-center relative overflow-hidden shadow-lg shadow-red-950/50">
+                    <div className="absolute top-0 right-0 transform translate-x-4 -translate-y-4 w-20 h-20 bg-red-600/20 rounded-full blur-xl pointer-events-none" />
+                    <div className="text-xs uppercase tracking-widest text-red-400 font-bold mb-1 flex items-center justify-center gap-1.5">
+                      <span>🎮 Bilhete Exclusivo PS5 Gerado!</span>
+                    </div>
+                    <div className="text-xl sm:text-2xl font-black text-white tracking-wider font-mono my-1 text-red-500">
+                      {approvedPaymentDetails.raffleTicketCode}
+                    </div>
+                    <p className="text-[11px] text-zinc-300 leading-relaxed">
+                      Sua compra atendeu aos requisitos (≥ R$ 150,00). Você está concorrendo ao PlayStation 5!
+                    </p>
+                  </div>
+                )}
 
                 <div className="p-4 bg-zinc-950 border border-zinc-800 rounded-xl text-left space-y-2.5">
                   <div className="flex items-center justify-between text-xs text-zinc-400">

@@ -4,11 +4,12 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
+import crypto from 'crypto';
+import { getAdminFirestore } from './lib/firebaseAdmin.js';
 import { registerBlingRoutes, blingRouter, blingAuthInterceptorMiddleware, fetchFromBling, loadBlingTokens, ensureBlingAuthorized, refreshBlingToken } from './server-bling.js';
 import { registerMelhorEnvioRoutes, startMelhorEnvioAutoSync } from './server-melhor-envio.js';
 import { hasFirebaseAdminEnv, hasFirestoreBlingToken, getValidBlingToken as getFirestoreValidToken } from './lib/blingToken.js';
-import { syncAllBlingProdutosToFirestore } from './lib/blingSyncProdutos.js';
-import { BLING_STOCK_PRODUCTS, BLING_CATALOG_META } from './src/data/blingCatalog.js';
+import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
 import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
 import {
   applyBlingImageOverrides,
@@ -333,7 +334,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           const sourceForTitle = parentItem || bp;
           const rawName = (sourceForTitle.nome || bp.nome || '').trim();
           const baseName = rawName.split(':')[0].trim();
-          const groupKey = parentId ? `parent:${parentId}` : `name:${baseName.toUpperCase()}`;
+          const groupKey = parentId ? `parent:${parentId}` : `item:${bp.id}`;
 
           if (!productGroups[groupKey]) {
             const { category, subcategory } = mapCategoryAndSubcategory(baseName);
@@ -360,37 +361,38 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
         // Sort newest Bling product IDs first so recently registered products show up right at the top
         const sortedGroups = Object.values(productGroups).sort((a, b) => Number(b.id) - Number(a.id));
 
-        const existingSkus = new Set(products.map(p => p.integration?.sku));
-        const existingNames = new Set(products.map(p => p.name.toLowerCase().trim()));
+        const existingBlingIds = new Set(products.map(p => String(p.integration?.blingId || '')));
 
-        // Curated high-res imagery for Bling catalog categories
-        const imagePresets: Record<string, string[]> = {
-          sneakers: [
-            '/src/assets/images/product_sneaker_chunky_1793275501375.jpg',
-            'https://images.unsplash.com/photo-1552346154-21d32810aba3?auto=format&fit=crop&w=1000&q=85',
-            'https://images.unsplash.com/photo-1595950653106-6c9ebd614d3a?auto=format&fit=crop&w=1000&q=85'
-          ],
-          camisetas: [
-            '/src/assets/images/lookview_fullkit_model_1793275500631.jpg',
-            '/src/assets/images/hero_streetwear_urban_1793275500555.jpg',
-            'https://images.unsplash.com/photo-1503342217505-b0a15ec3261c?auto=format&fit=crop&w=1000&q=85'
-          ],
-          hoodies: [
-            '/src/assets/images/product_hoodie_oversized_1793275501387.jpg',
-            '/src/assets/images/lookview_fullkit_model_1793275500631.jpg'
-          ],
-          calcas: [
-            '/src/assets/images/product_cargo_heavy_1793275501361.jpg'
-          ],
-          acessorios: [
-            '/src/assets/images/product_chain_silver_1793275501382.jpg',
-            '/src/assets/images/product_cap_streetwear_1793275501370.jpg'
-          ],
-          chinelos: [
-            'https://images.unsplash.com/photo-1608256246200-53e635b5b65f?auto=format&fit=crop&w=1000&q=85',
-            'https://images.unsplash.com/photo-1560769629-975ec94e6a86?auto=format&fit=crop&w=1000&q=85'
-          ]
-        };
+        const STUDIO_CUTOUT_BY_SKU: Array<{ prefixes: string[]; images: string[] }> = [
+          {
+            prefixes: ['OTSR1977'],
+            images: ['/assets/aistudio/C_pia_de_NOVIDADE__3__f437c7b1.png', '/assets/aistudio/C_pia_de_NOVIDADE__1__b4d9c4a8.png'],
+          },
+          {
+            prefixes: ['OTSR506'],
+            images: ['/assets/aistudio/Design_sem_nome__4__bfe5aaed.png', '/assets/aistudio/Design_sem_nome__3__5e605338.png'],
+          },
+          {
+            prefixes: ['OTSBP501', 'OVTP501'],
+            images: ['/assets/aistudio/Design_sem_nome__5__ef8bca41.png', '/assets/aistudio/Design_sem_nome__6__d3642ec7.png'],
+          },
+          {
+            prefixes: ['OTSBP502'],
+            images: ['/assets/aistudio/Design_sem_nome__8__f44ad096.png', '/assets/aistudio/Design_sem_nome__7__e6ab934f.png'],
+          },
+          {
+            prefixes: ['OTSP500', 'OVTP502'],
+            images: ['/assets/aistudio/Design_sem_nome__9__73306863.png'],
+          },
+          {
+            prefixes: ['OTSR505'],
+            images: ['/assets/aistudio/Design_sem_nome__10__4bbf1037.png'],
+          },
+          {
+            prefixes: ['OTSPN500'],
+            images: ['/assets/aistudio/Design_sem_nome__11__0eda0283.png'],
+          },
+        ];
 
         let addedFromBlingCount = 0;
         const imageStore = loadImageStore();
@@ -446,23 +448,8 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             }
           }
 
-          // If product already in catalog, sync stock, price, and any newly extracted Bling images
-          if (existingNames.has(normalizedBaseName)) {
-            const match = products.find(p => p.name.toLowerCase().trim() === normalizedBaseName);
-            if (match) {
-              const totalBlingStock = group.items.reduce((acc, it) => acc + (it.estoque?.saldoVirtualTotal || it.estoque?.saldoFisico || 0), 0);
-              if (totalBlingStock > 0) match.stockCount = totalBlingStock;
-              if (group.price > 0) match.price = group.price;
-              if (blingExtractedImages.length > 0) {
-                const existingReal = (match.images || []).filter((u: string) => !isPlaceholderImageUrl(u));
-                const existingFullRes = existingReal.filter((u: string) => !isThumbnailLikeUrl(u));
-                const incomingFullRes = blingExtractedImages.filter((u: string) => !isThumbnailLikeUrl(u));
-                const preferred = [...incomingFullRes, ...existingFullRes];
-                match.images = Array.from(
-                  new Set(preferred.length > 0 ? preferred : [...blingExtractedImages, ...existingReal])
-                );
-              }
-            }
+          // Skip only exact duplicate Bling parent IDs
+          if (existingBlingIds.has(String(group.id))) {
             continue;
           }
 
@@ -556,7 +543,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             : finalSizes;
           const activeSizes = inStockSizes.length > 0 ? inStockSizes : finalSizes;
 
-          // Select images: 1. Full-res live/cached midia.imagens.internas[0].link -> 2. List fallback -> 3. Presets
+          // Select images: 1. Full-res live/cached midia.imagens.internas[0].link -> 2. Studio HD cutouts -> 3. List fallback -> 4. Crisp SVG brand card
           const cachedBlingImages = getBlingImagesForProduct({
             name: group.baseName,
             integration: { sku: groupSku, blingId: String(group.id) },
@@ -565,23 +552,22 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           const cachedFullRes = cachedBlingImages.filter(u => !isThumbnailLikeUrl(u));
           const combinedFullRes = Array.from(new Set([...fullResBlingExtracted, ...cachedFullRes]));
 
+          const upperGroupSku = String(groupSku || '').toUpperCase().trim();
+          const studioPresetMatch = STUDIO_CUTOUT_BY_SKU.find((entry) =>
+            entry.prefixes.some((pref) => upperGroupSku.startsWith(pref))
+          );
+
           let images: string[] = [];
           if (combinedFullRes.length > 0) {
             images = combinedFullRes;
+          } else if (studioPresetMatch) {
+            images = studioPresetMatch.images;
           } else if (cachedBlingImages.length > 0) {
             images = cachedBlingImages;
           } else if (blingExtractedImages.length > 0) {
             images = blingExtractedImages;
-          } else if (normalizedBaseName.includes('chinelo') || normalizedBaseName.includes('havaianas')) {
-            images = imagePresets.chinelos;
-          } else if (group.category === 'calcados') {
-            images = imagePresets.sneakers;
-          } else if (group.subcategory === 'hoodies') {
-            images = imagePresets.hoodies;
-          } else if (group.category === 'acessorios') {
-            images = imagePresets.acessorios;
           } else {
-            images = imagePresets.camisetas;
+            images = ['/assets/streetstore-fallback.svg'];
           }
 
           const priceVal = isNaN(group.price) || group.price <= 0 ? 119.90 : group.price;
@@ -639,21 +625,40 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           }
 
           products.push(productObj);
-          existingSkus.add(groupSku);
-          existingNames.add(normalizedBaseName);
+          existingBlingIds.add(String(group.id));
           addedFromBlingCount++;
         }
 
-        // If background image sync isn't already running, fetch up to 10 missing high-res items inline & queue full background sync
+        // If background image sync isn't already running, fetch up to 12 missing high-res items inline (including variations) & queue full background sync
         if (groupsNeedingDetailFetch.length > 0) {
           if (!isImageSyncRunning()) {
-            const inlineBatch = groupsNeedingDetailFetch.slice(0, 10);
+            const inlineBatch = groupsNeedingDetailFetch.slice(0, 12);
             console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} products lacked full-res images in /produtos summary. Fetching detail media for ${inlineBatch.length}...`);
             for (const target of inlineBatch) {
               try {
                 const detail = await fetchFromBling(`/produtos/${target.id}`);
                 const fullData = detail?.data || detail;
-                const detailImgs = extractImagesFromBlingItem(fullData);
+                let detailImgs = extractImagesFromBlingItem(fullData);
+                let hasTrueFull = detailImgs.some((u: string) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+
+                if (!hasTrueFull && Array.isArray(fullData?.variacoes) && fullData.variacoes.length > 0) {
+                  for (const v of fullData.variacoes.slice(0, 2)) {
+                    if (!v?.id) continue;
+                    try {
+                      const vDetail = await fetchFromBling(`/produtos/${v.id}`);
+                      const vImgs = extractImagesFromBlingItem(vDetail?.data || vDetail);
+                      const vFull = vImgs.filter((u: string) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+                      if (vFull.length > 0) {
+                        detailImgs = Array.from(new Set([...vFull, ...detailImgs.filter((u: string) => !isThumbnailLikeUrl(u))]));
+                        hasTrueFull = true;
+                        break;
+                      }
+                    } catch {
+                      // continue
+                    }
+                  }
+                }
+
                 if (detailImgs.length > 0) {
                   const detailFull = detailImgs.filter((u: string) => !isThumbnailLikeUrl(u));
                   const existingImgs: string[] = Array.isArray(target.productRef.images)
@@ -682,15 +687,19 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                     imageStoreDirty = true;
                   }
                 }
-                await new Promise(resolve => setTimeout(resolve, 350));
               } catch {
                 // continue gracefully
               }
             }
 
             if (groupsNeedingDetailFetch.length > inlineBatch.length) {
-              syncImagesFromBling({ onBatchSaved: () => invalidateCatalogCache() })
-                .then(() => invalidateCatalogCache())
+              syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
+                .then(() => {
+                  reapplyImagesToCachedCatalog();
+                  if (hasFirebaseAdminEnv()) {
+                    syncImageStoreToFirestore().catch(() => {});
+                  }
+                })
                 .catch(() => {});
             }
           } else {
@@ -733,14 +742,14 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
     const consolidatedMap = new Map<string, any>();
 
     function ingestOrAggregate(item: any) {
-      const baseName = extractBaseProductName(item.name);
-      const key = baseName.toLowerCase().replace(/\s+/g, ' ');
+      const blingKey = String(item.integration?.blingId || item.id || '').trim();
+      const key = blingKey || extractBaseProductName(item.name).toLowerCase().replace(/\s+/g, ' ');
 
       if (!consolidatedMap.has(key)) {
         consolidatedMap.set(key, {
           ...item,
-          name: baseName,
-          stockCount: typeof item.stockCount === 'number' ? item.stockCount : 10,
+          name: extractBaseProductName(item.name) || item.name,
+          stockCount: typeof item.stockCount === 'number' ? item.stockCount : 0,
           sizes: Array.isArray(item.sizes) && item.sizes.length > 0 ? [...item.sizes] : ['Tamanho Único'],
           colors: Array.isArray(item.colors) && item.colors.length > 0 ? [...item.colors] : [{ name: 'Padrão', hex: '#111111' }],
           images: Array.isArray(item.images) ? [...item.images] : [],
@@ -748,17 +757,14 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
         });
       } else {
         const canonical = consolidatedMap.get(key);
-        // Turn repeated item into additional stock quantity!
-        canonical.stockCount += (typeof item.stockCount === 'number' ? item.stockCount : 5);
+        canonical.stockCount += (typeof item.stockCount === 'number' ? item.stockCount : 0);
 
-        // Merge sizes
         if (Array.isArray(item.sizes)) {
           item.sizes.forEach((sz: string) => {
             if (!canonical.sizes.includes(sz)) canonical.sizes.push(sz);
           });
         }
 
-        // Merge colors
         if (Array.isArray(item.colors)) {
           item.colors.forEach((col: any) => {
             if (!canonical.colors.some((ex: any) => ex.name === col.name)) {
@@ -767,7 +773,6 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           });
         }
 
-        // Merge images (prioritize high-res original Bling photos, strip resize params/placeholders/legacy URLs)
         if (Array.isArray(item.images)) {
           const allCombined = [...canonical.images.map((u: string) => stripResizeAndCompressionParams(u))];
           item.images.forEach((rawImg: string) => {
@@ -783,43 +788,33 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           canonical.images = (nonThumb.length > 0 ? nonThumb : pool).slice(0, 8);
         }
 
-        // Merge variantsList
         if (Array.isArray(item.variantsList)) {
           canonical.variantsList.push(...item.variantsList);
         }
 
-        // Update tag if now in stock
         if (canonical.stockCount > 0 && canonical.tag === 'SEM ESTOQUE') {
           canonical.tag = canonical.stockCount <= 3 ? 'POUCAS UNIDADES' : null;
         }
       }
     }
 
-    // 1. Ingest live Bling ERP products
+    // Ingest ONLY live Bling ERP products (local/PDF catalog removed)
     products.forEach((p) => ingestOrAggregate(p));
-
-    // 2. Fall back to baseline catalog ONLY when Bling ERP is disconnected or returned zero active items
-    if (!blingConnected || blingRawCount === 0) {
-      BLING_STOCK_PRODUCTS.forEach((bp) => {
-        if ((bp.stockCount ?? 0) <= 0) return;
-        const baseNameKey = extractBaseProductName(bp.name).toLowerCase().replace(/\s+/g, ' ');
-        const skuKey = String(bp.integration?.sku || '').toUpperCase().trim();
-        if (zeroStockFromBlingKeys.has(baseNameKey) || (skuKey && zeroStockFromBlingKeys.has(skuKey))) {
-          return;
-        }
-        ingestOrAggregate(bp);
-      });
-    }
 
     const allConsolidatedProducts = Array.from(consolidatedMap.values());
     const inStockProducts = allConsolidatedProducts.filter((p) => (p.stockCount ?? 0) > 0);
     const visibleProducts = filterVisibleProducts(inStockProducts);
-    const finalProducts = applyBlingImageOverrides(visibleProducts);
+    const finalProducts = applyBlingImageOverrides(visibleProducts)
+      .sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0))
+      .map((p, idx) => ({
+        ...p,
+        tag: (p.stockCount ?? 0) <= 3 ? 'POUCAS UNIDADES' : (idx < 16 ? 'NOVO DROP' : null),
+      }));
 
     console.log(`[Catalog Engine] Processed inventory: ${finalProducts.length} in-stock visible models (${allConsolidatedProducts.length - inStockProducts.length} out-of-stock auto-hidden, ${inStockProducts.length - visibleProducts.length} hidden per store rules).`);
 
     const hiddenCount = allConsolidatedProducts.length - finalProducts.length;
-    const totalRegisteredItems = BLING_CATALOG_META?.totalRegisteredRawSKUs || 1003;
+    const totalRegisteredItems = blingRawCount;
     const uniqueModels = finalProducts.length;
     const totalUnitsInStock = finalProducts.reduce((sum, p) => sum + (p.stockCount || 0), 0);
     const nowTs = Date.now();
@@ -861,10 +856,15 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
   return activeCatalogBuildPromise;
 }
 
+// Health check endpoint
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.json({ ok: true, status: 'healthy', timestamp: new Date().toISOString() });
+});
+
 // Unified Storefront Catalog API (Bling ERP v3 up to 1350 items + Automatic Stock & High-Res Images)
 app.get('/api/catalog/products', async (req: Request, res: Response) => {
   try {
-    const forceRefresh = req.query.refresh === 'true' || req.query._t !== undefined;
+    const forceRefresh = req.query.refresh === 'true';
     const isCacheFresh = catalogCache && (Date.now() - catalogCache.timestamp < CATALOG_CACHE_TTL_MS);
 
     if (!forceRefresh && catalogCache) {
@@ -881,8 +881,8 @@ app.get('/api/catalog/products', async (req: Request, res: Response) => {
         blingRawCount: catalogCache.blingRawCount,
         blingError: catalogCache.blingError,
         hiddenCount: catalogCache.hiddenCount ?? 0,
-        totalRegisteredItems: catalogCache.totalRegisteredItems ?? 1003,
-        blingRegisteredSKUs: catalogCache.totalRegisteredItems ?? 1003,
+        totalRegisteredItems: catalogCache.totalRegisteredItems ?? catalogCache.blingRawCount ?? 0,
+        blingRegisteredSKUs: catalogCache.totalRegisteredItems ?? catalogCache.blingRawCount ?? 0,
         uniqueModels: catalogCache.uniqueModels ?? catalogCache.count,
         totalUnitsInStock: catalogCache.totalUnitsInStock ?? 0,
         cached: true,
@@ -965,9 +965,12 @@ app.all(['/api/bling/sync-images', '/api/bling/sync-media'], blingAuthIntercepto
     const clearCache = req.query.clearCache === 'true' || req.body?.clearCache === true;
     const result = await syncImagesFromBling({
       clearCache,
-      onBatchSaved: () => invalidateCatalogCache()
+      onBatchSaved: () => reapplyImagesToCachedCatalog()
     });
-    invalidateCatalogCache();
+    reapplyImagesToCachedCatalog();
+    if (hasFirebaseAdminEnv()) {
+      syncImageStoreToFirestore().catch(() => {});
+    }
     res.json(result);
   } catch (error: any) {
     res.status(500).json({
@@ -1060,17 +1063,26 @@ app.post('/api/products/upload-image', (req: Request, res: Response) => {
   }
 });
 
-// Bling PDF Catalog Metadata Endpoint
+// Live Bling Catalog Metadata Endpoint
 app.get('/api/bling/catalog-meta', (_req: Request, res: Response) => {
+  const cachedProducts = catalogCache?.products || [];
   res.json({
     success: true,
-    meta: BLING_CATALOG_META,
-    sampleProducts: BLING_STOCK_PRODUCTS.slice(0, 10).map(p => ({
+    meta: {
+      source: 'bling-erp-live',
+      count: catalogCache?.count || cachedProducts.length,
+      blingRawCount: catalogCache?.blingRawCount || 0,
+      uniqueModels: catalogCache?.uniqueModels || cachedProducts.length,
+      totalUnitsInStock: catalogCache?.totalUnitsInStock || 0,
+      syncedAt: catalogCache?.timestamp ? new Date(catalogCache.timestamp).toISOString() : null,
+    },
+    sampleProducts: cachedProducts.slice(0, 10).map((p: any) => ({
       name: p.name,
       stockCount: p.stockCount,
       price: p.price,
       sizes: p.sizes,
-      sku: p.integration.sku
+      sku: p.integration?.sku,
+      blingId: p.blingId,
     }))
   });
 });
@@ -1603,6 +1615,22 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
 
         localPaymentsMap.set(id, payment);
 
+        let raffleTicketCode: string | undefined = undefined;
+        try {
+          raffleTicketCode = await processPs5RaffleEntry({
+            customerName: payment.payer?.name || 'Cliente Street Store',
+            customerEmail: payment.payer?.email || 'streetstore364@gmail.com',
+            customerPhone: payment.payer?.phone,
+            customerCpf: payment.payer?.cpf,
+            orderNumber: payment.orderNumber,
+            paymentId: matchedMpPayment.id,
+            orderTotal: payment.amount,
+            shippingAddress: payment.shippingAddress
+          }) || undefined;
+        } catch (e) {
+          console.warn('Could not generate PS5 raffle ticket for pix:', e);
+        }
+
         return res.json({
           success: true,
           approved: true,
@@ -1610,6 +1638,7 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
           statusDetail: 'accredited',
           orderNumber: payment.orderNumber,
           orderId: payment.orderId,
+          raffleTicketCode,
           message: 'Pagamento Pix identificado e aprovado pelo Mercado Pago!'
         });
       }
@@ -1726,6 +1755,24 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
         }
       }
 
+      let raffleTicketCode: string | undefined = undefined;
+      if (p.status === 'approved') {
+        try {
+          raffleTicketCode = await processPs5RaffleEntry({
+            customerName: p.payer?.name || 'Cliente Street Store',
+            customerEmail: p.payer?.email || 'streetstore364@gmail.com',
+            customerPhone: p.payer?.phone,
+            customerCpf: p.payer?.cpf,
+            orderNumber: p.orderNumber,
+            paymentId: p.id,
+            orderTotal: p.amount,
+            shippingAddress: p.shippingAddress
+          }) || undefined;
+        } catch (e) {
+          console.warn('Could not generate PS5 raffle ticket for payment-status:', e);
+        }
+      }
+
       return res.json({
         success: true,
         approved: p.status === 'approved',
@@ -1734,7 +1781,8 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
         statusDetail: p.statusDetail,
         dateApproved: p.dateApproved,
         orderNumber: p.orderNumber,
-        orderId: p.orderId
+        orderId: p.orderId,
+        raffleTicketCode
       });
     }
 
@@ -1923,6 +1971,24 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
       }
     }
 
+    let raffleTicketCode: string | undefined = undefined;
+    if (paymentResult.status === 'approved') {
+      try {
+        raffleTicketCode = await processPs5RaffleEntry({
+          customerName: fullName,
+          customerEmail: email,
+          customerPhone: payer?.phone,
+          customerCpf: cleanCpf,
+          orderNumber,
+          paymentId: paymentResult.id,
+          orderTotal: Number(transactionAmount),
+          shippingAddress
+        }) || undefined;
+      } catch (e) {
+        console.warn('Could not generate PS5 raffle ticket for card:', e);
+      }
+    }
+
     return res.json({
       success: true,
       paymentId: paymentResult.id,
@@ -1933,7 +1999,8 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
       paymentMethodId: paymentResult.payment_method_id,
       dateApproved: paymentResult.date_approved,
       orderNumber,
-      orderId
+      orderId,
+      raffleTicketCode
     });
 
   } catch (error: any) {
@@ -1942,6 +2009,205 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
       success: false,
       error: error.message || 'Erro interno ao processar pagamento com cartão'
     });
+  }
+});
+
+// ==========================================
+// PS5 RAFFLE SYSTEM (Street Store)
+// ==========================================
+async function processPs5RaffleEntry(params: {
+  customerName: string;
+  customerEmail: string;
+  customerPhone?: string;
+  customerCpf?: string;
+  orderNumber?: string;
+  paymentId: string | number;
+  orderTotal: number;
+  shippingAddress?: any;
+}): Promise<string | null> {
+  try {
+    if (process.env.PS5_RAFFLE_ACTIVE === 'false') {
+      return null;
+    }
+    const total = Number(params.orderTotal || 0);
+    if (total < 150) {
+      return null;
+    }
+    if (!hasFirebaseAdminEnv()) {
+      return null;
+    }
+    const db = getAdminFirestore();
+    const entriesRef = db.collection('raffle_ps5_entries');
+
+    const existingSnap = await entriesRef.where('paymentId', '==', String(params.paymentId)).get();
+    if (!existingSnap.empty) {
+      const existingData = existingSnap.docs[0].data();
+      return existingData.ticketCode || null;
+    }
+
+    const countSnap = await entriesRef.count().get();
+    const currentCount = countSnap.data().count || 0;
+    const ticketNumber = currentCount + 1;
+
+    const randomSuffix = crypto.randomBytes(2).toString('hex').toUpperCase();
+    const ticketCode = `PS5-${String(ticketNumber).padStart(4, '0')}-${randomSuffix}`;
+
+    const cityState = params.shippingAddress?.city && params.shippingAddress?.state
+      ? `${params.shippingAddress.city} - ${params.shippingAddress.state}`
+      : 'Itabira - MG';
+
+    const entryData = {
+      ticketCode,
+      ticketNumber,
+      customerName: params.customerName || 'Cliente Street Store',
+      customerEmail: params.customerEmail || 'streetstore364@gmail.com',
+      customerPhone: params.customerPhone || '',
+      customerCpf: params.customerCpf || '',
+      orderNumber: params.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`,
+      paymentId: String(params.paymentId),
+      orderTotal: total,
+      cityState,
+      createdAt: Date.now()
+    };
+
+    await entriesRef.add(entryData);
+    console.log(`[PS5 Raffle] New ticket generated successfully: ${ticketCode} for payment ${params.paymentId} (Total: R$ ${total})`);
+    return ticketCode;
+  } catch (err) {
+    console.error('[PS5 Raffle Error]:', err);
+    return null;
+  }
+}
+
+// Public raffle status route
+app.get('/api/raffle/ps5/status', async (_req: Request, res: Response) => {
+  try {
+    const active = process.env.PS5_RAFFLE_ACTIVE !== 'false';
+    if (!active) {
+      return res.json({ success: true, active: false });
+    }
+
+    let total = 0;
+    let recentEntries: any[] = [];
+
+    if (hasFirebaseAdminEnv()) {
+      try {
+        const db = getAdminFirestore();
+        const entriesSnap = await db.collection('raffle_ps5_entries').orderBy('createdAt', 'desc').limit(15).get();
+        const countSnap = await db.collection('raffle_ps5_entries').count().get();
+        total = countSnap.data().count || entriesSnap.size;
+
+        entriesSnap.forEach(doc => {
+          const d = doc.data();
+          const code = d.ticketCode || 'PS5-0000-0000';
+          const parts = code.split('-');
+          const maskedCode = parts.length === 3 ? `${parts[0]}-${parts[1]}-****` : 'PS5-****-****';
+
+          const rawName = (d.customerName || 'Cliente Street Store').trim();
+          const nameParts = rawName.split(' ');
+          const firstName = nameParts[0] || 'Cliente';
+          const lastInitial = nameParts.length > 1 ? `${nameParts[nameParts.length - 1].charAt(0)}.` : '';
+          const maskedName = `${firstName} ${lastInitial}`.trim();
+
+          recentEntries.push({
+            ticketCode: maskedCode,
+            customerName: maskedName,
+            cityState: d.cityState || 'Itabira - MG',
+            createdAt: d.createdAt,
+            orderTotal: d.orderTotal,
+            status: 'Confirmado'
+          });
+        });
+      } catch (dbErr) {
+        console.warn('[PS5 Raffle Status] Error fetching from Firestore:', dbErr);
+      }
+    }
+
+    const goal = 1000;
+    const remaining = Math.max(0, goal - total);
+    const percentage = Math.min(100, Math.round((total / goal) * 100));
+
+    return res.json({
+      success: true,
+      active: true,
+      goal,
+      total,
+      remaining,
+      percentage,
+      recentEntries
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, active: true, error: err.message || 'Erro ao carregar status do sorteio' });
+  }
+});
+
+// Admin verification helper
+function verifyAdminRaffleAccess(req: Request): boolean {
+  const adminKey = req.headers['x-admin-key'] || req.query.key;
+  const expectedKey = process.env.ADMIN_SECRET_KEY || 'streetstore2026';
+  return adminKey === expectedKey;
+}
+
+// Protected admin route: get all participants
+app.get('/api/raffle/ps5/admin/entries', async (req: Request, res: Response) => {
+  try {
+    if (!verifyAdminRaffleAccess(req)) {
+      return res.status(401).json({ success: false, error: 'Acesso negado. Chave de administrador inválida (x-admin-key ou ?key).' });
+    }
+    if (!hasFirebaseAdminEnv()) {
+      return res.json({ success: true, entries: [], count: 0, message: 'Firebase Admin não configurado.' });
+    }
+    const db = getAdminFirestore();
+    const snap = await db.collection('raffle_ps5_entries').orderBy('ticketNumber', 'asc').get();
+    const entries: any[] = [];
+    snap.forEach(doc => {
+      entries.push({ id: doc.id, ...doc.data() });
+    });
+    return res.json({ success: true, count: entries.length, entries });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message || 'Erro ao listar participantes' });
+  }
+});
+
+// Protected admin route: perform random draw
+app.post('/api/raffle/ps5/admin/draw', async (req: Request, res: Response) => {
+  try {
+    if (!verifyAdminRaffleAccess(req)) {
+      return res.status(401).json({ success: false, error: 'Acesso negado. Chave de administrador inválida (x-admin-key ou ?key).' });
+    }
+    if (!hasFirebaseAdminEnv()) {
+      return res.status(400).json({ success: false, error: 'Firebase Admin não configurado.' });
+    }
+    const db = getAdminFirestore();
+    const snap = await db.collection('raffle_ps5_entries').get();
+    if (snap.empty) {
+      return res.status(400).json({ success: false, error: 'Nenhum participante cadastrado no sorteio ainda.' });
+    }
+
+    const entries: Array<{ id: string; [key: string]: any }> = [];
+    snap.forEach(doc => {
+      entries.push({ id: doc.id, ...doc.data() });
+    });
+
+    const winningIndex = crypto.randomInt(0, entries.length);
+    const winner = entries[winningIndex];
+
+    await db.collection('raffle_ps5_draws').add({
+      winnerTicketCode: winner.ticketCode,
+      winnerName: winner.customerName,
+      winnerEmail: winner.customerEmail,
+      winnerOrder: winner.orderNumber,
+      drawnAt: Date.now()
+    });
+
+    return res.json({
+      success: true,
+      message: 'Sorteio realizado com sucesso!',
+      totalParticipants: entries.length,
+      winner
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err.message || 'Erro ao realizar sorteio' });
   }
 });
 
@@ -1965,7 +2231,12 @@ registerBlingRoutes(app, {
       .catch(() => {})
       .finally(() => {
         syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-          .then(() => reapplyImagesToCachedCatalog())
+          .then(async () => {
+            reapplyImagesToCachedCatalog();
+            if (hasFirebaseAdminEnv()) {
+              await syncImageStoreToFirestore().catch(() => {});
+            }
+          })
           .catch(() => {});
       });
   }
@@ -2009,46 +2280,43 @@ async function setupViteOrStatic() {
       // 1. Automatically keep Melhor Envio connected, tokens refreshed, & shipments synced on startup + periodically
       startMelhorEnvioAutoSync();
 
-      // 2. Automatically validate/refresh Bling token & sync ALL products (1411+) + stock + Firestore on startup
+      // 2. Automatically validate/refresh Bling token & sync ALL products (1411+) + high-res images + Firestore sequentially
       ensureBlingAuthorized({ verifyLive: true })
-        .then((authorized) => {
+        .then(async (authorized) => {
           if (!authorized) {
             console.log('[Startup Bling Auth] Sessão Bling ausente ou pendente de autorização OAuth.');
             return;
           }
-          const jobs: Promise<unknown>[] = [
-            buildAndCacheCatalog({ forceImageSync: false })
-              .then((catResult) => {
-                console.log(`[Startup Bling Catalog] ${catResult.count} produtos em estoque pré-carregados (Bling bruto: ${catResult.blingRawCount}).`);
-              })
-              .catch((err) => {
-                console.warn('[Startup Bling Catalog] Notice:', err?.message || err);
-              }),
-          ];
-
-          if (hasFirebaseAdminEnv()) {
-            jobs.push(
-              syncAllBlingProdutosToFirestore({ enrichHighResImages: true })
-                .then((syncFs) => {
-                  console.log(`[Startup Bling Firestore] ${syncFs.totalImportado} itens sincronizados em ${syncFs.documentosGravados} docs.`);
-                })
-                .catch((err) => {
-                  console.warn('[Startup Bling Firestore] Notice:', err?.message || err);
-                })
-            );
+          try {
+            const catResult = await buildAndCacheCatalog({ forceImageSync: false });
+            console.log(`[Startup Bling Catalog] ${catResult.count} produtos em estoque pré-carregados (Bling bruto: ${catResult.blingRawCount}).`);
+          } catch (err: any) {
+            console.warn('[Startup Bling Catalog] Notice:', err?.message || err);
           }
 
-          return Promise.all(jobs).finally(async () => {
-            if (!(await ensureBlingAuthorized())) return;
-            syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-              .then((syncRes) => {
+          if (await ensureBlingAuthorized()) {
+            if (!isImageSyncRunning()) {
+              try {
+                const syncRes = await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() });
                 reapplyImagesToCachedCatalog();
                 console.log(`[Startup Bling Sync] ${syncRes.message}`);
-              })
-              .catch((err) => {
+                if (hasFirebaseAdminEnv()) {
+                  await syncImageStoreToFirestore().catch(() => {});
+                }
+              } catch (err: any) {
                 console.warn('[Startup Bling Sync] Notice:', err?.message || err);
-              });
-          });
+              }
+            }
+          }
+
+          if (hasFirebaseAdminEnv()) {
+            try {
+              const syncFs = await syncAllBlingProdutosToFirestore({ enrichHighResImages: true });
+              console.log(`[Startup Bling Firestore] ${syncFs.totalImportado} itens sincronizados em ${syncFs.documentosGravados} docs.`);
+            } catch (err: any) {
+              console.warn('[Startup Bling Firestore] Notice:', err?.message || err);
+            }
+          }
         })
         .catch(() => {});
 
@@ -2084,13 +2352,16 @@ async function setupViteOrStatic() {
       const imageSyncTimer = setInterval(async () => {
         try {
           if (await ensureBlingAuthorized({ verifyLive: true })) {
-            if (hasFirebaseAdminEnv()) {
-              syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
-            }
             if (!isImageSyncRunning()) {
-              syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
+              await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
                 .then(() => reapplyImagesToCachedCatalog())
                 .catch(() => {});
+              if (hasFirebaseAdminEnv()) {
+                await syncImageStoreToFirestore().catch(() => {});
+              }
+            }
+            if (hasFirebaseAdminEnv()) {
+              syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
             }
           }
         } catch {

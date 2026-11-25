@@ -17,6 +17,7 @@ import { StreetwearRailSection } from './components/StreetwearRailSection';
 import { Product, ProductCategory, CartItem } from './types';
 import { getLiveCatalog } from './services/catalog';
 import { AdminBlingSyncPage } from './components/AdminBlingSyncPage';
+import { Ps5RaffleSection } from './components/Ps5RaffleSection';
 import { CustomerAuthModal, AuthModalMode } from './components/CustomerAuthModal';
 import {
   CustomerProfile,
@@ -388,6 +389,9 @@ function StorefrontApp() {
         onOpenProduct={(prod) => setSelectedProduct(prod)}
         onQuickAdd={handleQuickAdd}
       />
+
+      {/* 4. PS5 Raffle Official Section */}
+      <Ps5RaffleSection />
 
       {/* 4.5 Interactive 3D Clothing Rail Gallery Section */}
       <div id="arara-virtual">
