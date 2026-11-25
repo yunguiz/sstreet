@@ -47,10 +47,10 @@ export function Ps5RaffleSection() {
         <div className="text-center space-y-3">
           <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full bg-red-600/20 border border-red-500/40 text-red-400 text-xs font-black uppercase tracking-widest shadow-lg shadow-red-950/40 animate-pulse">
             <Gamepad2 className="w-4 h-4 text-red-500" />
-            <span>SORTEIO OFICIAL STREET STORE • PLAYSTATION 5</span>
+            <span>SORTEIO OFICIAL STREET STORE • PLAYSTATION 5 e GTA 6</span>
           </div>
           <h2 className="text-3xl sm:text-5xl font-black text-white uppercase tracking-wider font-oswald">
-            CONCORRA A UM <span className="text-red-600 drop-shadow-[0_0_25px_rgba(229,9,20,0.5)]">PS5 DE 5ª GERAÇÃO</span>
+            CONCORRA A UM <span className="text-red-600 drop-shadow-[0_0_25px_rgba(229,9,20,0.5)]">PS5 E GTA 6</span>
           </h2>
           <p className="text-sm sm:text-base text-zinc-300 max-w-2xl mx-auto leading-relaxed">
             Faça compras a partir de <strong className="text-white font-bold">R$ 150,00</strong> em produtos oficiais da Street Store para receber automaticamente o seu bilhete da sorte exclusivo!
