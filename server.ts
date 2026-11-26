@@ -2275,6 +2275,10 @@ async function processPs5RaffleEntry(params: {
   customerCpf?: string;
   orderNumber?: string;
   paymentId: string | number;
+  endToEndId?: string;
+  channel?: string;
+  cityState?: string;
+  createdAt?: number;
   orderTotal: number;
   shippingAddress?: any;
 }): Promise<string | null> {
@@ -2291,14 +2295,22 @@ async function processPs5RaffleEntry(params: {
     }
     const db = getAdminFirestore();
     const entriesRef = db.collection('raffle_ps5_entries');
-    const paymentIdStr = String(params.paymentId);
+    const paymentIdStr = String(params.paymentId).trim();
     const deterministicDocId = `mp_${paymentIdStr.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
-    // Check legacy auto-ID docs first to avoid duplicating previously created tickets
+    // Check existing docs by paymentId or endToEndId to prevent duplicates
     const existingSnap = await entriesRef.where('paymentId', '==', paymentIdStr).limit(1).get();
     if (!existingSnap.empty) {
       const existingData = existingSnap.docs[0].data();
       return existingData.ticketCode || null;
+    }
+
+    if (params.endToEndId) {
+      const existingE2ESnap = await entriesRef.where('endToEndId', '==', String(params.endToEndId).trim()).limit(1).get();
+      if (!existingE2ESnap.empty) {
+        const existingData = existingE2ESnap.docs[0].data();
+        return existingData.ticketCode || null;
+      }
     }
 
     const docRef = entriesRef.doc(deterministicDocId);
@@ -2306,9 +2318,16 @@ async function processPs5RaffleEntry(params: {
     const countSnap = await entriesRef.count().get();
     const existingCount = countSnap.data().count || 0;
 
-    const cityState = params.shippingAddress?.city && params.shippingAddress?.state
-      ? `${params.shippingAddress.city} - ${params.shippingAddress.state}`
-      : 'Itabira - MG';
+    const cityState =
+      params.cityState?.trim() ||
+      (params.shippingAddress?.city && params.shippingAddress?.state
+        ? `${params.shippingAddress.city} - ${params.shippingAddress.state}`
+        : 'Itabira - MG');
+
+    const createdAtMs =
+      typeof params.createdAt === 'number' && Number.isFinite(params.createdAt)
+        ? params.createdAt
+        : Date.now();
 
     const ticketCode = await db.runTransaction(async (tx) => {
       const docSnap = await tx.get(docRef);
@@ -2333,9 +2352,11 @@ async function processPs5RaffleEntry(params: {
         customerCpf: params.customerCpf || '',
         orderNumber: params.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`,
         paymentId: paymentIdStr,
+        ...(params.endToEndId ? { endToEndId: String(params.endToEndId).trim() } : {}),
+        ...(params.channel ? { channel: params.channel } : {}),
         orderTotal: total,
         cityState,
-        createdAt: Date.now()
+        createdAt: createdAtMs
       });
 
       return generatedCode;
@@ -2417,7 +2438,7 @@ app.get('/api/raffle/ps5/status', async (_req: Request, res: Response) => {
 // Admin verification helper
 function verifyAdminRaffleAccess(req: Request): boolean {
   const adminKey = req.headers['x-admin-key'] || req.query.key;
-  const expectedKey = process.env.ADMIN_SECRET_KEY || 'streetstore2026';
+  const expectedKey = process.env.ADMIN_SECRET_KEY || 'street_ps5_sorteio_2026_08xK';
   return adminKey === expectedKey;
 }
 
@@ -2481,6 +2502,207 @@ app.post('/api/raffle/ps5/admin/draw', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err.message || 'Erro ao realizar sorteio' });
+  }
+});
+
+// Helper to parse ISO or Brazilian date-time (e.g. "25/11/2026 às 19:54:16" -> BRT -03:00)
+function parseManualPaymentDate(input?: string | number): { timestampMs: number; iso: string } {
+  if (typeof input === 'number' && Number.isFinite(input)) {
+    const d = new Date(input);
+    return { timestampMs: d.getTime(), iso: d.toISOString() };
+  }
+  const raw = String(input || '').trim();
+  if (!raw) {
+    const now = new Date();
+    return { timestampMs: now.getTime(), iso: now.toISOString() };
+  }
+  const brMatch = raw.match(
+    /^(\d{2})\/(\d{2})\/(\d{4})(?:[\s,]+(?:às|as)?\s*(\d{2}):(\d{2})(?::(\d{2}))?)?$/i
+  );
+  if (brMatch) {
+    const [, dd, mm, yyyy, hh = '12', min = '00', ss = '00'] = brMatch;
+    const isoBrt = `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}-03:00`;
+    const parsed = new Date(isoBrt);
+    if (!isNaN(parsed.getTime())) {
+      return { timestampMs: parsed.getTime(), iso: parsed.toISOString() };
+    }
+  }
+  const parsed = new Date(raw);
+  if (!isNaN(parsed.getTime())) {
+    return { timestampMs: parsed.getTime(), iso: parsed.toISOString() };
+  }
+  const now = new Date();
+  return { timestampMs: now.getTime(), iso: now.toISOString() };
+}
+
+// Protected admin route: register manual/external Pix payment idempotently (creates order + PS5 raffle ticket)
+app.post('/api/raffle/ps5/admin/manual-entry', async (req: Request, res: Response) => {
+  try {
+    if (!verifyAdminRaffleAccess(req)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Acesso negado. Chave de administrador inválida (header x-admin-key ou query ?key).'
+      });
+    }
+    if (!hasFirebaseAdminEnv()) {
+      return res.status(500).json({
+        success: false,
+        error: 'Firebase Admin não configurado neste servidor.'
+      });
+    }
+
+    const {
+      customerName,
+      customerEmail,
+      customerPhone,
+      customerCpf,
+      amount,
+      orderTotal,
+      paidAt,
+      createdAt,
+      paymentId,
+      paymentReference,
+      endToEndId,
+      channel,
+      cityState,
+      shippingAddress,
+      items,
+      syncBling = false,
+      syncMelhorEnvio = false,
+    } = req.body || {};
+
+    const cleanName = String(customerName || '').trim();
+    if (!cleanName) {
+      return res.status(400).json({ success: false, error: 'Informe customerName.' });
+    }
+
+    const numericTotal = parseFloat(String(amount ?? orderTotal ?? 0).replace(',', '.'));
+    if (!Number.isFinite(numericTotal) || numericTotal <= 0) {
+      return res.status(400).json({ success: false, error: 'Valor pago inválido.' });
+    }
+
+    const canonicalPaymentId = String(paymentId || paymentReference || endToEndId || '').trim();
+    if (!canonicalPaymentId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Informe paymentId (ex: ST47134932) ou endToEndId para garantir idempotência.'
+      });
+    }
+
+    const { timestampMs, iso } = parseManualPaymentDate(paidAt ?? createdAt);
+    const resolvedChannel = String(channel || 'Pix bancário manual / fora do webhook do Mercado Pago').trim();
+    const resolvedEmail =
+      customerEmail && String(customerEmail).includes('@')
+        ? String(customerEmail).trim()
+        : 'streetstore364@gmail.com';
+
+    const db = getAdminFirestore();
+    const entriesRef = db.collection('raffle_ps5_entries');
+    const existingByPid = await entriesRef.where('paymentId', '==', canonicalPaymentId).limit(1).get();
+    const existingByE2E =
+      endToEndId && existingByPid.empty
+        ? await entriesRef.where('endToEndId', '==', String(endToEndId).trim()).limit(1).get()
+        : null;
+    const existingDoc = !existingByPid.empty
+      ? existingByPid.docs[0]
+      : existingByE2E && !existingByE2E.empty
+        ? existingByE2E.docs[0]
+        : null;
+
+    const orderRes = await createStoreOrder({
+      customer: {
+        name: cleanName,
+        email: resolvedEmail,
+        phone: customerPhone ? String(customerPhone) : undefined,
+        cpf: customerCpf ? String(customerCpf) : undefined,
+      },
+      items: Array.isArray(items) && items.length > 0
+        ? items
+        : [
+            {
+              sku: canonicalPaymentId,
+              name: `Pedido Manual Pix (${canonicalPaymentId})`,
+              price: numericTotal,
+              quantity: 1,
+            },
+          ],
+      shippingAddress,
+      paymentMethod: resolvedChannel,
+      paymentId: canonicalPaymentId,
+      endToEndId: endToEndId ? String(endToEndId).trim() : undefined,
+      source: 'manual_pix',
+      paidAt: iso,
+      skipBling: syncBling !== true,
+      skipMelhorEnvio: syncMelhorEnvio !== true,
+      total: numericTotal,
+    });
+
+    if (existingDoc) {
+      const existingData = existingDoc.data();
+      return res.json({
+        success: true,
+        alreadyExisted: true,
+        message: 'Pagamento manual já estava registrado anteriormente (idempotência preservada).',
+        orderId: orderRes.id,
+        orderNumber: existingData.orderNumber || orderRes.number,
+        blingOrderId: orderRes.blingOrderId,
+        ticketCode: existingData.ticketCode,
+        entry: { id: existingDoc.id, ...existingData },
+      });
+    }
+
+    if (numericTotal < 150) {
+      return res.status(400).json({
+        success: false,
+        orderId: orderRes.id,
+        orderNumber: orderRes.number,
+        error: 'Pedido registrado, mas valor total é inferior a R$ 150,00 (não elegível ao sorteio do PS5).'
+      });
+    }
+
+    const ticketCode = await processPs5RaffleEntry({
+      customerName: cleanName,
+      customerEmail: resolvedEmail,
+      customerPhone: customerPhone ? String(customerPhone) : undefined,
+      customerCpf: customerCpf ? String(customerCpf) : undefined,
+      orderNumber: orderRes.number,
+      paymentId: canonicalPaymentId,
+      endToEndId: endToEndId ? String(endToEndId).trim() : undefined,
+      channel: resolvedChannel,
+      cityState: cityState ? String(cityState) : undefined,
+      createdAt: timestampMs,
+      orderTotal: numericTotal,
+      shippingAddress,
+    });
+
+    if (!ticketCode) {
+      return res.status(500).json({
+        success: false,
+        orderId: orderRes.id,
+        orderNumber: orderRes.number,
+        error: 'Pedido salvo, mas não foi possível gerar o bilhete (verifique PS5_RAFFLE_ACTIVE e logs do Firestore).'
+      });
+    }
+
+    const docId = `mp_${canonicalPaymentId.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+    const savedSnap = await entriesRef.doc(docId).get();
+
+    return res.json({
+      success: true,
+      alreadyExisted: false,
+      message: 'Pagamento manual registrado no Firestore e bilhete do PS5 gerado com sucesso!',
+      orderId: orderRes.id,
+      orderNumber: orderRes.number,
+      blingOrderId: orderRes.blingOrderId,
+      ticketCode,
+      entry: savedSnap.exists ? { id: savedSnap.id, ...savedSnap.data() } : null,
+    });
+  } catch (err: any) {
+    console.error('[Manual Raffle Entry Error]:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Erro ao registrar compra manual no Firestore'
+    });
   }
 });
 
