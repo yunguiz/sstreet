@@ -10,13 +10,15 @@ import {
   parseBlingVariantMeta,
   sortSizes,
 } from '../lib/catalogVariants';
-import { db } from '../lib/firebase';
+import { auth, db } from '../lib/firebase';
 
 export interface TrackedOrderProduct {
   name: string;
   price: number;
   quantity: number;
   variant?: string;
+  color?: string;
+  sku?: string;
   image?: string;
 }
 
@@ -25,6 +27,10 @@ export interface TrackedOrder {
   orderId: number;
   status: 'open' | 'closed' | 'cancelled';
   paymentStatus: 'paid' | 'pending' | 'voided' | 'refunded';
+  paymentMethod?: string;
+  blingOrderId?: number;
+  blingSyncStatus?: string;
+  pendingPaymentId?: string;
   shippingStatus: 'unshipped' | 'shipped' | 'delivered' | 'unpacked';
   shippingCarrier: string;
   trackingNumber?: string | null;
@@ -306,6 +312,36 @@ export async function trackOrder(query: string): Promise<{
       success: false,
       orders: [],
       error: error.message || 'Falha ao buscar pedido no sistema de rastreamento'
+    };
+  }
+}
+
+/**
+ * Fetch orders belonging to the currently logged-in Firebase customer
+ */
+export async function getMyOrders(): Promise<{
+  success: boolean;
+  orders: TrackedOrder[];
+  error?: string;
+}> {
+  try {
+    const user = auth.currentUser;
+    if (!user) {
+      return { success: false, orders: [], error: 'Faça login para visualizar seus pedidos.' };
+    }
+    const token = await user.getIdToken();
+    const res = await fetch(`/api/orders/my-orders?_t=${Date.now()}`, {
+      cache: 'no-store',
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    return await res.json();
+  } catch (error: any) {
+    return {
+      success: false,
+      orders: [],
+      error: error.message || 'Falha ao carregar os pedidos da sua conta.',
     };
   }
 }

@@ -13,6 +13,7 @@ interface HeaderProps {
   onOpenFavorites: () => void;
   onOpenSearch: () => void;
   onOpenTracking: () => void;
+  onOpenMyOrders?: () => void;
   onOpenPolicies?: (tab: 'faq' | 'shipping' | 'returns') => void;
   onSelectCategory: (cat: ProductCategory | 'all', subcat?: string) => void;
   activeCategory: ProductCategory | 'all';
@@ -28,6 +29,7 @@ export function Header({
   onOpenFavorites,
   onOpenSearch,
   onOpenTracking,
+  onOpenMyOrders,
   onOpenPolicies,
   onSelectCategory,
   activeCategory
@@ -120,13 +122,17 @@ export function Header({
           {/* Customer Register / Account Button */}
           {currentUser ? (
             <div className="flex items-center gap-1 sm:gap-1.5 shrink-0">
-              <div
-                title={currentUser.email}
-                className="hidden sm:inline-flex items-center gap-1.5 h-8 sm:h-9 px-2.5 bg-[#141414] border border-zinc-800 rounded-lg text-[11px] font-bold text-zinc-200"
+              <button
+                type="button"
+                onClick={onOpenMyOrders || onOpenTracking}
+                title={`Meus Pedidos (${currentUser.email})`}
+                aria-label="Abrir Meus Pedidos"
+                className="hidden sm:inline-flex items-center gap-1.5 h-8 sm:h-9 px-2.5 bg-[#141414] hover:bg-zinc-800 border border-zinc-800 hover:border-emerald-500/40 rounded-lg text-[11px] font-bold text-zinc-200 hover:text-white transition-colors cursor-pointer"
               >
                 <User className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                 <span className="max-w-[76px] truncate">{firstName}</span>
-              </div>
+                <span className="hidden xl:inline text-[10px] text-emerald-400 font-black uppercase">Pedidos</span>
+              </button>
               <button
                 type="button"
                 onClick={onLogout}
@@ -218,21 +224,34 @@ export function Header({
 
           <div className="pt-3 border-t border-zinc-800 space-y-2">
             {currentUser ? (
-              <div className="flex items-center justify-between px-3 py-2.5 rounded-lg bg-[#141414] border border-zinc-800">
-                <div className="min-w-0">
-                  <p className="text-xs font-bold text-white truncate">{currentUser.name}</p>
-                  <p className="text-[11px] text-zinc-400 truncate">{currentUser.email}</p>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between px-3 py-2.5 rounded-lg bg-[#141414] border border-zinc-800">
+                  <div className="min-w-0">
+                    <p className="text-xs font-bold text-white truncate">{currentUser.name}</p>
+                    <p className="text-[11px] text-zinc-400 truncate">{currentUser.email}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      onLogout();
+                      setMobileMenuOpen(false);
+                    }}
+                    className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-xs font-bold text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0 ml-2"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Sair</span>
+                  </button>
                 </div>
                 <button
                   type="button"
                   onClick={() => {
-                    onLogout();
+                    (onOpenMyOrders || onOpenTracking)();
                     setMobileMenuOpen(false);
                   }}
-                  className="px-2.5 py-1.5 rounded bg-zinc-800 hover:bg-zinc-700 text-xs font-bold text-zinc-200 flex items-center gap-1 cursor-pointer shrink-0 ml-2"
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg bg-emerald-600/15 border border-emerald-500/40 text-emerald-300 font-black text-xs uppercase tracking-wider hover:bg-emerald-600/25 transition-colors cursor-pointer"
                 >
-                  <LogOut className="w-3.5 h-3.5" />
-                  <span>Sair</span>
+                  <User className="w-4 h-4 text-emerald-400" />
+                  <span>Meus Pedidos</span>
                 </button>
               </div>
             ) : (

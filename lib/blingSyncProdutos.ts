@@ -417,23 +417,31 @@ async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, Stoc
     chunks.push(uniqueIds.slice(i, i + 50));
   }
 
-  const results = await Promise.all(
-    chunks.map(async (chunk) => {
-      const qs = chunk.map((id) => `idsProdutos[]=${encodeURIComponent(id)}`).join('&');
-      try {
-        return await fetchBlingJson<{
-          data?: Array<{
-            produto?: { id?: number | string };
-            saldoVirtualTotal?: number | string;
-            saldoFisicoTotal?: number | string;
-            saldoFisico?: number | string;
-          }>;
-        }>(`/estoques/saldos?${qs}`);
-      } catch {
-        return null;
-      }
-    })
-  );
+  const results: Array<{
+    data?: Array<{
+      produto?: { id?: number | string };
+      saldoVirtualTotal?: number | string;
+      saldoFisicoTotal?: number | string;
+      saldoFisico?: number | string;
+    }>;
+  } | null> = [];
+
+  for (const chunk of chunks) {
+    const qs = chunk.map((id) => `idsProdutos[]=${encodeURIComponent(id)}`).join('&');
+    try {
+      const res = await fetchBlingJson<{
+        data?: Array<{
+          produto?: { id?: number | string };
+          saldoVirtualTotal?: number | string;
+          saldoFisicoTotal?: number | string;
+          saldoFisico?: number | string;
+        }>;
+      }>(`/estoques/saldos?${qs}`);
+      results.push(res);
+    } catch {
+      results.push(null);
+    }
+  }
 
   for (const res of results) {
     for (const entry of res?.data || []) {
@@ -683,7 +691,7 @@ export async function syncBlingProdutosPageToFirestore(
 
     const maxToEnrich = process.env.VERCEL ? 18 : 100;
     const targets = candidates.slice(0, maxToEnrich);
-    const CONCURRENCY = 2;
+    const CONCURRENCY = 1;
 
     for (let i = 0; i < targets.length; i += CONCURRENCY) {
       if (Date.now() - detailStart >= detailBudgetMs) break;
@@ -952,6 +960,8 @@ export async function syncBlingProdutosPageToFirestore(
   };
 }
 
+let activeSyncAllPromise: Promise<SyncAllResult> | null = null;
+
 /**
  * Percorre automaticamente páginas do Bling (`pagina = startPage` até o fim)
  * dentro de um orçamento de tempo seguro para nunca estourar o timeout da Vercel.
@@ -962,60 +972,70 @@ export async function syncAllBlingProdutosToFirestore(options?: {
   maxPages?: number;
   enrichHighResImages?: boolean;
 }): Promise<SyncAllResult> {
-  const startedAt = Date.now();
-  const startPage = Math.max(1, Math.floor(options?.startPage || 1));
-  const maxExecutionMs = Math.max(2000, options?.maxExecutionMs ?? (process.env.VERCEL ? 8200 : 180000));
-  const maxPages = Math.max(1, options?.maxPages ?? 100);
-
-  let currentPage = startPage;
-  let ultimaPagina = startPage;
-  let paginasProcessadas = 0;
-  let totalImportado = 0;
-  let documentosGravados = 0;
-  let finalizado = false;
-  let paradoPorTempoLimite = false;
-
-  while (paginasProcessadas < maxPages) {
-    const elapsed = Date.now() - startedAt;
-    if (paginasProcessadas > 0 && elapsed >= maxExecutionMs) {
-      paradoPorTempoLimite = true;
-      break;
-    }
-
-    const remainingBudget = Math.max(500, maxExecutionMs - elapsed);
-    const shouldEnrich = options?.enrichHighResImages ?? true;
-    const pageResult = await syncBlingProdutosPageToFirestore(currentPage, {
-      enrichHighResImages: shouldEnrich,
-      maxDetailMs: shouldEnrich
-        ? (process.env.VERCEL ? Math.min(2000, Math.floor(remainingBudget * 0.3)) : Math.min(20000, Math.floor(remainingBudget * 0.5)))
-        : 0,
-    });
-
-    ultimaPagina = currentPage;
-    paginasProcessadas++;
-    totalImportado += pageResult.importadosNaPagina || 0;
-    documentosGravados += pageResult.documentosGravados || 0;
-
-    if (pageResult.finalizado) {
-      finalizado = true;
-      break;
-    }
-
-    currentPage = pageResult.proximaPagina || currentPage + 1;
+  if (activeSyncAllPromise) {
+    return activeSyncAllPromise;
   }
 
-  return {
-    success: true,
-    finalizado,
-    paginaInicial: startPage,
-    ultimaPagina,
-    ...(finalizado ? {} : { proximaPagina: currentPage }),
-    paginasProcessadas,
-    totalImportado,
-    documentosGravados,
-    duracaoMs: Date.now() - startedAt,
-    ...(paradoPorTempoLimite ? { paradoPorTempoLimite: true } : {}),
-  };
+  activeSyncAllPromise = (async () => {
+    const startedAt = Date.now();
+    const startPage = Math.max(1, Math.floor(options?.startPage || 1));
+    const maxExecutionMs = Math.max(2000, options?.maxExecutionMs ?? (process.env.VERCEL ? 8200 : 180000));
+    const maxPages = Math.max(1, options?.maxPages ?? 100);
+
+    let currentPage = startPage;
+    let ultimaPagina = startPage;
+    let paginasProcessadas = 0;
+    let totalImportado = 0;
+    let documentosGravados = 0;
+    let finalizado = false;
+    let paradoPorTempoLimite = false;
+
+    while (paginasProcessadas < maxPages) {
+      const elapsed = Date.now() - startedAt;
+      if (paginasProcessadas > 0 && elapsed >= maxExecutionMs) {
+        paradoPorTempoLimite = true;
+        break;
+      }
+
+      const remainingBudget = Math.max(500, maxExecutionMs - elapsed);
+      const shouldEnrich = options?.enrichHighResImages ?? true;
+      const pageResult = await syncBlingProdutosPageToFirestore(currentPage, {
+        enrichHighResImages: shouldEnrich,
+        maxDetailMs: shouldEnrich
+          ? (process.env.VERCEL ? Math.min(2000, Math.floor(remainingBudget * 0.3)) : Math.min(20000, Math.floor(remainingBudget * 0.5)))
+          : 0,
+      });
+
+      ultimaPagina = currentPage;
+      paginasProcessadas++;
+      totalImportado += pageResult.importadosNaPagina || 0;
+      documentosGravados += pageResult.documentosGravados || 0;
+
+      if (pageResult.finalizado) {
+        finalizado = true;
+        break;
+      }
+
+      currentPage = pageResult.proximaPagina || currentPage + 1;
+    }
+
+    return {
+      success: true,
+      finalizado,
+      paginaInicial: startPage,
+      ultimaPagina,
+      ...(finalizado ? {} : { proximaPagina: currentPage }),
+      paginasProcessadas,
+      totalImportado,
+      documentosGravados,
+      duracaoMs: Date.now() - startedAt,
+      ...(paradoPorTempoLimite ? { paradoPorTempoLimite: true } : {}),
+    };
+  })().finally(() => {
+    activeSyncAllPromise = null;
+  });
+
+  return activeSyncAllPromise;
 }
 
 /**

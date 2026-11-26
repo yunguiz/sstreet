@@ -358,6 +358,10 @@ function StorefrontApp() {
           setTrackingInitialQuery('');
           setIsTrackingOpen(true);
         }}
+        onOpenMyOrders={() => {
+          setTrackingInitialQuery('');
+          setIsTrackingOpen(true);
+        }}
         onOpenPolicies={(tab) => {
           setPoliciesInitialTab(tab);
           setIsPoliciesOpen(true);
@@ -539,6 +543,7 @@ function StorefrontApp() {
         isOpen={isTrackingOpen}
         onClose={() => setIsTrackingOpen(false)}
         initialQuery={trackingInitialQuery}
+        currentUser={currentUser}
       />
 
       {/* Policies & FAQ Modal (Entregas, Trocas e Devoluções, Perguntas Frequentes) */}

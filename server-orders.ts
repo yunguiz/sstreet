@@ -18,6 +18,7 @@ export interface StoredOrderItem {
   price: number;
   quantity: number;
   selectedSize?: string;
+  selectedColor?: string;
   image?: string;
 }
 
@@ -32,12 +33,19 @@ export interface StoredOrder {
   trackingUrl?: string | null;
   paymentMethod: string;
   paymentId: string | number;
+  pendingPaymentId?: string;
   endToEndId?: string;
   source?: string;
+  userId?: string;
   blingOrderId?: number;
   blingOrderNumber?: number;
+  blingSyncStatus?: 'synced' | 'pending' | 'failed' | 'skipped';
+  blingSyncError?: string | null;
+  blingSyncAttempts?: number;
+  lastBlingSyncAt?: string | null;
   melhorEnvioCartId?: string;
   customer: {
+    uid?: string;
     name: string;
     email: string;
     phone?: string;
@@ -58,6 +66,7 @@ export interface StoredOrder {
     price: number;
     quantity: number;
     variant?: string;
+    color?: string;
     sku?: string;
     variantId?: number;
     image?: string;
@@ -107,6 +116,22 @@ function saveOrdersDb(db: OrdersDatabase): void {
   }
 }
 
+function upsertOrderInLocalDb(order: StoredOrder): void {
+  const db = loadOrdersDb();
+  db.lastOrderSequence = Math.max(db.lastOrderSequence, Number(order.orderId || 0));
+  const idx = db.orders.findIndex(
+    (o) =>
+      String(o.paymentId) === String(order.paymentId) ||
+      (order.orderId && Number(o.orderId) === Number(order.orderId))
+  );
+  if (idx >= 0) {
+    db.orders[idx] = order;
+  } else {
+    db.orders.unshift(order);
+  }
+  saveOrdersDb(db);
+}
+
 function sanitizeOrderDocId(paymentId: string | number): string {
   return `mp_${String(paymentId).replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 }
@@ -136,10 +161,18 @@ async function getNextOrderSequence(): Promise<number> {
   return localDb.lastOrderSequence;
 }
 
-async function findExistingOrderByPaymentId(paymentId: string | number): Promise<StoredOrder | null> {
+export async function findExistingOrderByPaymentId(
+  paymentId: string | number,
+  extraRefs?: { pendingPaymentId?: string; endToEndId?: string }
+): Promise<StoredOrder | null> {
   const pidStr = String(paymentId);
   const localDb = loadOrdersDb();
-  const localMatch = localDb.orders.find((o) => String(o.paymentId) === pidStr);
+  const localMatch = localDb.orders.find(
+    (o) =>
+      String(o.paymentId) === pidStr ||
+      (extraRefs?.pendingPaymentId && o.pendingPaymentId === extraRefs.pendingPaymentId) ||
+      (extraRefs?.endToEndId && o.endToEndId === extraRefs.endToEndId)
+  );
   if (localMatch) {
     return localMatch;
   }
@@ -159,6 +192,26 @@ async function findExistingOrderByPaymentId(paymentId: string | number): Promise
       if (!querySnap.empty) {
         return querySnap.docs[0].data() as StoredOrder;
       }
+      if (extraRefs?.pendingPaymentId) {
+        const pendingSnap = await fsDb
+          .collection('orders')
+          .where('pendingPaymentId', '==', extraRefs.pendingPaymentId)
+          .limit(1)
+          .get();
+        if (!pendingSnap.empty) {
+          return pendingSnap.docs[0].data() as StoredOrder;
+        }
+      }
+      if (extraRefs?.endToEndId) {
+        const e2eSnap = await fsDb
+          .collection('orders')
+          .where('endToEndId', '==', extraRefs.endToEndId)
+          .limit(1)
+          .get();
+        if (!e2eSnap.empty) {
+          return e2eSnap.docs[0].data() as StoredOrder;
+        }
+      }
     } catch (err) {
       console.warn('[Orders Store] Erro ao buscar pedido existente no Firestore:', err);
     }
@@ -167,7 +220,7 @@ async function findExistingOrderByPaymentId(paymentId: string | number): Promise
   return null;
 }
 
-async function saveOrderToFirestore(order: StoredOrder): Promise<void> {
+export async function saveOrderToFirestore(order: StoredOrder): Promise<void> {
   if (!hasFirebaseAdminEnv()) return;
   try {
     const fsDb = getAdminFirestore();
@@ -184,7 +237,7 @@ let cachedBlingPaymentMethods: { items: any[]; fetchedAt: number } | null = null
 async function getBlingPaymentMethodId(paymentMethodLabel: string): Promise<number | null> {
   try {
     const now = Date.now();
-    if (!cachedBlingPaymentMethods || now - cachedBlingPaymentMethods.fetchedAt > 10 * 60 * 1000) {
+    if (!cachedBlingPaymentMethods || now - cachedBlingPaymentMethods.fetchedAt > 60 * 60 * 1000) {
       const res = await fetchFromBling('/formas-pagamentos?limite=50');
       cachedBlingPaymentMethods = {
         items: Array.isArray(res?.data) ? res.data : [],
@@ -362,10 +415,11 @@ async function syncOrderToBling(params: {
   };
   total: number;
   nowIso: string;
-}): Promise<{ blingOrderId?: number; blingOrderNumber?: number }> {
-  if (!(await ensureBlingAuthorized({ verifyLive: true }))) {
-    console.warn('[Bling Order] Bling OAuth não autorizado no momento; pedido não pôde ser enviado ao Bling.');
-    return {};
+}): Promise<{ blingOrderId?: number; blingOrderNumber?: number; error?: string }> {
+  if (!(await ensureBlingAuthorized())) {
+    const msg = 'Bling OAuth não autorizado no momento; sincronização do pedido adiada.';
+    console.warn('[Bling Order]', msg);
+    return { error: msg };
   }
 
   const todayDate = params.nowIso.slice(0, 10);
@@ -375,8 +429,9 @@ async function syncOrderToBling(params: {
   });
 
   if (!contactId) {
-    console.error('[Bling Order] Não foi possível resolver contato.id no Bling. Pedido abortado no Bling.');
-    return {};
+    const msg = 'Não foi possível resolver contato.id no Bling.';
+    console.error('[Bling Order]', msg);
+    return { error: msg };
   }
 
   const blingItems: any[] = [];
@@ -457,6 +512,7 @@ async function syncOrderToBling(params: {
     ];
   }
 
+  let primaryErrorMsg = '';
   try {
     const blingRes = await fetchFromBling('/pedidos/vendas', {
       method: 'POST',
@@ -470,7 +526,8 @@ async function syncOrderToBling(params: {
       };
     }
   } catch (blingErr: any) {
-    console.error('[Orders Store] Falha no envio completo ao Bling ERP:', blingErr?.message || blingErr);
+    primaryErrorMsg = blingErr?.message || String(blingErr);
+    console.error('[Orders Store] Falha no envio completo ao Bling ERP:', primaryErrorMsg);
 
     // Clean fallback retry without optional produto.id / parcelas / transporte in case Bling rejected SKU/payment relation
     try {
@@ -500,15 +557,18 @@ async function syncOrderToBling(params: {
         };
       }
     } catch (retryErr: any) {
-      console.error('[Orders Store] Fallback no Bling ERP também falhou:', retryErr?.message || retryErr);
+      const retryMsg = retryErr?.message || String(retryErr);
+      console.error('[Orders Store] Fallback no Bling ERP também falhou:', retryMsg);
+      return { error: retryMsg };
     }
   }
 
-  return {};
+  return { error: primaryErrorMsg || 'Resposta sem ID ao criar pedido no Bling ERP.' };
 }
 
 export async function createStoreOrder(params: {
   customer: {
+    uid?: string;
     name?: string;
     email: string;
     phone?: string;
@@ -530,8 +590,10 @@ export async function createStoreOrder(params: {
   shippingCarrier?: string;
   paymentMethod: string;
   paymentId: string | number;
+  pendingPaymentId?: string;
   endToEndId?: string;
   source?: string;
+  userId?: string;
   paidAt?: string;
   skipBling?: boolean;
   skipMelhorEnvio?: boolean;
@@ -542,11 +604,29 @@ export async function createStoreOrder(params: {
   number: string;
   blingOrderId?: number;
   blingOrderNumber?: number;
+  blingSyncStatus?: 'synced' | 'pending' | 'failed' | 'skipped';
+  blingSyncError?: string;
   melhorEnvioCartId?: string;
   alreadyExisted?: boolean;
 }> {
-  const existing = await findExistingOrderByPaymentId(params.paymentId);
+  const existing = await findExistingOrderByPaymentId(params.paymentId, {
+    pendingPaymentId: params.pendingPaymentId,
+    endToEndId: params.endToEndId,
+  });
+
   if (existing) {
+    let updated = false;
+    const resolvedUid = params.userId || params.customer?.uid;
+    if (resolvedUid && !existing.userId) {
+      existing.userId = resolvedUid;
+      existing.customer = { ...existing.customer, uid: resolvedUid };
+      updated = true;
+    }
+    if (params.pendingPaymentId && !existing.pendingPaymentId) {
+      existing.pendingPaymentId = params.pendingPaymentId;
+      updated = true;
+    }
+
     // If previous save missed Bling sync and skipBling is false, retry Bling sync idempotently
     if (!existing.blingOrderId && !params.skipBling) {
       const blingSync = await syncOrderToBling({
@@ -566,16 +646,23 @@ export async function createStoreOrder(params: {
         total: existing.total,
         nowIso: existing.createdAt,
       });
+      existing.blingSyncAttempts = (existing.blingSyncAttempts || 0) + 1;
+      existing.lastBlingSyncAt = new Date().toISOString();
       if (blingSync.blingOrderId) {
         existing.blingOrderId = blingSync.blingOrderId;
         existing.blingOrderNumber = blingSync.blingOrderNumber;
-        const db = loadOrdersDb();
-        const idx = db.orders.findIndex((o) => String(o.paymentId) === String(existing.paymentId));
-        if (idx >= 0) db.orders[idx] = existing;
-        else db.orders.unshift(existing);
-        saveOrdersDb(db);
-        await saveOrderToFirestore(existing);
+        existing.blingSyncStatus = 'synced';
+        existing.blingSyncError = null;
+      } else {
+        existing.blingSyncStatus = 'failed';
+        existing.blingSyncError = blingSync.error || 'Falha temporária ao enviar pedido ao Bling ERP';
       }
+      updated = true;
+    }
+
+    if (updated) {
+      upsertOrderInLocalDb(existing);
+      await saveOrderToFirestore(existing);
     }
 
     return {
@@ -584,6 +671,8 @@ export async function createStoreOrder(params: {
       number: existing.orderNumber,
       blingOrderId: existing.blingOrderId,
       blingOrderNumber: existing.blingOrderNumber,
+      blingSyncStatus: existing.blingSyncStatus,
+      blingSyncError: existing.blingSyncError || undefined,
       melhorEnvioCartId: existing.melhorEnvioCartId,
       alreadyExisted: true,
     };
@@ -592,6 +681,7 @@ export async function createStoreOrder(params: {
   const orderId = await getNextOrderSequence();
   const orderNumber = `#${orderId}`;
   const nowIso = params.paidAt || new Date().toISOString();
+  const resolvedUid = params.userId || params.customer?.uid;
 
   const newOrder: StoredOrder = {
     orderId,
@@ -604,9 +694,14 @@ export async function createStoreOrder(params: {
     trackingUrl: null,
     paymentMethod: params.paymentMethod,
     paymentId: String(params.paymentId),
+    ...(params.pendingPaymentId ? { pendingPaymentId: params.pendingPaymentId } : {}),
     ...(params.endToEndId ? { endToEndId: params.endToEndId } : {}),
     ...(params.source ? { source: params.source } : {}),
+    ...(resolvedUid ? { userId: resolvedUid } : {}),
+    blingSyncStatus: params.skipBling ? 'skipped' : 'pending',
+    blingSyncAttempts: 0,
     customer: {
+      ...(resolvedUid ? { uid: resolvedUid } : {}),
       name: params.customer.name?.trim() || 'Cliente Street Store',
       email: params.customer.email,
       phone: params.customer.phone || '',
@@ -629,6 +724,7 @@ export async function createStoreOrder(params: {
       price: Number(it.price || 0),
       quantity: Number(it.quantity || 1),
       variant: it.selectedSize || 'Tamanho Único',
+      ...(it.selectedColor ? { color: it.selectedColor } : {}),
       sku: it.sku,
       variantId: it.variantId,
       image: it.image || '',
@@ -639,9 +735,19 @@ export async function createStoreOrder(params: {
     shippedAt: null,
   };
 
+  // CRITICAL: Save paid order to local DB & Firestore IMMEDIATELY BEFORE Bling / Melhor Envio calls.
+  // Temporary Bling 429 or network timeouts MUST NEVER block saving the paid order or leave it stuck in pending_payments.
+  upsertOrderInLocalDb(newOrder);
+  await saveOrderToFirestore(newOrder);
+  console.log(`[Orders Store] Pedido pago ${orderNumber} persistido em orders (ID pagamento: ${newOrder.paymentId}).`);
+
+  let postSaveDirty = false;
+
   // Sync order to Bling ERP unless skipped (e.g. manual historical reconciliation)
   if (!params.skipBling) {
     try {
+      newOrder.blingSyncAttempts = 1;
+      newOrder.lastBlingSyncAt = new Date().toISOString();
       const blingSync = await syncOrderToBling({
         orderNumber,
         paymentMethod: params.paymentMethod,
@@ -655,9 +761,18 @@ export async function createStoreOrder(params: {
       if (blingSync.blingOrderId) {
         newOrder.blingOrderId = blingSync.blingOrderId;
         newOrder.blingOrderNumber = blingSync.blingOrderNumber;
+        newOrder.blingSyncStatus = 'synced';
+        newOrder.blingSyncError = null;
+      } else {
+        newOrder.blingSyncStatus = 'failed';
+        newOrder.blingSyncError = blingSync.error || 'Erro temporário ao enviar pedido ao Bling ERP';
       }
+      postSaveDirty = true;
     } catch (blingErr: any) {
-      console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP:', blingErr?.message || blingErr);
+      newOrder.blingSyncStatus = 'failed';
+      newOrder.blingSyncError = blingErr?.message || String(blingErr);
+      postSaveDirty = true;
+      console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP (pedido já salvo no site):', newOrder.blingSyncError);
     }
   }
 
@@ -688,6 +803,7 @@ export async function createStoreOrder(params: {
       if (meCart.success && meCart.cartId) {
         melhorEnvioCartId = meCart.cartId;
         newOrder.melhorEnvioCartId = meCart.cartId;
+        postSaveDirty = true;
         console.log(`[Orders Store] Etiqueta adicionada ao carrinho Melhor Envio: ${meCart.cartId}`);
       }
     } catch (meErr: any) {
@@ -695,13 +811,10 @@ export async function createStoreOrder(params: {
     }
   }
 
-  const db = loadOrdersDb();
-  db.lastOrderSequence = Math.max(db.lastOrderSequence, orderId);
-  db.orders.unshift(newOrder);
-  saveOrdersDb(db);
-  await saveOrderToFirestore(newOrder);
-
-  console.log(`[Orders Store] Pedido oficial ${orderNumber} registrado com sucesso.`);
+  if (postSaveDirty) {
+    upsertOrderInLocalDb(newOrder);
+    await saveOrderToFirestore(newOrder);
+  }
 
   return {
     success: true,
@@ -709,38 +822,427 @@ export async function createStoreOrder(params: {
     number: orderNumber,
     blingOrderId: newOrder.blingOrderId,
     blingOrderNumber: newOrder.blingOrderNumber,
+    blingSyncStatus: newOrder.blingSyncStatus,
+    blingSyncError: newOrder.blingSyncError || undefined,
     melhorEnvioCartId,
   };
 }
 
-export async function trackStoreOrders(query: string): Promise<StoredOrder[]> {
-  const cleanQ = query.trim().replace(/^#/, '').toLowerCase();
-  const db = loadOrdersDb();
+let activeRetryBlingOrdersPromise: Promise<{
+  checked: number;
+  synced: number;
+  failed: number;
+  details: Array<{ orderNumber: string; paymentId: string | number; blingOrderId?: number; error?: string }>;
+}> | null = null;
 
-  const matchesOrder = (o: StoredOrder) => {
-    const numMatch = o.orderNumber.replace('#', '').toLowerCase() === cleanQ || String(o.orderId) === cleanQ;
-    const emailMatch =
-      (o.customer?.email || '').toLowerCase() === cleanQ ||
-      (cleanQ.length >= 4 && (o.customer?.email || '').toLowerCase().includes(cleanQ));
-    const paymentMatch = String(o.paymentId).toLowerCase() === cleanQ;
-    return numMatch || emailMatch || paymentMatch;
+export async function retryPendingBlingOrders(options?: {
+  paymentId?: string | number;
+  orderId?: number;
+  limit?: number;
+  forceAll?: boolean;
+}): Promise<{
+  checked: number;
+  synced: number;
+  failed: number;
+  details: Array<{ orderNumber: string; paymentId: string | number; blingOrderId?: number; error?: string }>;
+}> {
+  if (activeRetryBlingOrdersPromise && !options?.paymentId && !options?.orderId) {
+    return activeRetryBlingOrdersPromise;
+  }
+
+  const run = (async () => {
+    const candidatesMap = new Map<string, StoredOrder>();
+    const localDb = loadOrdersDb();
+    for (const o of localDb.orders) {
+      candidatesMap.set(String(o.paymentId || o.orderId), o);
+    }
+
+    if (hasFirebaseAdminEnv()) {
+      try {
+        const fsDb = getAdminFirestore();
+        const snap = await fsDb.collection('orders').orderBy('createdAt', 'desc').limit(100).get();
+        snap.forEach((doc) => {
+          const o = doc.data() as StoredOrder;
+          const key = String(o.paymentId || o.orderId);
+          const prev = candidatesMap.get(key);
+          candidatesMap.set(key, prev ? { ...prev, ...o } : o);
+        });
+      } catch (err) {
+        console.warn('[Orders Retry Bling] Aviso ao listar pedidos no Firestore:', err);
+      }
+    }
+
+    const targetPaymentId = options?.paymentId !== undefined ? String(options.paymentId) : null;
+    const targetOrderId = options?.orderId !== undefined ? Number(options.orderId) : null;
+
+    const toSync = Array.from(candidatesMap.values())
+      .filter((o) => {
+        if (o.paymentStatus !== 'paid') return false;
+        if (targetPaymentId) return String(o.paymentId) === targetPaymentId || o.pendingPaymentId === targetPaymentId;
+        if (targetOrderId) return Number(o.orderId) === targetOrderId;
+        if (o.blingOrderId) return false;
+        if (!options?.forceAll && o.blingSyncStatus === 'skipped') return false;
+        return true;
+      })
+      .slice(0, options?.limit ?? 10);
+
+    const details: Array<{ orderNumber: string; paymentId: string | number; blingOrderId?: number; error?: string }> = [];
+    let synced = 0;
+    let failed = 0;
+
+    if (toSync.length === 0 || !(await ensureBlingAuthorized())) {
+      return { checked: toSync.length, synced: 0, failed: 0, details };
+    }
+
+    for (const order of toSync) {
+      const blingRes = await syncOrderToBling({
+        orderNumber: order.orderNumber,
+        paymentMethod: order.paymentMethod,
+        paymentId: order.paymentId,
+        customer: order.customer,
+        items: (order.products || []).map((p) => ({
+          name: p.name,
+          price: p.price,
+          quantity: p.quantity,
+          sku: p.sku,
+          variantId: p.variantId,
+          selectedSize: p.variant,
+          image: p.image,
+        })),
+        shippingAddress: order.shippingAddress
+          ? {
+              street: order.shippingAddress.address,
+              number: order.shippingAddress.number,
+              neighborhood: order.shippingAddress.locality,
+              city: order.shippingAddress.city,
+              state: order.shippingAddress.province,
+              zip: order.shippingAddress.zipcode,
+              name: order.shippingAddress.name,
+            }
+          : undefined,
+        total: order.total,
+        nowIso: order.paidAt || order.createdAt || new Date().toISOString(),
+      });
+
+      order.blingSyncAttempts = (order.blingSyncAttempts || 0) + 1;
+      order.lastBlingSyncAt = new Date().toISOString();
+
+      if (blingRes.blingOrderId) {
+        order.blingOrderId = blingRes.blingOrderId;
+        order.blingOrderNumber = blingRes.blingOrderNumber;
+        order.blingSyncStatus = 'synced';
+        order.blingSyncError = null;
+        synced++;
+        details.push({
+          orderNumber: order.orderNumber,
+          paymentId: order.paymentId,
+          blingOrderId: blingRes.blingOrderId,
+        });
+      } else {
+        order.blingSyncStatus = 'failed';
+        order.blingSyncError = blingRes.error || 'Erro ao enviar pedido para Bling ERP';
+        failed++;
+        details.push({
+          orderNumber: order.orderNumber,
+          paymentId: order.paymentId,
+          error: order.blingSyncError,
+        });
+      }
+
+      upsertOrderInLocalDb(order);
+      await saveOrderToFirestore(order);
+    }
+
+    return { checked: toSync.length, synced, failed, details };
+  })().finally(() => {
+    if (!options?.paymentId && !options?.orderId) {
+      activeRetryBlingOrdersPromise = null;
+    }
+  });
+
+  if (!options?.paymentId && !options?.orderId) {
+    activeRetryBlingOrdersPromise = run;
+  }
+
+  return run;
+}
+
+const BLING_SALES_CACHE_TTL_MS = 45 * 1000;
+let cachedBlingSalesOrders: { items: any[]; fetchedAt: number } | null = null;
+let inFlightBlingSalesFetch: Promise<any[]> | null = null;
+
+async function getCachedBlingSalesOrders(): Promise<any[]> {
+  const now = Date.now();
+  if (cachedBlingSalesOrders && now - cachedBlingSalesOrders.fetchedAt < BLING_SALES_CACHE_TTL_MS) {
+    return cachedBlingSalesOrders.items;
+  }
+
+  if (inFlightBlingSalesFetch) {
+    return inFlightBlingSalesFetch;
+  }
+
+  inFlightBlingSalesFetch = (async () => {
+    try {
+      if (!(await ensureBlingAuthorized())) {
+        return cachedBlingSalesOrders?.items || [];
+      }
+      const blingData = await fetchFromBling('/pedidos/vendas?pagina=1&limite=50');
+      const rawOrders = Array.isArray(blingData?.data) ? blingData.data : [];
+      cachedBlingSalesOrders = {
+        items: rawOrders,
+        fetchedAt: Date.now(),
+      };
+      return rawOrders;
+    } catch (err: any) {
+      console.warn('[Orders Track] Bling lookup notice:', err?.message || err);
+      return cachedBlingSalesOrders?.items || [];
+    } finally {
+      inFlightBlingSalesFetch = null;
+    }
+  })();
+
+  return inFlightBlingSalesFetch;
+}
+
+function mapBlingOrderToStoredOrder(bo: any): StoredOrder {
+  return {
+    orderId: bo.id,
+    orderNumber: `#${bo.numero || bo.id}`,
+    status: 'open',
+    paymentStatus: 'paid',
+    shippingStatus: bo.transporte?.etiqueta ? 'shipped' : 'unshipped',
+    shippingCarrier: bo.transporte?.transportador?.nome || 'Melhor Envio',
+    trackingNumber: bo.transporte?.etiqueta?.codigoRastreamento || null,
+    trackingUrl: bo.transporte?.etiqueta?.codigoRastreamento
+      ? `https://melhorenvio.com.br/rastreio/${bo.transporte.etiqueta.codigoRastreamento}`
+      : null,
+    paymentMethod: 'Mercado Pago / Bling ERP',
+    paymentId: String(bo.id),
+    blingOrderId: bo.id,
+    blingOrderNumber: bo.numero ? Number(bo.numero) : undefined,
+    blingSyncStatus: 'synced',
+    customer: {
+      name: bo.contato?.nome || 'Cliente Street Store',
+      email: bo.contato?.email || '',
+      phone: bo.contato?.celular || bo.contato?.telefone || '',
+    },
+    products: (bo.itens || []).map((it: any) => ({
+      name: it.descricao || 'Peça Street Store',
+      price: Number(it.valor || 0),
+      quantity: Number(it.quantidade || 1),
+      variant: it.codigo || '',
+      image: '',
+    })),
+    total: Number(bo.total || 0),
+    createdAt: bo.data || new Date().toISOString(),
+    paidAt: bo.data || null,
+    shippedAt: null,
+  };
+}
+
+function mapPendingPaymentToStoredOrder(p: Record<string, any>, docId: string): StoredOrder {
+  const idStr = String(p.id || docId);
+  const createdMs = Number(p.createdAt || Date.now());
+  const createdIso = Number.isFinite(createdMs) ? new Date(createdMs).toISOString() : new Date().toISOString();
+  const shortNumeric = idStr.replace(/\D/g, '').slice(-5) || '0';
+  return {
+    orderId: Number(shortNumeric) || 0,
+    orderNumber: p.orderNumber || `PIX-${idStr.slice(-6).toUpperCase()}`,
+    status: 'open',
+    paymentStatus: p.status === 'approved' ? 'paid' : 'pending',
+    shippingStatus: 'unshipped',
+    shippingCarrier: p.shippingCarrier || 'Melhor Envio (Correios / Jadlog)',
+    trackingNumber: null,
+    trackingUrl: null,
+    paymentMethod: p.paymentMethod || 'Pix Instantâneo Mercado Pago',
+    paymentId: idStr,
+    pendingPaymentId: idStr,
+    ...(p.userId || p.payer?.uid ? { userId: String(p.userId || p.payer?.uid) } : {}),
+    customer: {
+      ...(p.userId || p.payer?.uid ? { uid: String(p.userId || p.payer?.uid) } : {}),
+      name: String(p.payer?.name || 'Cliente Street Store'),
+      email: String(p.payer?.email || ''),
+      phone: String(p.payer?.phone || ''),
+      ...(p.payer?.cpf ? { cpf: String(p.payer.cpf) } : {}),
+    },
+    shippingAddress: p.shippingAddress
+      ? {
+          name: p.shippingAddress.name || p.payer?.name || 'Cliente Street Store',
+          address: p.shippingAddress.street || '',
+          number: p.shippingAddress.number || 'S/N',
+          locality: p.shippingAddress.neighborhood || 'Centro',
+          city: p.shippingAddress.city || '',
+          province: p.shippingAddress.state || '',
+          zipcode: String(p.shippingAddress.zip || '').replace(/\D/g, ''),
+          country: 'BR',
+        }
+      : undefined,
+    products: Array.isArray(p.items)
+      ? p.items.map((it: any) => ({
+          name: String(it.name || 'Peça Street Store'),
+          price: Number(it.price || 0),
+          quantity: Number(it.quantity || 1),
+          variant: it.selectedSize || 'Tamanho Único',
+          ...(it.selectedColor ? { color: it.selectedColor } : {}),
+          sku: it.sku,
+          variantId: it.variantId,
+          image: it.image || '',
+        }))
+      : [],
+    total: Number(p.amount || 0),
+    createdAt: createdIso,
+    paidAt: p.dateApproved || null,
+    shippedAt: null,
+  };
+}
+
+function mergeOrderUnique(target: StoredOrder[], candidate: StoredOrder): void {
+  const exists = target.some(
+    (o) =>
+      String(o.paymentId) === String(candidate.paymentId) ||
+      (candidate.orderId > 0 && o.orderId === candidate.orderId && candidate.orderNumber === o.orderNumber) ||
+      (candidate.pendingPaymentId &&
+        (o.pendingPaymentId === candidate.pendingPaymentId || String(o.paymentId) === candidate.pendingPaymentId))
+  );
+  if (!exists) {
+    target.push(candidate);
+  }
+}
+
+export async function getCustomerOrders(identity: {
+  uid?: string;
+  email?: string;
+  phone?: string;
+  cpf?: string;
+}): Promise<StoredOrder[]> {
+  const uid = (identity.uid || '').trim();
+  const email = (identity.email || '').trim().toLowerCase();
+  const phoneDigits = String(identity.phone || '').replace(/\D/g, '');
+  const phoneTail = phoneDigits.length >= 8 ? phoneDigits.slice(-8) : '';
+  const cpfDigits = String(identity.cpf || '').replace(/\D/g, '');
+
+  const matchesCustomer = (o: {
+    userId?: string;
+    customer?: { uid?: string; email?: string; phone?: string; cpf?: string };
+  }) => {
+    if (uid && (o.userId === uid || o.customer?.uid === uid)) return true;
+    if (email && email !== 'streetstore364@gmail.com' && (o.customer?.email || '').trim().toLowerCase() === email) {
+      return true;
+    }
+    const oCpf = String(o.customer?.cpf || '').replace(/\D/g, '');
+    if (cpfDigits.length === 11 && oCpf === cpfDigits) return true;
+    const oPhone = String(o.customer?.phone || '').replace(/\D/g, '');
+    if (phoneTail && oPhone.length >= 8 && oPhone.endsWith(phoneTail)) return true;
+    return false;
   };
 
-  const localMatches = db.orders.filter(matchesOrder);
+  const results: StoredOrder[] = [];
+  const db = loadOrdersDb();
+  for (const o of db.orders) {
+    if (matchesCustomer(o)) {
+      mergeOrderUnique(results, o);
+    }
+  }
 
-  // Also check Firestore orders collection (serverless persistence)
-  const firestoreMatches: StoredOrder[] = [];
   if (hasFirebaseAdminEnv()) {
     try {
       const fsDb = getAdminFirestore();
-      const snap = await fsDb.collection('orders').orderBy('createdAt', 'desc').limit(100).get();
+      const ordersSnap = await fsDb.collection('orders').orderBy('createdAt', 'desc').limit(150).get();
+      ordersSnap.forEach((doc) => {
+        const o = doc.data() as StoredOrder;
+        if (matchesCustomer(o)) {
+          mergeOrderUnique(results, o);
+        }
+      });
+
+      const pendingSnap = await fsDb.collection('pending_payments').orderBy('createdAt', 'desc').limit(80).get();
+      pendingSnap.forEach((doc) => {
+        const p = doc.data() as Record<string, any>;
+        if (p.status === 'approved' || p.movedToOrders === true) return;
+        const fakeOrder = mapPendingPaymentToStoredOrder(p, doc.id);
+        if (matchesCustomer(fakeOrder)) {
+          mergeOrderUnique(results, fakeOrder);
+        }
+      });
+    } catch (err) {
+      console.warn('[Customer Orders] Firestore lookup notice:', err);
+    }
+  }
+
+  // Enrich tracking info from cached Bling orders without letting 429 fail the response
+  const rawBlingOrders = await getCachedBlingSalesOrders();
+  for (const bo of rawBlingOrders) {
+    const numLojaStr = String(bo.numeroLoja || '').replace('#', '');
+    const boEmail = String(bo.contato?.email || '').trim().toLowerCase();
+    const matchedLocal = results.find(
+      (r) => (r.blingOrderId && r.blingOrderId === bo.id) || (r.orderId > 0 && String(r.orderId) === numLojaStr)
+    );
+    if (matchedLocal) {
+      const trackingCode = bo.transporte?.etiqueta?.codigoRastreamento;
+      if (trackingCode && !matchedLocal.trackingNumber) {
+        matchedLocal.trackingNumber = trackingCode;
+        matchedLocal.trackingUrl = `https://melhorenvio.com.br/rastreio/${trackingCode}`;
+        matchedLocal.shippingStatus = 'shipped';
+      }
+    } else if (email && email !== 'streetstore364@gmail.com' && boEmail === email) {
+      mergeOrderUnique(results, mapBlingOrderToStoredOrder(bo));
+    }
+  }
+
+  results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return results;
+}
+
+export async function trackStoreOrders(query: string): Promise<StoredOrder[]> {
+  const cleanQ = query.trim().replace(/^#/, '').toLowerCase();
+  const cleanDigits = cleanQ.replace(/\D/g, '');
+  const db = loadOrdersDb();
+
+  const matchesOrder = (o: StoredOrder) => {
+    const numMatch =
+      o.orderNumber.replace('#', '').toLowerCase() === cleanQ ||
+      (o.orderId > 0 && String(o.orderId) === cleanQ);
+    const emailMatch =
+      (o.customer?.email || '').toLowerCase() === cleanQ ||
+      (cleanQ.length >= 4 && (o.customer?.email || '').toLowerCase().includes(cleanQ));
+    const paymentMatch =
+      String(o.paymentId).toLowerCase() === cleanQ ||
+      (o.pendingPaymentId && o.pendingPaymentId.toLowerCase() === cleanQ) ||
+      (o.endToEndId && o.endToEndId.toLowerCase() === cleanQ);
+    const uidMatch = Boolean(o.userId && o.userId.toLowerCase() === cleanQ);
+    const oCpf = String(o.customer?.cpf || '').replace(/\D/g, '');
+    const cpfMatch = cleanDigits.length === 11 && oCpf === cleanDigits;
+    const oPhone = String(o.customer?.phone || '').replace(/\D/g, '');
+    const phoneMatch = cleanDigits.length >= 8 && oPhone.endsWith(cleanDigits.slice(-8));
+    return numMatch || emailMatch || paymentMatch || uidMatch || cpfMatch || phoneMatch;
+  };
+
+  const results: StoredOrder[] = [];
+  for (const o of db.orders) {
+    if (matchesOrder(o)) {
+      mergeOrderUnique(results, o);
+    }
+  }
+
+  // Also check Firestore orders + pending_payments (serverless persistence)
+  if (hasFirebaseAdminEnv()) {
+    try {
+      const fsDb = getAdminFirestore();
+      const snap = await fsDb.collection('orders').orderBy('createdAt', 'desc').limit(150).get();
       snap.forEach((doc) => {
         const o = doc.data() as StoredOrder;
-        if (
-          matchesOrder(o) &&
-          !localMatches.some((lm) => String(lm.paymentId) === String(o.paymentId) || lm.orderId === o.orderId)
-        ) {
-          firestoreMatches.push(o);
+        if (matchesOrder(o)) {
+          mergeOrderUnique(results, o);
+        }
+      });
+
+      const pendingSnap = await fsDb.collection('pending_payments').orderBy('createdAt', 'desc').limit(80).get();
+      pendingSnap.forEach((doc) => {
+        const p = doc.data() as Record<string, any>;
+        if (p.status === 'approved' || p.movedToOrders === true) return;
+        const mapped = mapPendingPaymentToStoredOrder(p, doc.id);
+        if (matchesOrder(mapped)) {
+          mergeOrderUnique(results, mapped);
         }
       });
     } catch (err) {
@@ -748,67 +1250,31 @@ export async function trackStoreOrders(query: string): Promise<StoredOrder[]> {
     }
   }
 
-  const combinedLocal = [...localMatches, ...firestoreMatches];
+  // Also check cached Bling ERP sales orders if connected (cached 45s to avoid Bling 429)
+  const rawOrders = await getCachedBlingSalesOrders();
+  for (const bo of rawOrders) {
+    const numStr = String(bo.numero || '');
+    const numLojaStr = String(bo.numeroLoja || '').replace('#', '');
+    const idStr = String(bo.id || '');
+    const contactName = (bo.contato?.nome || '').toLowerCase();
+    const contactEmail = (bo.contato?.email || '').toLowerCase();
 
-  // Also check Bling ERP sales orders if connected
-  const blingMatches: StoredOrder[] = [];
-  try {
-    if (await ensureBlingAuthorized()) {
-      const blingData = await fetchFromBling('/pedidos/vendas?pagina=1&limite=50');
-      const rawOrders = blingData?.data || [];
-      for (const bo of rawOrders) {
-        const numStr = String(bo.numero || '');
-        const numLojaStr = String(bo.numeroLoja || '').replace('#', '');
-        const idStr = String(bo.id || '');
-        const contactName = (bo.contato?.nome || '').toLowerCase();
-        const contactEmail = (bo.contato?.email || '').toLowerCase();
+    const isMatch =
+      numStr === cleanQ ||
+      numLojaStr === cleanQ ||
+      idStr === cleanQ ||
+      (cleanQ.length >= 4 && (contactName.includes(cleanQ) || contactEmail.includes(cleanQ)));
 
-        const isMatch =
-          numStr === cleanQ ||
-          numLojaStr === cleanQ ||
-          idStr === cleanQ ||
-          (cleanQ.length >= 4 && (contactName.includes(cleanQ) || contactEmail.includes(cleanQ)));
-
-        if (isMatch && !combinedLocal.some((lm) => lm.blingOrderId === bo.id || String(lm.orderId) === numLojaStr)) {
-          blingMatches.push({
-            orderId: bo.id,
-            orderNumber: `#${bo.numero || bo.id}`,
-            status: 'open',
-            paymentStatus: 'paid',
-            shippingStatus: bo.transporte?.etiqueta ? 'shipped' : 'unshipped',
-            shippingCarrier: bo.transporte?.transportador?.nome || 'Melhor Envio',
-            trackingNumber: bo.transporte?.etiqueta?.codigoRastreamento || null,
-            trackingUrl: bo.transporte?.etiqueta?.codigoRastreamento
-              ? `https://melhorenvio.com.br/rastreio/${bo.transporte.etiqueta.codigoRastreamento}`
-              : null,
-            paymentMethod: 'Mercado Pago / Bling ERP',
-            paymentId: String(bo.id),
-            blingOrderId: bo.id,
-            customer: {
-              name: bo.contato?.nome || 'Cliente Street Store',
-              email: bo.contato?.email || '',
-              phone: bo.contato?.celular || bo.contato?.telefone || '',
-            },
-            products: (bo.itens || []).map((it: any) => ({
-              name: it.descricao || 'Peça Street Store',
-              price: Number(it.valor || 0),
-              quantity: Number(it.quantidade || 1),
-              variant: it.codigo || '',
-              image: '',
-            })),
-            total: Number(bo.total || 0),
-            createdAt: bo.data || new Date().toISOString(),
-            paidAt: bo.data || null,
-            shippedAt: null,
-          });
-        }
-      }
+    if (
+      isMatch &&
+      !results.some((lm) => lm.blingOrderId === bo.id || (lm.orderId > 0 && String(lm.orderId) === numLojaStr))
+    ) {
+      mergeOrderUnique(results, mapBlingOrderToStoredOrder(bo));
     }
-  } catch (err: any) {
-    console.warn('[Orders Track] Bling lookup notice:', err?.message || err);
   }
 
-  return [...combinedLocal, ...blingMatches];
+  results.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  return results;
 }
 
 export function requestStoreOrderReturn(params: {

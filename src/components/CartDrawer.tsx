@@ -412,6 +412,7 @@ export function CartDrawer({
               raffleTicketCode: res.raffleTicketCode
             });
             window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
+            window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
             confetti({
               particleCount: 120,
               spread: 110,
@@ -529,6 +530,7 @@ export function CartDrawer({
           : 'Melhor Envio';
 
       const res = await processTransparentCardPayment({
+        userId: currentUser?.uid,
         token: cardTokenId,
         cardData: !cardTokenId ? {
           cardNumber: cleanNum,
@@ -567,6 +569,7 @@ export function CartDrawer({
             price: it.product.price,
             quantity: it.quantity,
             selectedSize: it.selectedSize,
+            selectedColor: it.selectedColor,
             variantId: matchedVariant?.id,
             image: it.product.images?.[0]
           };
@@ -595,6 +598,7 @@ export function CartDrawer({
           raffleTicketCode: res.raffleTicketCode
         });
         window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
+        window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
         confetti({
           particleCount: 130,
           spread: 110,
@@ -668,6 +672,7 @@ export function CartDrawer({
           : 'Melhor Envio';
 
       const res = await createDirectPix({
+        userId: currentUser?.uid,
         amount: total,
         description: `Street Store (${items.length} itens)`,
         payer: {
@@ -695,6 +700,7 @@ export function CartDrawer({
             price: it.product.price,
             quantity: it.quantity,
             selectedSize: it.selectedSize,
+            selectedColor: it.selectedColor,
             variantId: matchedVariant?.id,
             image: it.product.images?.[0]
           };
@@ -743,6 +749,7 @@ export function CartDrawer({
           raffleTicketCode: res.raffleTicketCode
         });
         window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
+        window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
         confetti({
           particleCount: 130,
           spread: 110,

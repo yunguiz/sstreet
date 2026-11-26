@@ -18,23 +18,27 @@ import {
   ChevronRight,
   Loader2
 } from 'lucide-react';
-import { TrackedOrder, trackOrder, requestOrderReturn } from '../services/catalog';
+import { TrackedOrder, trackOrder, getMyOrders, requestOrderReturn } from '../services/catalog';
+import { CustomerProfile } from '../services/auth';
 
 interface OrderTrackingModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialQuery?: string;
+  currentUser?: CustomerProfile | null;
 }
 
 export function OrderTrackingModal({
   isOpen,
   onClose,
-  initialQuery = ''
+  initialQuery = '',
+  currentUser = null
 }: OrderTrackingModalProps) {
   const [query, setQuery] = useState(initialQuery);
   const [isLoading, setIsLoading] = useState(false);
   const [orders, setOrders] = useState<TrackedOrder[]>([]);
   const [hasSearched, setHasSearched] = useState(false);
+  const [showingAccountOrders, setShowingAccountOrders] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedTracking, setCopiedTracking] = useState<string | null>(null);
 
@@ -48,23 +52,68 @@ export function OrderTrackingModal({
   const [returnProtocol, setReturnProtocol] = useState<string | null>(null);
   const [returnError, setReturnError] = useState<string | null>(null);
 
+  const loadMyOrders = async () => {
+    if (!currentUser) return;
+    setIsLoading(true);
+    setErrorMessage(null);
+    setHasSearched(true);
+    setShowingAccountOrders(true);
+    setSelectedOrderForReturn(null);
+    setReturnProtocol(null);
+
+    try {
+      const res = await getMyOrders();
+      if (res.success && Array.isArray(res.orders)) {
+        setOrders(res.orders);
+      } else {
+        setOrders([]);
+        if (res.error) setErrorMessage(res.error);
+      }
+    } catch {
+      setOrders([]);
+      setErrorMessage('Erro ao carregar os pedidos da sua conta. Tente novamente em instantes.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   useEffect(() => {
-    if (initialQuery && isOpen) {
+    if (!isOpen) return;
+    if (initialQuery) {
       setQuery(initialQuery);
       handleSearch(initialQuery);
+    } else if (currentUser) {
+      setQuery('');
+      void loadMyOrders();
+    } else {
+      setShowingAccountOrders(false);
     }
-  }, [initialQuery, isOpen]);
+  }, [initialQuery, isOpen, currentUser?.uid]);
+
+  useEffect(() => {
+    if (!isOpen || !currentUser) return;
+    const handleOrdersUpdated = () => {
+      void loadMyOrders();
+    };
+    window.addEventListener('streetstore:orders-updated', handleOrdersUpdated);
+    return () => window.removeEventListener('streetstore:orders-updated', handleOrdersUpdated);
+  }, [isOpen, currentUser?.uid]);
 
   const handleSearch = async (searchQuery?: string) => {
     const q = (searchQuery ?? query).trim();
     if (!q) {
-      setErrorMessage('Digite o número do seu pedido ou e-mail cadastrado na compra.');
+      if (currentUser) {
+        await loadMyOrders();
+        return;
+      }
+      setErrorMessage('Digite o número do pedido, e-mail ou CPF cadastrado na compra.');
       return;
     }
 
     setIsLoading(true);
     setErrorMessage(null);
     setHasSearched(true);
+    setShowingAccountOrders(false);
     setSelectedOrderForReturn(null);
     setReturnProtocol(null);
 
@@ -75,7 +124,7 @@ export function OrderTrackingModal({
       } else {
         setOrders([]);
         setErrorMessage(
-          'Nenhum pedido encontrado com esses dados. Verifique se digitou o e-mail exato da compra ou o número do pedido (ex: #107).'
+          'Nenhum pedido encontrado com esses dados. Verifique o número do pedido (ex: #1001), e-mail ou CPF usado na compra.'
         );
       }
     } catch {
@@ -169,13 +218,15 @@ export function OrderTrackingModal({
             </div>
             <div>
               <h2 className="text-sm sm:text-base font-black text-white uppercase tracking-wider font-oswald flex items-center gap-2">
-                Acompanhar Pedido
+                {currentUser ? 'Meus Pedidos & Rastreio' : 'Acompanhar Pedido'}
                 <span className="text-[10px] font-sans font-bold px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700/50">
                   Melhor Envio Oficial
                 </span>
               </h2>
               <p className="text-[11px] text-zinc-400">
-                Consulte o status em tempo real, código de rastreio e logística reversa
+                {currentUser
+                  ? `Conta conectada: ${currentUser.email}`
+                  : 'Consulte o status em tempo real, código de rastreio e logística reversa'}
               </p>
             </div>
           </div>
@@ -205,7 +256,7 @@ export function OrderTrackingModal({
                 type="text"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Número do Pedido (ex: #107) ou seu E-mail..."
+                placeholder="Número do Pedido (ex: #1001), E-mail ou CPF..."
                 className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-[#E50914] focus:ring-1 focus:ring-[#E50914] transition-all"
               />
             </div>
@@ -226,6 +277,19 @@ export function OrderTrackingModal({
                 </>
               )}
             </button>
+            {currentUser && (
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery('');
+                  void loadMyOrders();
+                }}
+                disabled={isLoading}
+                className="px-4 py-3 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 font-bold text-xs uppercase tracking-wider rounded-xl transition-colors cursor-pointer shrink-0"
+              >
+                Meus Pedidos
+              </button>
+            )}
           </form>
 
           {/* Feedback messages */}
@@ -236,6 +300,17 @@ export function OrderTrackingModal({
             </div>
           )}
 
+          {/* Friendly Empty State for Logged-in Customer */}
+          {hasSearched && showingAccountOrders && !isLoading && orders.length === 0 && !errorMessage && (
+            <div className="p-6 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl text-center space-y-2.5">
+              <Package className="w-10 h-10 text-zinc-600 mx-auto" />
+              <p className="text-sm font-bold text-white">Nenhum pedido encontrado nesta conta ainda</p>
+              <p className="text-xs text-zinc-400 max-w-md mx-auto leading-relaxed">
+                Se você finalizou um pedido usando outro e-mail ou CPF, digite o número do pedido (ex: <strong>#1001</strong>) ou o CPF no campo acima para consultar.
+              </p>
+            </div>
+          )}
+
           {/* If No search conducted yet */}
           {!hasSearched && orders.length === 0 && (
             <div className="p-6 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl text-center space-y-3">
@@ -243,7 +318,7 @@ export function OrderTrackingModal({
               <div>
                 <p className="text-sm font-bold text-white">Como rastrear seu pedido?</p>
                 <p className="text-xs text-zinc-400 mt-1 max-w-md mx-auto leading-relaxed">
-                  Digite o número do pedido recebido por e-mail (ex: <strong>#107</strong>) ou o seu e-mail cadastrado no momento da compra para ver o andamento da entrega e a etiqueta da transportadora.
+                  Digite o número do pedido recebido por e-mail (ex: <strong>#1001</strong>), o seu e-mail ou o CPF usado na compra para ver o andamento e a etiqueta da transportadora.
                 </p>
               </div>
 
@@ -479,7 +554,7 @@ export function OrderTrackingModal({
                 {/* Order Top Bar */}
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-zinc-800">
                   <div>
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="text-base font-black text-white font-oswald uppercase">
                         Pedido {order.orderNumber}
                       </span>
@@ -492,6 +567,11 @@ export function OrderTrackingModal({
                       >
                         {isPaid ? 'Pagamento Aprovado' : 'Aguardando Pagamento'}
                       </span>
+                      {order.blingOrderId && (
+                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 border border-zinc-700">
+                          Bling #{order.blingOrderId}
+                        </span>
+                      )}
                     </div>
                     <span className="text-[11px] text-zinc-400">
                       Realizado em {new Date(order.createdAt).toLocaleDateString('pt-BR', {
@@ -499,6 +579,7 @@ export function OrderTrackingModal({
                         month: 'short',
                         year: 'numeric'
                       })}
+                      {order.paymentMethod ? ` • ${order.paymentMethod}` : ''}
                     </span>
                   </div>
 
@@ -656,12 +737,17 @@ export function OrderTrackingModal({
                         key={idx}
                         className="flex items-center justify-between text-xs p-2 bg-zinc-950/70 border border-zinc-850 rounded-lg"
                       >
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span className="font-bold text-[#E50914]">{p.quantity}x</span>
                           <span className="text-zinc-200 font-medium">{p.name}</span>
                           {p.variant && (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">
                               {p.variant}
+                            </span>
+                          )}
+                          {p.color && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">
+                              {p.color}
                             </span>
                           )}
                         </div>
@@ -685,16 +771,22 @@ export function OrderTrackingModal({
                 <div className="pt-2 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-zinc-800/80">
                   <div className="flex items-center gap-1.5 text-[11px] text-zinc-400">
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>Garantia de 7 dias com Logística Reversa Melhor Envio</span>
+                    <span>
+                      {isPaid
+                        ? 'Garantia de 7 dias com Logística Reversa Melhor Envio'
+                        : 'Pedido aguardando confirmação do pagamento para envio ao Bling e expedição'}
+                    </span>
                   </div>
 
-                  <button
-                    onClick={() => handleOpenReturnModal(order)}
-                    className="px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 hover:text-white rounded-lg text-xs font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5 text-[#E50914]" />
-                    <span>Solicitar Troca ou Devolução</span>
-                  </button>
+                  {isPaid && (
+                    <button
+                      onClick={() => handleOpenReturnModal(order)}
+                      className="px-3.5 py-2 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 hover:text-white rounded-lg text-xs font-bold uppercase tracking-wider transition-colors flex items-center justify-center gap-1.5 cursor-pointer active:scale-95"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5 text-[#E50914]" />
+                      <span>Solicitar Troca ou Devolução</span>
+                    </button>
+                  )}
                 </div>
               </div>
             );

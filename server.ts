@@ -5,7 +5,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import QRCode from 'qrcode';
 import crypto from 'crypto';
-import { getAdminFirestore } from './lib/firebaseAdmin.js';
+import { getAdminAuth, getAdminFirestore } from './lib/firebaseAdmin.js';
 import { registerBlingRoutes, blingRouter, blingAuthInterceptorMiddleware, fetchFromBling, loadBlingTokens, ensureBlingAuthorized, refreshBlingToken } from './server-bling.js';
 import { registerMelhorEnvioRoutes, startMelhorEnvioAutoSync } from './server-melhor-envio.js';
 import { hasFirebaseAdminEnv, hasFirestoreBlingToken, getValidBlingToken as getFirestoreValidToken } from './lib/blingToken.js';
@@ -38,6 +38,8 @@ import {
 } from './server-bling-images.js';
 import {
   createStoreOrder,
+  getCustomerOrders,
+  retryPendingBlingOrders,
   trackStoreOrders,
   requestStoreOrderReturn
 } from './server-orders.js';
@@ -70,7 +72,7 @@ let catalogCache: {
   totalUnitsInStock?: number;
   timestamp: number;
 } | null = null;
-const CATALOG_CACHE_TTL_MS = 2 * 60 * 1000; // 2 minutes fresh TTL with silent stale-while-revalidate
+const CATALOG_CACHE_TTL_MS = 4 * 60 * 1000; // 4 minutes fresh TTL with silent stale-while-revalidate
 
 export function invalidateCatalogCache() {
   catalogCache = null;
@@ -211,7 +213,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
         blingRawCount = blingRaw.length;
         console.log(`[Bling Sync] Fetched ${blingRaw.length} total raw active items (limit ${MAX_BLING_PRODUCTS}) from Bling ERP.`);
 
-        // 2. Fetch REAL stock balances via /estoques/saldos in chunks of 50 (2 parallel chunks per pace cycle)
+        // 2. Fetch REAL stock balances via /estoques/saldos in sequential chunks of 50 (rate-limiter enforces safe Bling pace)
         const realStockMap = new Map<number, number>();
         let stockApiQueried = false;
         const allBlingIds = blingRaw.map((bp: any) => bp.id).filter(Boolean);
@@ -220,29 +222,21 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           stockChunks.push(allBlingIds.slice(i, i + 50));
         }
 
-        for (let i = 0; i < stockChunks.length; i += 2) {
-          const pair = stockChunks.slice(i, i + 2);
-          await Promise.all(
-            pair.map(async (chunk) => {
-              try {
-                const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
-                const stockRes = await fetchFromBling(`/estoques/saldos?${qs}`);
-                stockApiQueried = true;
-                const entries = stockRes?.data || [];
-                for (const entry of entries) {
-                  const pId = entry?.produto?.id;
-                  if (pId) {
-                    const bal = entry.saldoVirtualTotal ?? entry.saldoFisicoTotal ?? entry.saldoFisico ?? 0;
-                    realStockMap.set(Number(pId), Math.max(0, Number(bal) || 0));
-                  }
-                }
-              } catch (stockChunkErr: any) {
-                console.warn(`[Bling Stock] Chunk fetch notice:`, stockChunkErr?.message || stockChunkErr);
+        for (const chunk of stockChunks) {
+          try {
+            const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
+            const stockRes = await fetchFromBling(`/estoques/saldos?${qs}`);
+            stockApiQueried = true;
+            const entries = stockRes?.data || [];
+            for (const entry of entries) {
+              const pId = entry?.produto?.id;
+              if (pId) {
+                const bal = entry.saldoVirtualTotal ?? entry.saldoFisicoTotal ?? entry.saldoFisico ?? 0;
+                realStockMap.set(Number(pId), Math.max(0, Number(bal) || 0));
               }
-            })
-          );
-          if (i + 2 < stockChunks.length) {
-            await new Promise(resolve => setTimeout(resolve, 260));
+            }
+          } catch (stockChunkErr: any) {
+            console.warn(`[Bling Stock] Chunk fetch notice:`, stockChunkErr?.message || stockChunkErr);
           }
         }
 
@@ -1054,7 +1048,7 @@ app.get('/api/orders/track', async (req: Request, res: Response) => {
   try {
     const q = (req.query.q as string || '').trim();
     if (!q) {
-      return res.status(400).json({ success: false, error: 'Informe o número do pedido ou seu e-mail para rastreamento.' });
+      return res.status(400).json({ success: false, error: 'Informe o número do pedido, CPF ou seu e-mail para rastreamento.' });
     }
 
     const orders = await trackStoreOrders(q);
@@ -1068,6 +1062,47 @@ app.get('/api/orders/track', async (req: Request, res: Response) => {
       success: false,
       orders: [],
       error: error.message || 'Erro ao consultar pedidos'
+    });
+  }
+});
+
+// Authenticated Customer Account Orders (verified via Firebase ID token)
+app.get('/api/orders/my-orders', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  try {
+    const authHeader = String(req.headers.authorization || '');
+    const idToken = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : '';
+    if (!idToken || !hasFirebaseAdminEnv()) {
+      return res.status(401).json({ success: false, orders: [], error: 'Faça login para visualizar seus pedidos.' });
+    }
+
+    const decoded = await getAdminAuth().verifyIdToken(idToken);
+    const uid = decoded.uid;
+    let email = decoded.email || '';
+    let phone = decoded.phone_number || '';
+
+    try {
+      const userSnap = await getAdminFirestore().collection('users').doc(uid).get();
+      if (userSnap.exists) {
+        const userData = userSnap.data() || {};
+        if (userData.email) email = String(userData.email);
+        if (userData.phone) phone = String(userData.phone);
+      }
+    } catch {
+      // use decoded token claims
+    }
+
+    const orders = await getCustomerOrders({ uid, email, phone });
+    return res.json({
+      success: true,
+      orders,
+    });
+  } catch (error: any) {
+    console.warn('[Customer Orders] Auth/lookup notice:', error?.message || error);
+    return res.status(401).json({
+      success: false,
+      orders: [],
+      error: 'Sessão expirada ou inválida. Entre novamente na sua conta.',
     });
   }
 });
@@ -1257,11 +1292,16 @@ app.post('/api/mercadopago/create-preference', async (req: Request, res: Respons
 interface LocalPayment {
   id: string;
   mpPaymentId?: string;
+  pixTxId?: string;
+  externalReference?: string;
+  mpFallbackReason?: string;
+  userId?: string;
   amount: number;
   status: 'pending' | 'approved' | 'rejected';
   statusDetail: string;
   createdAt: number;
   dateApproved?: string;
+  movedToOrders?: boolean;
   payer?: any;
   items?: any[];
   shippingAddress?: any;
@@ -1271,6 +1311,7 @@ interface LocalPayment {
   orderId?: number;
   orderNumber?: string;
   blingOrderId?: number;
+  blingSyncStatus?: string;
   raffleTicketCode?: string;
 }
 
@@ -1279,8 +1320,32 @@ const inFlightFinalizations = new Map<string, Promise<{
   orderId?: number;
   orderNumber?: string;
   blingOrderId?: number;
+  blingSyncStatus?: string;
   raffleTicketCode?: string;
 }>>();
+
+let cachedMpCollectorEmail: { email: string; fetchedAt: number } | null = null;
+
+async function getMpCollectorEmail(): Promise<string> {
+  const now = Date.now();
+  if (cachedMpCollectorEmail && now - cachedMpCollectorEmail.fetchedAt < 30 * 60 * 1000) {
+    return cachedMpCollectorEmail.email;
+  }
+  try {
+    const res = await fetch(`${MERCADO_PAGO_API_BASE}/users/me`, {
+      headers: { Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}` },
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const email = String(data?.email || '').trim().toLowerCase();
+      cachedMpCollectorEmail = { email, fetchedAt: now };
+      return email;
+    }
+  } catch {
+    // ignore
+  }
+  return '';
+}
 
 function sanitizePaymentDocId(id: string | number): string {
   return String(id).replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -1323,9 +1388,69 @@ async function loadPendingPaymentContext(id: string | number): Promise<LocalPaym
   return null;
 }
 
+async function findPendingPaymentForMpPayment(mpData: any): Promise<{ key: string; payment: LocalPayment } | null> {
+  const mpId = String(mpData?.id || '').trim();
+  const extRef = String(mpData?.external_reference || '').trim();
+
+  for (const candidateKey of [mpId, extRef]) {
+    if (!candidateKey) continue;
+    const direct = await loadPendingPaymentContext(candidateKey);
+    if (direct) {
+      return { key: candidateKey, payment: direct };
+    }
+  }
+
+  if (hasFirebaseAdminEnv()) {
+    try {
+      const db = getAdminFirestore();
+      if (mpId) {
+        const byMpId = await db.collection('pending_payments').where('mpPaymentId', '==', mpId).limit(1).get();
+        if (!byMpId.empty) {
+          const doc = byMpId.docs[0];
+          const data = doc.data() as LocalPayment;
+          return { key: data.id || doc.id, payment: data };
+        }
+      }
+      if (extRef) {
+        const byExt = await db.collection('pending_payments').where('externalReference', '==', extRef).limit(1).get();
+        if (!byExt.empty) {
+          const doc = byExt.docs[0];
+          const data = doc.data() as LocalPayment;
+          return { key: data.id || doc.id, payment: data };
+        }
+      }
+
+      const amount = Number(mpData?.transaction_amount || 0);
+      const mpCreatedMs = mpData?.date_created ? new Date(mpData.date_created).getTime() : Date.now();
+      const mpCpf = String(mpData?.payer?.identification?.number || '').replace(/\D/g, '');
+      const recentSnap = await db.collection('pending_payments').orderBy('createdAt', 'desc').limit(50).get();
+      for (const doc of recentSnap.docs) {
+        const p = doc.data() as LocalPayment;
+        if (p.status === 'approved' || p.movedToOrders) continue;
+        const pCpf = String(p.payer?.cpf || '').replace(/\D/g, '');
+        const amountMatches = amount > 0 && Math.abs(Number(p.amount || 0) - amount) < 0.05;
+        const timeDeltaMs = Math.abs(mpCreatedMs - Number(p.createdAt || 0));
+        const within24h = timeDeltaMs <= 24 * 60 * 60 * 1000;
+        const cpfMatches = Boolean(mpCpf && pCpf && mpCpf === pCpf);
+        if (amountMatches && within24h && (cpfMatches || !mpCpf)) {
+          return { key: p.id || doc.id, payment: p };
+        }
+      }
+    } catch (err) {
+      console.warn('[Pending Payment] Erro ao correlacionar webhook MP:', err);
+    }
+  }
+
+  return null;
+}
+
 async function finalizeApprovedPayment(params: {
   canonicalPaymentId: string | number;
   contextKeys?: Array<string | number>;
+  pendingPaymentId?: string;
+  userId?: string;
+  endToEndId?: string;
+  source?: string;
   amount: number;
   paymentMethod: string;
   dateApproved?: string;
@@ -1334,10 +1459,12 @@ async function finalizeApprovedPayment(params: {
   shippingAddress?: any;
   shippingServiceId?: number;
   shippingCarrier?: string;
+  skipBling?: boolean;
 }): Promise<{
   orderId?: number;
   orderNumber?: string;
   blingOrderId?: number;
+  blingSyncStatus?: string;
   raffleTicketCode?: string;
 }> {
   const canonicalId = String(params.canonicalPaymentId);
@@ -1350,6 +1477,7 @@ async function finalizeApprovedPayment(params: {
     let orderId: number | undefined;
     let orderNumber: string | undefined;
     let blingOrderId: number | undefined;
+    let blingSyncStatus: string | undefined;
     let raffleTicketCode: string | undefined;
 
     const payerEmail =
@@ -1362,15 +1490,23 @@ async function finalizeApprovedPayment(params: {
         : [params.payer?.first_name, params.payer?.last_name].filter(Boolean).join(' ').trim() || 'Cliente Street Store';
     const payerCpf = params.payer?.cpf || params.payer?.identification?.number;
     const payerPhone = params.payer?.phone;
+    const resolvedUid = params.userId || params.payer?.uid;
 
     try {
       const orderRes = await createStoreOrder({
         customer: {
+          ...(resolvedUid ? { uid: String(resolvedUid) } : {}),
           name: payerName,
           email: payerEmail,
           phone: payerPhone,
           cpf: payerCpf,
         },
+        userId: resolvedUid ? String(resolvedUid) : undefined,
+        pendingPaymentId: params.pendingPaymentId,
+        endToEndId: params.endToEndId,
+        source: params.source,
+        paidAt: params.dateApproved,
+        skipBling: params.skipBling,
         items: params.items || [],
         shippingAddress: params.shippingAddress,
         shippingServiceId: params.shippingServiceId,
@@ -1384,6 +1520,7 @@ async function finalizeApprovedPayment(params: {
         orderId = orderRes.id;
         orderNumber = orderRes.number;
         blingOrderId = orderRes.blingOrderId;
+        blingSyncStatus = orderRes.blingSyncStatus;
         if (!orderRes.alreadyExisted) {
           invalidateCatalogCache();
         }
@@ -1401,6 +1538,7 @@ async function finalizeApprovedPayment(params: {
           customerCpf: payerCpf ? String(payerCpf) : undefined,
           orderNumber,
           paymentId: canonicalId,
+          endToEndId: params.endToEndId,
           orderTotal: Number(params.amount || 0),
           shippingAddress: params.shippingAddress,
         })) || undefined;
@@ -1409,7 +1547,11 @@ async function finalizeApprovedPayment(params: {
     }
 
     const keysToUpdate = Array.from(
-      new Set([canonicalId, ...(params.contextKeys || []).map((k) => String(k))])
+      new Set([
+        canonicalId,
+        ...(params.pendingPaymentId ? [params.pendingPaymentId] : []),
+        ...(params.contextKeys || []).map((k) => String(k)),
+      ])
     );
     for (const key of keysToUpdate) {
       const prev = await loadPendingPaymentContext(key);
@@ -1421,9 +1563,11 @@ async function finalizeApprovedPayment(params: {
         }),
         id: key,
         mpPaymentId: canonicalId,
+        ...(resolvedUid ? { userId: String(resolvedUid) } : prev?.userId ? { userId: prev.userId } : {}),
         amount: Number(prev?.amount || params.amount || 0),
         status: 'approved',
         statusDetail: 'accredited',
+        movedToOrders: Boolean(orderNumber),
         dateApproved: params.dateApproved || prev?.dateApproved || new Date().toISOString(),
         payer: prev?.payer || params.payer,
         items: prev?.items || params.items,
@@ -1434,11 +1578,12 @@ async function finalizeApprovedPayment(params: {
         orderId,
         orderNumber,
         blingOrderId,
+        blingSyncStatus,
         raffleTicketCode,
       });
     }
 
-    return { orderId, orderNumber, blingOrderId, raffleTicketCode };
+    return { orderId, orderNumber, blingOrderId, blingSyncStatus, raffleTicketCode };
   })();
 
   inFlightFinalizations.set(canonicalId, run);
@@ -1521,20 +1666,29 @@ function generatePixBRCode(params: {
 // 3. Create Direct Pix Payment via Mercado Pago v1/payments with zero external redirects
 app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
   try {
-    const { amount, description, payer, items, shippingAddress, shippingServiceId, shippingCarrier } = req.body;
+    const { amount, description, payer, items, shippingAddress, shippingServiceId, shippingCarrier, userId } = req.body;
 
     const numericAmount = parseFloat(Number(amount).toFixed(2));
     if (!numericAmount || numericAmount <= 0) {
       return res.status(400).json({ success: false, error: 'Valor inválido para pagamento Pix' });
     }
 
-    const email = (payer?.email && payer.email.includes('@')) 
-      ? payer.email 
+    const resolvedUserId = String(userId || payer?.uid || '').trim() || undefined;
+    const email = (payer?.email && payer.email.includes('@'))
+      ? String(payer.email).trim()
       : 'streetstore364@gmail.com';
     const fullName = (payer?.name && payer.name.trim()) || 'Cliente Street Store';
     const nameParts = fullName.trim().split(' ');
     const firstName = nameParts[0] || 'Cliente';
     const lastName = nameParts.slice(1).join(' ') || 'Street';
+
+    // Mercado Pago blocks self-payments if payer.email equals the collector account email.
+    // Keep the customer's real email in pending_payments/orders, and pass a neutral alias to MP API if identical.
+    const collectorEmail = await getMpCollectorEmail();
+    const mpPayerEmail =
+      collectorEmail && email.toLowerCase() === collectorEmail
+        ? `cliente+${Date.now()}@streetstore.com.br`
+        : email;
 
     const appUrl = process.env.APP_URL || '';
     const rawOrigin = req.headers.origin || (req.headers.host ? `https://${req.headers.host}` : '');
@@ -1545,13 +1699,16 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
           ? appUrl
           : 'https://www.streetstore.com.br';
 
+    const localPaymentId = `pix_st_${Date.now()}`;
+    const externalReference = localPaymentId;
+
     const paymentPayload: Record<string, any> = {
       transaction_amount: numericAmount,
       description: description || 'Street Store - Pedido Streetwear Oficial',
       payment_method_id: 'pix',
-      external_reference: `ST-PIX-${Date.now()}`,
+      external_reference: externalReference,
       payer: {
-        email,
+        email: mpPayerEmail,
         first_name: firstName,
         last_name: lastName,
         identification: payer?.cpf ? {
@@ -1568,6 +1725,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
     const idempotencyKey = `pix-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
 
     let officialMpSuccess = false;
+    let mpFallbackReason: string | undefined;
     let data: any = null;
 
     try {
@@ -1584,10 +1742,12 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       if (mpRes.ok && data?.point_of_interaction?.transaction_data?.qr_code) {
         officialMpSuccess = true;
       } else {
-        console.warn('Mercado Pago direct pix response:', data?.status, data?.message || data?.cause);
+        mpFallbackReason = data?.message || data?.cause?.[0]?.description || `MP status ${mpRes.status}`;
+        console.warn('Mercado Pago direct pix response:', data?.status, mpFallbackReason);
       }
-    } catch (apiErr) {
-      console.warn('Direct Mercado Pago API fetch failed:', apiErr);
+    } catch (apiErr: any) {
+      mpFallbackReason = apiErr?.message || String(apiErr);
+      console.warn('Direct Mercado Pago API fetch failed:', mpFallbackReason);
     }
 
     if (officialMpSuccess && data) {
@@ -1597,11 +1757,14 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       await savePendingPaymentContext(mpPaymentIdStr, {
         id: mpPaymentIdStr,
         mpPaymentId: mpPaymentIdStr,
+        externalReference,
+        userId: resolvedUserId,
         amount: Number(data.transaction_amount || numericAmount),
         status: data.status === 'approved' ? 'approved' : 'pending',
         statusDetail: data.status_detail || 'waiting_payment',
         createdAt: Date.now(),
         payer: {
+          ...(resolvedUserId ? { uid: resolvedUserId } : {}),
           name: fullName,
           email,
           cpf: payer?.cpf,
@@ -1651,15 +1814,19 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
     });
 
     const qrCodeBase64 = qrDataUrl.replace(/^data:image\/png;base64,/, '');
-    const localPaymentId = `pix_st_${Date.now()}`;
 
     await savePendingPaymentContext(localPaymentId, {
       id: localPaymentId,
+      pixTxId: txId,
+      externalReference,
+      mpFallbackReason,
+      userId: resolvedUserId,
       amount: numericAmount,
       status: 'pending',
       statusDetail: 'waiting_payment',
       createdAt: Date.now(),
       payer: {
+        ...(resolvedUserId ? { uid: resolvedUserId } : {}),
         name: fullName,
         email,
         cpf: payer?.cpf,
@@ -1693,6 +1860,39 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
   }
 });
 
+async function searchApprovedMpMatchForPending(p: LocalPayment, pendingId: string): Promise<any | null> {
+  try {
+    const mpSearchRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/search?sort=date_created&criteria=desc&limit=30`, {
+      headers: {
+        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
+      }
+    });
+
+    if (!mpSearchRes.ok) return null;
+    const searchData = await mpSearchRes.json();
+    const results = searchData.results || [];
+    const pCpf = String(p.payer?.cpf || '').replace(/\D/g, '');
+
+    return results.find((item: any) => {
+      if (item.status !== 'approved') return false;
+      const extRef = String(item.external_reference || '');
+      if (extRef && (extRef === pendingId || extRef === p.externalReference || (p.pixTxId && extRef === p.pixTxId))) {
+        return true;
+      }
+      const amountMatches = Math.abs(Number(item.transaction_amount || 0) - Number(p.amount || 0)) < 0.05;
+      const createdTime = new Date(item.date_created).getTime();
+      const isRecent = createdTime > (p.createdAt - 180000);
+      if (!amountMatches || !isRecent) return false;
+      const itemCpf = String(item.payer?.identification?.number || '').replace(/\D/g, '');
+      if (itemCpf && pCpf && itemCpf !== pCpf) return false;
+      return true;
+    }) || null;
+  } catch (err) {
+    console.warn('Error querying Mercado Pago payment search:', err);
+    return null;
+  }
+}
+
 // 4. Confirm Pix Payment (Strict Real Verification with Mercado Pago - NEVER auto-approves)
 app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response) => {
   try {
@@ -1714,6 +1914,8 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
       if (payment.status === 'approved') {
         const finalized = await finalizeApprovedPayment({
           canonicalPaymentId: payment.mpPaymentId || payment.id,
+          pendingPaymentId: id,
+          userId: payment.userId || payment.payer?.uid,
           contextKeys: [id],
           amount: payment.amount,
           paymentMethod: payment.paymentMethod || 'Pix Instantâneo Mercado Pago',
@@ -1738,41 +1940,13 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
       }
 
       // Query Mercado Pago live payment search to verify if money actually arrived
-      let paymentFoundInMp = false;
-      let matchedMpPayment: any = null;
+      const matchedMpPayment = await searchApprovedMpMatchForPending(payment, id);
 
-      try {
-        const mpSearchRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/search?sort=date_created&criteria=desc&limit=15`, {
-          headers: {
-            'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
-          }
-        });
-
-        if (mpSearchRes.ok) {
-          const searchData = await mpSearchRes.json();
-          const results = searchData.results || [];
-          
-          // Look for an approved payment with matching amount created within last 30 minutes
-          const match = results.find((p: any) => {
-            const isApproved = p.status === 'approved';
-            const amountMatches = Math.abs(p.transaction_amount - payment.amount) < 0.05;
-            const createdTime = new Date(p.date_created).getTime();
-            const isRecent = createdTime > (payment.createdAt - 180000);
-            return isApproved && amountMatches && isRecent;
-          });
-
-          if (match) {
-            paymentFoundInMp = true;
-            matchedMpPayment = match;
-          }
-        }
-      } catch (searchErr) {
-        console.warn('Error querying Mercado Pago payment search:', searchErr);
-      }
-
-      if (paymentFoundInMp && matchedMpPayment) {
+      if (matchedMpPayment) {
         const finalized = await finalizeApprovedPayment({
           canonicalPaymentId: matchedMpPayment.id,
+          pendingPaymentId: id,
+          userId: payment.userId || payment.payer?.uid,
           contextKeys: [id],
           amount: payment.amount,
           paymentMethod: 'Pix Instantâneo Mercado Pago',
@@ -1824,10 +1998,14 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
 
     const data = await mpRes.json();
     if (data.status === 'approved') {
-      const pendingCtx = await loadPendingPaymentContext(id);
+      const matchedCtx = await findPendingPaymentForMpPayment(data);
+      const pendingCtx = matchedCtx?.payment || (await loadPendingPaymentContext(id));
+      const contextKeys = matchedCtx?.key && matchedCtx.key !== id ? [id, matchedCtx.key] : [id];
       const finalized = await finalizeApprovedPayment({
         canonicalPaymentId: data.id,
-        contextKeys: [id],
+        pendingPaymentId: matchedCtx?.key || pendingCtx?.id,
+        userId: pendingCtx?.userId || pendingCtx?.payer?.uid,
+        contextKeys,
         amount: Number(pendingCtx?.amount || data.transaction_amount || 0),
         paymentMethod: pendingCtx?.paymentMethod || 'Pix Instantâneo Mercado Pago',
         dateApproved: data.date_approved,
@@ -1883,55 +2061,43 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
         return res.status(404).json({ success: false, approved: false, error: 'Pagamento não encontrado' });
       }
 
-      // If still pending, also check Mercado Pago search in background
       if (p.status !== 'approved') {
-        try {
-          const mpSearchRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/search?sort=date_created&criteria=desc&limit=10`, {
-            headers: { 'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}` }
+        const match = await searchApprovedMpMatchForPending(p, id);
+        if (match) {
+          const finalized = await finalizeApprovedPayment({
+            canonicalPaymentId: match.id,
+            pendingPaymentId: id,
+            userId: p.userId || p.payer?.uid,
+            contextKeys: [id],
+            amount: p.amount,
+            paymentMethod: 'Pix Instantâneo Mercado Pago',
+            dateApproved: match.date_approved || new Date().toISOString(),
+            payer: p.payer,
+            items: p.items,
+            shippingAddress: p.shippingAddress,
+            shippingServiceId: p.shippingServiceId,
+            shippingCarrier: p.shippingCarrier,
           });
-          if (mpSearchRes.ok) {
-            const searchData = await mpSearchRes.json();
-            const results = searchData.results || [];
-            const match = results.find((item: any) => {
-              return item.status === 'approved' &&
-                Math.abs(item.transaction_amount - p.amount) < 0.05 &&
-                new Date(item.date_created).getTime() > (p.createdAt - 180000);
-            });
-            if (match) {
-              const finalized = await finalizeApprovedPayment({
-                canonicalPaymentId: match.id,
-                contextKeys: [id],
-                amount: p.amount,
-                paymentMethod: 'Pix Instantâneo Mercado Pago',
-                dateApproved: match.date_approved || new Date().toISOString(),
-                payer: p.payer,
-                items: p.items,
-                shippingAddress: p.shippingAddress,
-                shippingServiceId: p.shippingServiceId,
-                shippingCarrier: p.shippingCarrier,
-              });
 
-              return res.json({
-                success: true,
-                approved: true,
-                id: p.id,
-                status: 'approved',
-                statusDetail: 'accredited',
-                dateApproved: match.date_approved || new Date().toISOString(),
-                orderNumber: finalized.orderNumber,
-                orderId: finalized.orderId,
-                raffleTicketCode: finalized.raffleTicketCode,
-              });
-            }
-          }
-        } catch {
-          // continue
+          return res.json({
+            success: true,
+            approved: true,
+            id: p.id,
+            status: 'approved',
+            statusDetail: 'accredited',
+            dateApproved: match.date_approved || new Date().toISOString(),
+            orderNumber: finalized.orderNumber,
+            orderId: finalized.orderId,
+            raffleTicketCode: finalized.raffleTicketCode,
+          });
         }
       }
 
       if (p.status === 'approved') {
         const finalized = await finalizeApprovedPayment({
           canonicalPaymentId: p.mpPaymentId || p.id,
+          pendingPaymentId: id,
+          userId: p.userId || p.payer?.uid,
           contextKeys: [id],
           amount: p.amount,
           paymentMethod: p.paymentMethod || 'Pix Instantâneo Mercado Pago',
@@ -1986,10 +2152,14 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
     let raffleTicketCode: string | undefined;
 
     if (data.status === 'approved') {
-      const pendingCtx = await loadPendingPaymentContext(id);
+      const matchedCtx = await findPendingPaymentForMpPayment(data);
+      const pendingCtx = matchedCtx?.payment || (await loadPendingPaymentContext(id));
+      const contextKeys = matchedCtx?.key && matchedCtx.key !== id ? [id, matchedCtx.key] : [id];
       const finalized = await finalizeApprovedPayment({
         canonicalPaymentId: data.id,
-        contextKeys: [id],
+        pendingPaymentId: matchedCtx?.key || pendingCtx?.id,
+        userId: pendingCtx?.userId || pendingCtx?.payer?.uid,
+        contextKeys,
         amount: Number(pendingCtx?.amount || data.transaction_amount || 0),
         paymentMethod: pendingCtx?.paymentMethod || 'Pix Instantâneo Mercado Pago',
         dateApproved: data.date_approved,
@@ -2035,12 +2205,14 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
       installments = 1, 
       paymentMethodId, 
       payer,
+      userId,
       items,
       shippingAddress,
       shippingServiceId,
       shippingCarrier
     } = req.body;
 
+    const resolvedUserId = String(userId || payer?.uid || '').trim() || undefined;
     let cardToken = clientToken;
 
     // Se o frontend enviou dados do cartão, tokenizar no Mercado Pago
@@ -2154,10 +2326,12 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
     if (paymentResult.status === 'approved') {
       const finalized = await finalizeApprovedPayment({
         canonicalPaymentId: paymentResult.id,
+        userId: resolvedUserId,
         amount: parseFloat(Number(transactionAmount).toFixed(2)),
         paymentMethod: `Cartão de Crédito ${installments}x (${methodId})`,
         dateApproved: paymentResult.date_approved,
         payer: {
+          ...(resolvedUserId ? { uid: resolvedUserId } : {}),
           name: fullName,
           email,
           phone: payer?.phone,
@@ -2637,6 +2811,86 @@ app.post('/api/raffle/ps5/admin/manual-entry', async (req: Request, res: Respons
   }
 });
 
+// Protected admin route: confirm/reprocess a pending Pix payment into orders + Bling ERP
+app.post('/api/orders/admin/confirm-pending', async (req: Request, res: Response) => {
+  try {
+    if (!verifyAdminRaffleAccess(req)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Acesso negado. Chave de administrador inválida (header x-admin-key ou query ?key).'
+      });
+    }
+
+    const {
+      pendingPaymentId,
+      mpPaymentId,
+      endToEndId,
+      paidAt,
+      channel,
+      syncBling = true,
+    } = req.body || {};
+
+    const cleanPendingId = String(pendingPaymentId || '').trim();
+    if (!cleanPendingId) {
+      return res.status(400).json({ success: false, error: 'Informe pendingPaymentId (ex: pix_st_1795717563519).' });
+    }
+
+    const pending = await loadPendingPaymentContext(cleanPendingId);
+    if (!pending) {
+      return res.status(404).json({ success: false, error: `Pagamento pendente ${cleanPendingId} não encontrado.` });
+    }
+
+    const canonicalId = String(mpPaymentId || pending.mpPaymentId || cleanPendingId).trim();
+    const paidIso = paidAt ? parseManualPaymentDate(paidAt).iso : (pending.dateApproved || new Date().toISOString());
+
+    const finalized = await finalizeApprovedPayment({
+      canonicalPaymentId: canonicalId,
+      pendingPaymentId: cleanPendingId,
+      userId: pending.userId || pending.payer?.uid,
+      contextKeys: [cleanPendingId],
+      endToEndId: endToEndId ? String(endToEndId).trim() : undefined,
+      source: 'admin_confirm_pending',
+      amount: Number(pending.amount || 0),
+      paymentMethod: channel ? String(channel) : (pending.paymentMethod || 'Pix Instantâneo Mercado Pago'),
+      dateApproved: paidIso,
+      payer: pending.payer,
+      items: pending.items || [],
+      shippingAddress: pending.shippingAddress,
+      shippingServiceId: pending.shippingServiceId,
+      shippingCarrier: pending.shippingCarrier,
+      skipBling: syncBling === false,
+    });
+
+    return res.json({
+      success: true,
+      pendingPaymentId: cleanPendingId,
+      canonicalPaymentId: canonicalId,
+      ...finalized,
+      message: 'Pagamento pendente confirmado, movido para orders e enviado ao fluxo do Bling ERP.',
+    });
+  } catch (err: any) {
+    console.error('[Orders Admin Confirm Pending Error]:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Erro ao confirmar pagamento pendente.' });
+  }
+});
+
+// Protected admin route: retry sending paid orders without blingOrderId to Bling ERP
+app.post('/api/orders/admin/retry-bling', async (req: Request, res: Response) => {
+  try {
+    if (!verifyAdminRaffleAccess(req)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Acesso negado. Chave de administrador inválida (header x-admin-key ou query ?key).'
+      });
+    }
+    const { paymentId, orderId, limit, forceAll } = req.body || {};
+    const result = await retryPendingBlingOrders({ paymentId, orderId, limit, forceAll });
+    return res.json({ success: true, ...result });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Erro ao reenviar pedidos para o Bling.' });
+  }
+});
+
 // 6. Webhook receiver (Processes approved payments even if customer closes browser)
 app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
   try {
@@ -2655,7 +2909,11 @@ app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
       if (mpRes.ok) {
         const mpData = await mpRes.json();
         if (mpData?.status === 'approved') {
-          const pendingCtx = await loadPendingPaymentContext(paymentId);
+          const matchedCtx = await findPendingPaymentForMpPayment(mpData);
+          const pendingCtx = matchedCtx?.payment || (await loadPendingPaymentContext(paymentId));
+          const contextKeys = matchedCtx?.key && matchedCtx.key !== String(paymentId)
+            ? [String(paymentId), matchedCtx.key]
+            : [String(paymentId)];
           const methodLabel =
             pendingCtx?.paymentMethod ||
             (mpData.payment_method_id === 'pix'
@@ -2664,7 +2922,9 @@ app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
 
           await finalizeApprovedPayment({
             canonicalPaymentId: mpData.id,
-            contextKeys: [String(paymentId)],
+            pendingPaymentId: matchedCtx?.key || pendingCtx?.id,
+            userId: pendingCtx?.userId || pendingCtx?.payer?.uid,
+            contextKeys,
             amount: Number(pendingCtx?.amount || mpData.transaction_amount || 0),
             paymentMethod: methodLabel,
             dateApproved: mpData.date_approved,
@@ -2802,31 +3062,30 @@ async function setupViteOrStatic() {
       }, 3 * 60 * 60 * 1000);
       if (typeof tokenKeepaliveTimer.unref === 'function') tokenKeepaliveTimer.unref();
 
-      // 4. Periodic background auto-sync: refresh all Bling products & stock every 3 min + Firestore & full-res photos every 15 min
+      // 4. Periodic background auto-sync: refresh Bling catalog every 5 min, retry pending Bling orders, and Firestore/images every 15 min
       const catalogSyncTimer = setInterval(async () => {
         try {
+          if (isImageSyncRunning() || activeCatalogBuildPromise) return;
           if (await ensureBlingAuthorized()) {
             await buildAndCacheCatalog({ forceImageSync: false });
+            await retryPendingBlingOrders({ limit: 5 }).catch(() => {});
           }
         } catch {
           // ignore
         }
-      }, 3 * 60 * 1000);
+      }, 5 * 60 * 1000);
       if (typeof catalogSyncTimer.unref === 'function') catalogSyncTimer.unref();
 
       const imageSyncTimer = setInterval(async () => {
         try {
-          if (await ensureBlingAuthorized({ verifyLive: true })) {
-            if (!isImageSyncRunning()) {
-              await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-                .then(() => reapplyImagesToCachedCatalog())
-                .catch(() => {});
-              if (hasFirebaseAdminEnv()) {
-                await syncImageStoreToFirestore().catch(() => {});
-              }
-            }
+          if (activeCatalogBuildPromise || isImageSyncRunning()) return;
+          if (await ensureBlingAuthorized()) {
+            await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
+              .then(() => reapplyImagesToCachedCatalog())
+              .catch(() => {});
             if (hasFirebaseAdminEnv()) {
-              syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
+              await syncImageStoreToFirestore().catch(() => {});
+              await syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
             }
           }
         } catch {

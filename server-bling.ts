@@ -23,6 +23,8 @@ import {
   saveBlingTokensToFirestore,
   refreshBlingTokenInFirestore,
   isBlingTokenExpiringOrExpired,
+  acquireBlingRateLimitSlot,
+  reportBlingRateLimit,
 } from './lib/blingToken.js';
 import {
   syncAllBlingProdutosToFirestore,
@@ -189,7 +191,7 @@ export async function exchangeCodeForTokens(code: string, redirectUri?: string):
   }
 
   if (!res.ok || json.error) {
-    console.error('[Bling Token Error]:', json);
+    console.error('[Bling Token Error]:', JSON.stringify(json));
     const errDesc = json.error?.message || json.error_description || json.error || responseText;
     throw new Error(`Erro Bling OAuth: ${errDesc}`);
   }
@@ -490,6 +492,8 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
   const token = await getValidAccessToken();
   const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
 
+  await acquireBlingRateLimitSlot();
+
   const res = await fetch(url, {
     ...options,
     headers: {
@@ -501,9 +505,15 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
     }
   });
 
-  if (res.status === 429 && retryCount < 3) {
-    const waitMs = 600 * (retryCount + 1);
-    console.warn(`[Bling] 429 Rate Limit em ${endpoint}. Aguardando ${waitMs}ms antes de tentar novamente...`);
+  if (res.status === 429 && retryCount < 6) {
+    const retryAfterSec = Number(res.headers.get('retry-after') || '0');
+    const jitter = 200 + Math.floor(Math.random() * 450);
+    const waitMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(15000, retryAfterSec * 1000 + jitter)
+        : Math.min(15000, 1500 * (retryCount + 1) + jitter);
+    reportBlingRateLimit(waitMs);
+    console.warn(`[Bling] 429 Rate Limit em ${endpoint} (tentativa ${retryCount + 1}/6). Aguardando ${waitMs}ms...`);
     await new Promise(resolve => setTimeout(resolve, waitMs));
     return fetchFromBling(endpoint, options, retryCount + 1);
   }
@@ -517,6 +527,7 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
         console.log('[Bling Interceptor] 401 recebido. Forçando renovação automática via refresh_token...');
         try {
           const refreshed = await refreshBlingToken({ force: true, failedAccessToken: token });
+          await acquireBlingRateLimitSlot();
           const retryRes = await fetch(url, {
             ...options,
             headers: {
@@ -527,6 +538,12 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
               ...(options.headers || {})
             }
           });
+          if (retryRes.status === 429 && retryCount < 6) {
+            const waitMs = 2000 + Math.floor(Math.random() * 500);
+            reportBlingRateLimit(waitMs);
+            await new Promise(resolve => setTimeout(resolve, waitMs));
+            return fetchFromBling(endpoint, options, retryCount + 1);
+          }
           if (retryRes.ok) {
             lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
             return retryRes.json();
@@ -553,7 +570,8 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
         throw new Error(msg);
       }
     }
-    throw new Error(`Bling API [${res.status}]: ${errorText}`);
+    const compactErr = errorText.replace(/\s+/g, ' ').trim();
+    throw new Error(`Bling API [${res.status}]: ${compactErr}`);
   }
 
   lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
@@ -1209,7 +1227,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
         };
       });
 
-      const visible = formatted.filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0));
+      const visible = formatted
+        .filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0))
+        .sort((a: any, b: any) => Number(b.blingId || 0) - Number(a.blingId || 0));
 
       res.json({
         success: true,

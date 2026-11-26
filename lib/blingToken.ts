@@ -390,7 +390,19 @@ export const interceptBlingTokenBeforeSync = getValidBlingToken;
 
 let blingRateLimitTail: Promise<void> = Promise.resolve();
 let lastBlingRequestAt = 0;
-const MIN_BLING_REQUEST_INTERVAL_MS = 360;
+let globalBlingCooldownUntil = 0;
+const MIN_BLING_REQUEST_INTERVAL_MS = 450;
+
+export function reportBlingRateLimit(waitMs: number = 2000): void {
+  const targetUntil = Date.now() + Math.max(800, Math.min(15000, waitMs));
+  if (targetUntil > globalBlingCooldownUntil) {
+    globalBlingCooldownUntil = targetUntil;
+  }
+}
+
+export function getBlingRateLimitCooldownRemainingMs(): number {
+  return Math.max(0, globalBlingCooldownUntil - Date.now());
+}
 
 export async function acquireBlingRateLimitSlot(): Promise<void> {
   const prev = blingRateLimitTail;
@@ -402,9 +414,11 @@ export async function acquireBlingRateLimitSlot(): Promise<void> {
   await prev;
   try {
     const now = Date.now();
-    const elapsed = now - lastBlingRequestAt;
-    if (elapsed < MIN_BLING_REQUEST_INTERVAL_MS) {
-      await new Promise((r) => setTimeout(r, MIN_BLING_REQUEST_INTERVAL_MS - elapsed));
+    const cooldownWait = Math.max(0, globalBlingCooldownUntil - now);
+    const intervalWait = Math.max(0, MIN_BLING_REQUEST_INTERVAL_MS - (now - lastBlingRequestAt));
+    const waitTotal = Math.max(cooldownWait, intervalWait);
+    if (waitTotal > 0) {
+      await new Promise((r) => setTimeout(r, waitTotal));
     }
     lastBlingRequestAt = Date.now();
   } finally {
@@ -415,7 +429,7 @@ export async function acquireBlingRateLimitSlot(): Promise<void> {
 /**
  * Interceptor HTTP completo para todas as requisições à API v3 do Bling:
  * 1. Antes da chamada, valida expiração e renova via refresh_token se expirado ou < 10 min.
- * 2. Respeita cadência <= 3 req/s e trata 429 (Rate Limit) com backoff progressivo.
+ * 2. Respeita cadência <= 2.2 req/s, compartilha cooldown global de 429 e faz backoff progressivo.
  * 3. Em 401 inesperado, força renovação via refresh_token e reexecuta transparentemente.
  */
 export async function blingApiRequest<T = unknown>(
@@ -439,12 +453,15 @@ export async function blingApiRequest<T = unknown>(
     },
   });
 
-  if (response.status === 429 && rateLimitAttempt < 5) {
+  if (response.status === 429 && rateLimitAttempt < 6) {
     const retryAfterSec = Number(response.headers.get('retry-after') || '0');
+    const jitter = 200 + Math.floor(Math.random() * 450);
     const waitMs =
       Number.isFinite(retryAfterSec) && retryAfterSec > 0
-        ? Math.min(8000, retryAfterSec * 1000)
-        : 1100 * (rateLimitAttempt + 1);
+        ? Math.min(15000, retryAfterSec * 1000 + jitter)
+        : Math.min(15000, 1500 * (rateLimitAttempt + 1) + jitter);
+    reportBlingRateLimit(waitMs);
+    console.warn(`[Bling API] 429 Rate Limit em ${endpoint} (tentativa ${rateLimitAttempt + 1}/6). Aguardando ${waitMs}ms...`);
     await new Promise((r) => setTimeout(r, waitMs));
     return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
   }
@@ -468,6 +485,12 @@ export async function blingApiRequest<T = unknown>(
           ...(init.headers || {}),
         },
       });
+      if (retryRes.status === 429 && rateLimitAttempt < 6) {
+        const waitMs = 2000 + Math.floor(Math.random() * 500);
+        reportBlingRateLimit(waitMs);
+        await new Promise((r) => setTimeout(r, waitMs));
+        return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
+      }
       if (!retryRes.ok) {
         throw new Error(`Bling API [${retryRes.status}]: ${(await retryRes.text()).slice(0, 300)}`);
       }

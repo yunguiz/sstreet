@@ -82,6 +82,7 @@ export async function createCheckoutPreference(params: {
 
 // Generate direct Mercado Pago Pix with real QR code
 export async function createDirectPix(params: {
+  userId?: string;
   amount: number;
   description?: string;
   payer?: {
@@ -97,6 +98,7 @@ export async function createDirectPix(params: {
     price: number;
     quantity: number;
     selectedSize?: string;
+    selectedColor?: string;
     variantId?: number;
     image?: string;
   }>;
@@ -187,6 +189,7 @@ export async function confirmPixPayment(paymentId: string | number): Promise<{
 }
 
 export interface TransparentCardPaymentParams {
+  userId?: string;
   cardData?: {
     cardNumber: string;
     cardholderName: string;
@@ -213,6 +216,7 @@ export interface TransparentCardPaymentParams {
     price: number;
     quantity: number;
     selectedSize?: string;
+    selectedColor?: string;
     variantId?: number;
     image?: string;
   }>;
