@@ -551,8 +551,15 @@ export function CartDrawer({
         items: items.map((it) => {
           const matchedVariant =
             it.product.variantsList?.find(
+              (v) =>
+                v.size &&
+                v.size.toLowerCase() === it.selectedSize.toLowerCase() &&
+                (!v.color || v.color.toLowerCase() === it.selectedColor.toLowerCase())
+            ) ||
+            it.product.variantsList?.find(
               (v) => v.size && v.size.toLowerCase() === it.selectedSize.toLowerCase()
-            ) || it.product.variantsList?.[0];
+            ) ||
+            it.product.variantsList?.[0];
           return {
             id: it.product.id,
             sku: matchedVariant?.sku || it.product.integration?.sku,
@@ -672,8 +679,15 @@ export function CartDrawer({
         items: items.map((it) => {
           const matchedVariant =
             it.product.variantsList?.find(
+              (v) =>
+                v.size &&
+                v.size.toLowerCase() === it.selectedSize.toLowerCase() &&
+                (!v.color || v.color.toLowerCase() === it.selectedColor.toLowerCase())
+            ) ||
+            it.product.variantsList?.find(
               (v) => v.size && v.size.toLowerCase() === it.selectedSize.toLowerCase()
-            ) || it.product.variantsList?.[0];
+            ) ||
+            it.product.variantsList?.[0];
           return {
             id: it.product.id,
             sku: matchedVariant?.sku || it.product.integration?.sku,

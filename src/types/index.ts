@@ -47,6 +47,7 @@ export interface Product {
     comparePrice?: number;
     stock: number;
     size?: string;
+    color?: string;
   }[];
 }
 

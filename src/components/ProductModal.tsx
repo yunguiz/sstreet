@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   X, 
@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
+import { sortSizes } from '../lib/catalogVariants';
 import { calculateShippingQuotes, ShippingOption } from '../services/shipping';
 import { ProductImage } from './ProductImage';
 
@@ -50,29 +51,88 @@ export function ProductModal({
   const [shippingLoading, setShippingLoading] = useState(false);
   const [shippingOptions, setShippingOptions] = useState<ShippingOption[]>([]);
 
+  const inStockVariants = useMemo(() => {
+    if (!product?.variantsList || product.variantsList.length === 0) return [];
+    return product.variantsList.filter((v) => v.stock > 0);
+  }, [product]);
+
+  const selectableColors = useMemo(() => {
+    if (!product) return [];
+    const baseColors = product.colors?.length ? product.colors : [{ name: 'Cor Única', hex: '#1C1C1C' }];
+    const hasVariantColors = inStockVariants.some((v) => Boolean(v.color));
+    if (!hasVariantColors) return baseColors;
+    const activeColorSet = new Set(inStockVariants.map((v) => (v.color || '').toLowerCase()).filter(Boolean));
+    const filtered = baseColors.filter((c) => activeColorSet.has(c.name.toLowerCase()));
+    return filtered.length > 0 ? filtered : baseColors;
+  }, [product, inStockVariants]);
+
+  const selectableSizes = useMemo(() => {
+    if (!product) return [];
+    if (inStockVariants.length > 0) {
+      const hasVariantColors = inStockVariants.some((v) => Boolean(v.color));
+      const matchingColorVariants =
+        hasVariantColors && selectableColors.length > 1 && selectedColor
+          ? inStockVariants.filter((v) => (v.color || '').toLowerCase() === selectedColor.toLowerCase())
+          : inStockVariants;
+      const pool = matchingColorVariants.length > 0 ? matchingColorVariants : inStockVariants;
+      const fromVars = sortSizes(pool.map((v) => v.size || '').filter(Boolean));
+      if (fromVars.length > 0) return fromVars;
+    }
+    if (product.variantsList && product.variantsList.length > 0) {
+      return [];
+    }
+    return product.sizes?.length ? sortSizes(product.sizes) : ['Tamanho Único'];
+  }, [product, inStockVariants, selectableColors.length, selectedColor]);
+
+  const selectedVariantStock = useMemo(() => {
+    if (!product) return 0;
+    if (inStockVariants.length > 0) {
+      const exact = inStockVariants.find(
+        (v) =>
+          (v.size || '').toLowerCase() === selectedSize.toLowerCase() &&
+          (!v.color || v.color.toLowerCase() === selectedColor.toLowerCase())
+      ) || inStockVariants.find((v) => (v.size || '').toLowerCase() === selectedSize.toLowerCase());
+      if (exact) return exact.stock;
+    }
+    return product.stockCount ?? 0;
+  }, [product, inStockVariants, selectedSize, selectedColor]);
+
   // Synchronize selection whenever the active product changes
   useEffect(() => {
     if (product) {
-      setSelectedSize(product.sizes?.[0] || 'Tamanho Único');
-      setSelectedColor(product.colors?.[0]?.name || 'Cor Única');
+      setSelectedColor(selectableColors[0]?.name || product.colors?.[0]?.name || 'Cor Única');
+      setSelectedSize(selectableSizes[0] || product.sizes?.[0] || 'Tamanho Único');
       setSelectedImage(0);
       setShowSizeGuide(false);
       setQuantity(1);
     }
   }, [product?.id]);
 
+  // Keep selectedSize and quantity valid when color or available sizes update
+  useEffect(() => {
+    if (selectableSizes.length > 0 && !selectableSizes.includes(selectedSize)) {
+      setSelectedSize(selectableSizes[0]);
+    }
+  }, [selectableSizes, selectedSize]);
+
+  useEffect(() => {
+    if (selectedVariantStock > 0 && quantity > selectedVariantStock) {
+      setQuantity(selectedVariantStock);
+    }
+  }, [selectedVariantStock, quantity]);
+
   // Early return only AFTER all hooks are declared
   if (!product || !isOpen) return null;
 
-  const isUniqueSize = (product.sizes?.length || 0) <= 1 && (
-    product.sizes?.[0] === 'Tamanho Único' || 
-    product.sizes?.[0] === 'Único' || 
-    product.sizes?.[0] === 'Ajustável' || 
-    product.category === 'acessorios'
+  const isUniqueSize = selectableSizes.length <= 1 && (
+    selectableSizes.length === 0 ||
+    selectableSizes[0] === 'Tamanho Único' ||
+    selectableSizes[0] === 'Único' ||
+    selectableSizes[0] === 'Ajustável'
   );
 
-  const isSingleColor = (product.colors?.length || 0) <= 1;
-  const isOutOfStock = (product.stockCount ?? 0) <= 0;
+  const isSingleColor = selectableColors.length <= 1;
+  const isOutOfStock = (product.stockCount ?? 0) <= 0 || selectableSizes.length === 0;
 
   const handleSimulateShipping = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -235,10 +295,12 @@ export function ProductModal({
                   </div>
                 ) : (
                   <div className="flex items-center gap-2 text-xs">
-                    <span className={`w-2 h-2 rounded-full ${product.stockCount <= 4 ? 'bg-amber-400' : 'bg-green-500'}`} />
+                    <span className={`w-2 h-2 rounded-full ${selectedVariantStock <= 4 ? 'bg-amber-400' : 'bg-green-500'}`} />
                     <span className="text-zinc-300 font-medium">
-                      {product.stockCount <= 4
-                        ? `Apenas ${product.stockCount} unidades restantes no estoque!`
+                      {selectedVariantStock <= 4
+                        ? isUniqueSize
+                          ? `Apenas ${selectedVariantStock} ${selectedVariantStock === 1 ? 'unidade restante' : 'unidades restantes'} no estoque!`
+                          : `Apenas ${selectedVariantStock} ${selectedVariantStock === 1 ? 'unidade disponível' : 'unidades disponíveis'} no tamanho ${selectedSize}!`
                         : `Estoque disponível para envio imediato.`}
                     </span>
                   </div>
@@ -263,7 +325,7 @@ export function ProductModal({
                   </span>
                 </div>
                 <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg bg-zinc-900/90 border border-zinc-700/80 text-xs font-bold text-white shadow-xs">
-                  <span>{product.sizes[0] || 'Tamanho Único'}</span>
+                  <span>{selectableSizes[0] || 'Tamanho Único'}</span>
                   <Check className="w-3.5 h-3.5 text-emerald-400" />
                 </div>
               </div>
@@ -285,9 +347,9 @@ export function ProductModal({
                   )}
                 </div>
 
-                {/* Sizes Buttons */}
+                {/* Sizes Buttons (Strictly in-stock sizes only) */}
                 <div className="flex flex-wrap gap-2">
-                  {product.sizes.map((sz) => (
+                  {selectableSizes.map((sz) => (
                     <button
                       key={sz}
                       onClick={() => setSelectedSize(sz)}
@@ -339,15 +401,15 @@ export function ProductModal({
                     Cor:
                   </span>
                   <span className="text-[10px] font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded tracking-wide uppercase">
-                    {product.colors[0]?.name === 'Cor Única' ? 'Modelo Exclusivo' : 'Cor Única'}
+                    {(selectableColors[0]?.name || 'Cor Única') === 'Cor Única' ? 'Modelo Exclusivo' : 'Cor Única'}
                   </span>
                 </div>
                 <div className="inline-flex items-center gap-2.5 px-3.5 py-2 rounded-lg bg-zinc-900/90 border border-zinc-700/80 text-xs font-medium text-white shadow-xs">
                   <span
                     className="w-3.5 h-3.5 rounded-full border border-zinc-600 shrink-0"
-                    style={{ backgroundColor: product.colors[0]?.hex || '#1C1C1C' }}
+                    style={{ backgroundColor: selectableColors[0]?.hex || '#1C1C1C' }}
                   />
-                  <span className="font-semibold">{product.colors[0]?.name || 'Cor Única'}</span>
+                  <span className="font-semibold">{selectableColors[0]?.name || 'Cor Única'}</span>
                   <Check className="w-3.5 h-3.5 text-emerald-400" />
                 </div>
               </div>
@@ -357,7 +419,7 @@ export function ProductModal({
                   Cor: <strong className="text-white">{selectedColor}</strong>
                 </span>
                 <div className="flex flex-wrap items-center gap-2.5">
-                  {product.colors.map((c) => (
+                  {selectableColors.map((c) => (
                     <button
                       key={c.name}
                       onClick={() => setSelectedColor(c.name)}
@@ -397,9 +459,9 @@ export function ProductModal({
                   {isOutOfStock ? 0 : quantity}
                 </span>
                 <button
-                  disabled={isOutOfStock}
-                  onClick={() => setQuantity(Math.min(product.stockCount, quantity + 1))}
-                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed"
+                  disabled={isOutOfStock || quantity >= selectedVariantStock}
+                  onClick={() => setQuantity(Math.min(Math.max(1, selectedVariantStock), quantity + 1))}
+                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   +
                 </button>

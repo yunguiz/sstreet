@@ -200,14 +200,29 @@ function StorefrontApp() {
 
   const totalCartCount = cartItems.reduce((acc, item) => acc + item.quantity, 0);
 
-  // Add single item to cart (blocked if stockCount <= 0)
+  const getAvailableStockForChoice = (product: Product, size: string, color?: string): number => {
+    const vars = (product.variantsList || []).filter((v) => v.stock > 0);
+    if (vars.length > 0) {
+      const exact =
+        vars.find(
+          (v) =>
+            (v.size || '').toLowerCase() === size.toLowerCase() &&
+            (!color || !v.color || v.color.toLowerCase() === color.toLowerCase())
+        ) || vars.find((v) => (v.size || '').toLowerCase() === size.toLowerCase());
+      return exact ? exact.stock : 0;
+    }
+    return product.stockCount ?? 0;
+  };
+
+  // Add single item to cart (blocked if stockCount <= 0 or chosen size has 0 stock)
   const handleAddToCart = (
     product: Product,
     size: string,
     color: string,
     quantity: number = 1
   ) => {
-    if ((product.stockCount ?? 0) <= 0) {
+    const availableStock = getAvailableStockForChoice(product, size, color);
+    if ((product.stockCount ?? 0) <= 0 || availableStock <= 0) {
       setSelectedProduct(product);
       return;
     }
@@ -218,7 +233,7 @@ function StorefrontApp() {
       if (existing) {
         return prev.map((item) =>
           item.id === cartItemId
-            ? { ...item, quantity: item.quantity + quantity }
+            ? { ...item, quantity: Math.min(availableStock, item.quantity + quantity) }
             : item
         );
       }
@@ -229,7 +244,7 @@ function StorefrontApp() {
           product,
           selectedSize: size,
           selectedColor: color,
-          quantity,
+          quantity: Math.min(availableStock, Math.max(1, quantity)),
         },
       ];
     });
@@ -237,13 +252,16 @@ function StorefrontApp() {
     setIsCartOpen(true);
   };
 
-  // Quick add from card (uses first size & color; opens details if out of stock)
+  // Quick add from card (uses first in-stock size & color; opens details if out of stock)
   const handleQuickAdd = (product: Product) => {
     if ((product.stockCount ?? 0) <= 0) {
       setSelectedProduct(product);
       return;
     }
-    handleAddToCart(product, product.sizes[0] || 'Tamanho Único', product.colors[0]?.name || 'Cor Única', 1);
+    const firstInStockVar = (product.variantsList || []).find((v) => v.stock > 0);
+    const chosenSize = firstInStockVar?.size || product.sizes[0] || 'Tamanho Único';
+    const chosenColor = firstInStockVar?.color || product.colors[0]?.name || 'Cor Única';
+    handleAddToCart(product, chosenSize, chosenColor, 1);
   };
 
   const handleUpdateQuantity = (id: string, delta: number) => {
@@ -251,7 +269,8 @@ function StorefrontApp() {
       prev
         .map((item) => {
           if (item.id === id) {
-            const newQty = item.quantity + delta;
+            const maxStock = Math.max(1, getAvailableStockForChoice(item.product, item.selectedSize, item.selectedColor));
+            const newQty = Math.min(maxStock, item.quantity + delta);
             return newQty > 0 ? { ...item, quantity: newQty } : null;
           }
           return item;

@@ -8,6 +8,14 @@ import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
 import { matchesBrandFilter } from '../data/brands';
+import {
+  detectColorFromText,
+  inferStoreCategory,
+  normalizeColorName,
+  normalizeColorOptions,
+  parseBlingVariantMeta,
+  sortSizes,
+} from '../lib/catalogVariants';
 
 interface CatalogSectionProps {
   products: Product[];
@@ -23,31 +31,6 @@ interface CatalogSectionProps {
   onOpenProduct: (product: Product) => void;
   onQuickAdd: (product: Product) => void;
 }
-
-const COLOR_HEX_MAP: Record<string, string> = {
-  preto: '#111111',
-  preta: '#111111',
-  branco: '#FFFFFF',
-  branca: '#FFFFFF',
-  'off-white': '#EAE6DF',
-  'off white': '#EAE6DF',
-  cinza: '#6B7280',
-  chumbo: '#374151',
-  grafite: '#374151',
-  azul: '#1E3A8A',
-  marinho: '#172554',
-  verde: '#14532D',
-  militar: '#3F4E2E',
-  vermelho: '#DC2626',
-  vermelha: '#DC2626',
-  rosa: '#F472B6',
-  roxo: '#6B21A8',
-  bege: '#D6C5A7',
-  caqui: '#A89F81',
-  marrom: '#78350F',
-  laranja: '#EA580C',
-  amarelo: '#EAB308',
-};
 
 const DEFAULT_PRODUCT_IMAGE = '/assets/streetstore-fallback.svg';
 
@@ -70,33 +53,11 @@ function inferStoreCategoryAndSubcategory(
   rawSubcat: unknown,
   productName: string
 ): { category: ProductCategory; subcategory: ProductSubcategory } {
-  const catStr = String(rawCat || '').toLowerCase();
-  const subStr = String(rawSubcat || '').toLowerCase();
-  const text = `${catStr} ${subStr} ${productName.toLowerCase()}`;
-
-  if (catStr === 'calcados' || /\b(tenis|tênis|sneaker|chinelo|calçado|calcado|dunk|jordan)\b/i.test(text)) {
-    return { category: 'calcados', subcategory: 'sneakers' };
-  }
-  if (catStr === 'acessorios' || /\b(boné|bone|bucket|touca)\b/i.test(text)) {
-    return { category: 'acessorios', subcategory: 'bones' };
-  }
-  if (/\b(bag|shoulder|mochila|pochete|mala)\b/i.test(text)) {
-    return { category: 'acessorios', subcategory: 'bags' };
-  }
-  if (/\b(óculos|oculos|cinto|carteira|relógio|relogio|corrente|meia|cadarço|cadarco|acessório|acessorio)\b/i.test(text)) {
-    return { category: 'acessorios', subcategory: 'acessorios-metal' };
-  }
-  if (subStr === 'hoodies' || /\b(moletom|hoodie|jaqueta|corta vento|casaco)\b/i.test(text)) {
-    return { category: 'roupas', subcategory: 'hoodies' };
-  }
-  if (subStr === 'calcas' || /\b(calça|calca|cargo|jogger|jeans)\b/i.test(text)) {
-    return { category: 'roupas', subcategory: 'calcas' };
-  }
-  if (subStr === 'shorts' || /\b(bermuda|short)\b/i.test(text)) {
-    return { category: 'roupas', subcategory: 'shorts' };
-  }
-
-  return { category: 'roupas', subcategory: 'camisetas' };
+  return inferStoreCategory(
+    productName,
+    String(rawCat || ''),
+    String(rawSubcat || '')
+  );
 }
 
 function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>): Product {
@@ -112,17 +73,38 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
   const rawOriginal = Number(data.originalPrice ?? 0);
   const originalPrice = Number.isFinite(rawOriginal) && rawOriginal > price ? rawOriginal : Math.round(price * 1.25);
 
-  const variacoesObj =
+  const variacoesEntries =
     data.variacoes && typeof data.variacoes === 'object' && !Array.isArray(data.variacoes)
-      ? (data.variacoes as Record<string, Record<string, unknown>>)
-      : null;
+      ? Object.values(data.variacoes as Record<string, Record<string, unknown>>)
+      : [];
 
-  const variacoesStock = variacoesObj
-    ? Object.values(variacoesObj).reduce((sum, v) => sum + Math.max(0, Number(v?.estoque ?? 0) || 0), 0)
+  const variantsList =
+    variacoesEntries.length > 0
+      ? variacoesEntries.map((v) => {
+          const parsedMeta = v?.nome
+            ? parseBlingVariantMeta({ nome: String(v.nome), isParentContainer: false })
+            : null;
+          const rawSize = parsedMeta?.hasExplicitSize
+            ? parsedMeta.size
+            : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
+          const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
+          return {
+            id: Number(v.blingId || 0) || 0,
+            sku: String(v.codigo || ''),
+            price: Number(v.preco || price) || price,
+            stock: Math.max(0, Number(v.estoque ?? 0) || 0),
+            size: sortSizes([rawSize])[0] || 'Tamanho Único',
+            ...(rawColor ? { color: rawColor } : {}),
+          };
+        })
+      : undefined;
+
+  const variacoesStock = variantsList
+    ? variantsList.reduce((sum, v) => sum + v.stock, 0)
     : 0;
   const rawStock = Number(data.estoque ?? data.stockCount ?? 0);
   const directStock = Number.isFinite(rawStock) ? Math.max(0, rawStock) : 0;
-  const stockCount = variacoesObj ? Math.max(variacoesStock, directStock) : directStock;
+  const stockCount = variantsList && variantsList.length > 0 ? variacoesStock : directStock;
 
   const rawImages: string[] = [];
   if (Array.isArray(data.imagens)) {
@@ -143,51 +125,36 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
 
   const images = rawImages.length > 0 ? rawImages : [DEFAULT_PRODUCT_IMAGE];
 
+  const inStockVariants = (variantsList || []).filter((v) => v.stock > 0);
+  const activeVariantSizes = sortSizes(
+    inStockVariants.map((v) => v.size || '').filter(Boolean)
+  );
   const rawSizes = Array.isArray(data.tamanhos)
     ? data.tamanhos
     : Array.isArray(data.sizes)
       ? data.sizes
       : [];
-  const sizes = rawSizes
-    .map((s) => String(s || '').trim())
-    .filter(Boolean);
-  const finalSizes = sizes.length > 0 ? sizes : ['Tamanho Único'];
+  const docSizes = rawSizes.map((s) => String(s || '').trim()).filter(Boolean);
+  const finalSizes =
+    variantsList && variantsList.length > 0
+      ? (activeVariantSizes.length > 0 ? activeVariantSizes : ['Tamanho Único'])
+      : (docSizes.length > 0 ? sortSizes(docSizes) : ['Tamanho Único']);
 
+  const inStockVarColors = inStockVariants.map((v) => v.color).filter(Boolean) as string[];
   const rawColors = Array.isArray(data.cores)
     ? data.cores
     : Array.isArray(data.colors)
       ? data.colors
       : [];
-  const colors = rawColors
-    .map((c) => {
-      if (c && typeof c === 'object' && 'name' in c) {
-        const obj = c as { name?: string; hex?: string };
-        const colorName = String(obj.name || 'Padrão').trim();
-        return {
-          name: colorName,
-          hex: String(obj.hex || COLOR_HEX_MAP[colorName.toLowerCase()] || '#1C1C1C'),
-        };
-      }
-      const colorName = String(c || '').trim();
-      if (!colorName) return null;
-      return {
-        name: colorName,
-        hex: COLOR_HEX_MAP[colorName.toLowerCase()] || '#1C1C1C',
-      };
-    })
-    .filter((c): c is { name: string; hex: string } => Boolean(c));
-
-  const finalColors = colors.length > 0 ? colors : [{ name: 'Padrão', hex: '#1C1C1C' }];
-
-  const variantsList = variacoesObj
-    ? Object.values(variacoesObj).map((v) => ({
-        id: Number(v.blingId || 0) || 0,
-        sku: String(v.codigo || ''),
-        price: Number(v.preco || price) || price,
-        stock: Math.max(0, Number(v.estoque ?? 0) || 0),
-        size: String(v.tamanho || 'Tamanho Único'),
-      }))
-    : undefined;
+  const fallbackTitleColor =
+    inStockVarColors.length === 0 && rawColors.length === 0
+      ? detectColorFromText(name)
+      : null;
+  const finalColors = normalizeColorOptions(
+    inStockVarColors.length > 0
+      ? inStockVarColors
+      : (rawColors.length > 0 ? rawColors : (fallbackTitleColor ? [fallbackTitleColor] : []))
+  );
 
   const cleanedDesc =
     cleanDescription(String(data.descricao || data.description || '')) ||

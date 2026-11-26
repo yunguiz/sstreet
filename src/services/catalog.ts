@@ -2,6 +2,14 @@ import { collection, getDocs, query, where } from 'firebase/firestore';
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
+import {
+  detectColorFromText,
+  inferStoreCategory,
+  normalizeColorName,
+  normalizeColorOptions,
+  parseBlingVariantMeta,
+  sortSizes,
+} from '../lib/catalogVariants';
 import { db } from '../lib/firebase';
 
 export interface TrackedOrderProduct {
@@ -55,7 +63,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
     data.variacoes && typeof data.variacoes === 'object' ? Object.values(data.variacoes) as any[] : [];
   const variacoesStock = variacoesRaw.reduce((sum, v) => sum + Math.max(0, Number(v?.estoque || 0)), 0);
   const directStock = Math.max(0, Number(data.estoque || 0));
-  const stockCount = variacoesRaw.length > 0 ? Math.max(variacoesStock, directStock) : directStock;
+  const stockCount = variacoesRaw.length > 0 ? variacoesStock : directStock;
   if (stockCount <= 0) return null;
 
   const nome = String(data.nome || '').trim();
@@ -67,30 +75,55 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
     rawImages.push(data.imagemURL.trim());
   }
 
-  const variantsList = variacoesRaw.map((v: any) => ({
-    id: Number(v.blingId || v.id || 0),
-    sku: String(v.codigo || ''),
-    price: Number(v.preco || preco),
-    stock: Math.max(0, Number(v.estoque || 0)),
-    size: String(v.tamanho || 'Único'),
-  }));
+  const variantsList = variacoesRaw.map((v: any) => {
+    const parsedMeta = v?.nome
+      ? parseBlingVariantMeta({ nome: String(v.nome), isParentContainer: false })
+      : null;
+    const rawSize = parsedMeta?.hasExplicitSize ? parsedMeta.size : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
+    const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
+    return {
+      id: Number(v.blingId || v.id || 0),
+      sku: String(v.codigo || ''),
+      price: Number(v.preco || preco),
+      stock: Math.max(0, Number(v.estoque || 0)),
+      size: sortSizes([rawSize])[0] || 'Tamanho Único',
+      ...(rawColor ? { color: rawColor } : {}),
+    };
+  });
 
-  const activeVariantSizes = Array.from(
-    new Set(variantsList.filter((v) => v.stock > 0 && v.size).map((v) => v.size))
+  const inStockVariants = variantsList.filter((v) => v.stock > 0);
+  if (variantsList.length > 0 && inStockVariants.length === 0) {
+    return null;
+  }
+
+  const activeVariantSizes = sortSizes(
+    inStockVariants.map((v) => v.size).filter(Boolean) as string[]
   );
   const docSizes = Array.isArray(data.tamanhos) ? data.tamanhos.filter((s: unknown) => typeof s === 'string' && s.trim()) : [];
-  const sizes = activeVariantSizes.length > 0 ? activeVariantSizes : (docSizes.length > 0 ? docSizes : ['Tamanho Único']);
+  const sizes =
+    variantsList.length > 0
+      ? (activeVariantSizes.length > 0 ? activeVariantSizes : ['Tamanho Único'])
+      : (docSizes.length > 0 ? sortSizes(docSizes) : ['Tamanho Único']);
 
+  const inStockVarColors = inStockVariants.map((v) => v.color).filter(Boolean) as string[];
   const docColors = Array.isArray(data.cores)
-    ? data.cores
-        .filter((c: unknown) => typeof c === 'string' && c.trim() && c !== 'Padrão')
-        .map((c: string) => ({ name: c, hex: '#1C1C1C' }))
+    ? data.cores.filter((c: unknown): c is string => typeof c === 'string' && c.trim().length > 0)
     : [];
+  const fallbackTitleColor =
+    inStockVarColors.length === 0 && docColors.length === 0
+      ? detectColorFromText(nome)
+      : null;
+  const resolvedColors = normalizeColorOptions(
+    inStockVarColors.length > 0
+      ? inStockVarColors
+      : (docColors.length > 0 ? docColors : (fallbackTitleColor ? [fallbackTitleColor] : []))
+  );
 
-  const category = (data.categoriaStore === 'calcados' || data.categoriaStore === 'acessorios' || data.categoriaStore === 'roupas')
-    ? data.categoriaStore
-    : 'roupas';
-  const subcategory = data.subcategoriaStore || (category === 'calcados' ? 'sneakers' : category === 'acessorios' ? 'acessorios-metal' : 'camisetas');
+  const { category, subcategory } = inferStoreCategory(
+    nome,
+    String(data.categoriaStore ?? data.categoria ?? ''),
+    String(data.subcategoriaStore ?? '')
+  );
 
   return {
     id: `bling-${data.blingId || docId}`,
@@ -104,7 +137,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
     reviewsCount: 24,
     images: rawImages.length > 0 ? rawImages : ['/assets/streetstore-fallback.svg'],
     sizes,
-    colors: docColors.length > 0 ? docColors : [{ name: 'Cor Única', hex: '#1C1C1C' }],
+    colors: resolvedColors,
     description: cleanDescription(String(data.descricao || `${nome} - Street Store Itabira`)),
     stockCount,
     details: {

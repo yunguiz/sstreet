@@ -12,6 +12,13 @@ import { hasFirebaseAdminEnv, hasFirestoreBlingToken, getValidBlingToken as getF
 import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
 import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
 import {
+  detectColorFromText,
+  inferStoreCategory,
+  normalizeColorOptions,
+  parseBlingVariantMeta,
+  sortSizes,
+} from './src/lib/catalogVariants.js';
+import {
   applyBlingImageOverrides,
   recordProductImage,
   syncImagesFromBling,
@@ -115,30 +122,8 @@ function cleanDescription(raw?: string): string {
   return text;
 }
 
-const COLOR_PALETTE: { name: string; regex: RegExp; hex: string }[] = [
-  { name: 'Preto', regex: /\b(preto|preta|black|all black|negro)\b/i, hex: '#111111' },
-  { name: 'Branco', regex: /\b(branco|branca|white)\b/i, hex: '#FFFFFF' },
-  { name: 'Off-White', regex: /\b(off white|off-white|off withe|off)\b/i, hex: '#EAE6DF' },
-  { name: 'Cinza', regex: /\b(cinza|grey|gray|chumbo|grafite|estonado|estonada)\b/i, hex: '#6B7280' },
-  { name: 'Azul', regex: /\b(azul|navy|blue|safira|jeans|marinho)\b/i, hex: '#1E3A8A' },
-  { name: 'Verde', regex: /\b(verde|green|militar|musgo)\b/i, hex: '#14532D' },
-  { name: 'Vermelho', regex: /\b(vermelho|vermelha|red)\b/i, hex: '#DC2626' },
-  { name: 'Rosa / Rose Gold', regex: /\b(rosa|pink|rose|rose gold)\b/i, hex: '#F472B6' },
-  { name: 'Roxo', regex: /\b(roxo|roxa|purple)\b/i, hex: '#6B21A8' },
-  { name: 'Marrom / Bege', regex: /\b(marrom|brown|caramelo|bege|areia|khaki)\b/i, hex: '#78350F' },
-  { name: 'Prata', regex: /\b(prata|prateado|prateada|silver)\b/i, hex: '#9CA3AF' },
-  { name: 'Dourado', regex: /\b(dourado|dourada|ouro|gold)\b/i, hex: '#F59E0B' },
-  { name: 'Amarelo', regex: /\b(amarelo|amarela|yellow)\b/i, hex: '#EAB308' },
-  { name: 'Laranja', regex: /\b(laranja|orange)\b/i, hex: '#EA580C' }
-];
-
 function detectColorFromName(name: string): { name: string; hex: string } | null {
-  for (const c of COLOR_PALETTE) {
-    if (c.regex.test(name)) {
-      return { name: c.name, hex: c.hex };
-    }
-  }
-  return null;
+  return detectColorFromText(name);
 }
 
 // Map product category and title to app categories
@@ -148,48 +133,9 @@ function mapCategoryAndSubcategory(
 ): { category: 'roupas' | 'calcados' | 'acessorios'; subcategory: 'hoodies' | 'camisetas' | 'calcas' | 'shorts' | 'sneakers' | 'bones' | 'bags' | 'acessorios-metal' } {
   const allCatNames = (categories || [])
     .map(c => (typeof c.name === 'object' && c.name?.pt ? c.name.pt : (c.name || '')))
-    .join(' ')
-    .toLowerCase();
+    .join(' ');
 
-  const titleLower = productName.toLowerCase();
-  const text = `${allCatNames} ${titleLower}`;
-
-  // Accessories checked first if explicit in title or category (avoids socks/laces being called sneakers)
-  if (text.includes('boné') || text.includes('bone') || text.includes('bucket') || text.includes('gorro')) {
-    return { category: 'acessorios', subcategory: 'bones' };
-  }
-  if (text.includes('bag') || text.includes('shoulder') || text.includes('mochila') || text.includes('pochete') || text.includes('mala')) {
-    return { category: 'acessorios', subcategory: 'bags' };
-  }
-  if (
-    text.includes('óculos') || text.includes('oculos') || 
-    text.includes('radar') || text.includes('juliet') || text.includes('penny') ||
-    text.includes('oakley') || text.includes('cartier') || text.includes('descanço') || text.includes('descanso') ||
-    text.includes('cinto') || text.includes('carteira') || text.includes('relógio') || text.includes('relogio') || 
-    text.includes('isqueiro') || text.includes('corrente') || text.includes('chaveiro') || text.includes('anel') || text.includes('pulseira') ||
-    titleLower.includes('meia') || titleLower.includes('cadarço') || titleLower.includes('cadarco') || titleLower.includes('lace')
-  ) {
-    return { category: 'acessorios', subcategory: 'acessorios-metal' };
-  }
-
-  // Sneakers / Calçados
-  if (text.includes('tênis') || text.includes('tenis') || text.includes('sneaker') || text.includes('chinelo') || text.includes('calçado') || text.includes('calcado')) {
-    return { category: 'calcados', subcategory: 'sneakers' };
-  }
-
-  // Roupas
-  if (text.includes('moletom') || text.includes('hoodie') || text.includes('jaqueta') || text.includes('corta vento') || text.includes('casaco')) {
-    return { category: 'roupas', subcategory: 'hoodies' };
-  }
-  if (text.includes('calça') || text.includes('calca') || text.includes('cargo') || text.includes('jogger')) {
-    return { category: 'roupas', subcategory: 'calcas' };
-  }
-  if (text.includes('bermuda') || text.includes('short')) {
-    return { category: 'roupas', subcategory: 'shorts' };
-  }
-
-  // Default to camisetas / oversize
-  return { category: 'roupas', subcategory: 'camisetas' };
+  return inferStoreCategory(productName, allCatNames);
 }
 
 let activeCatalogBuildPromise: Promise<{
@@ -321,6 +267,8 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           id: number;
           baseName: string;
           items: any[];
+          parentItem: any | null;
+          childItems: any[];
           price: number;
           category: 'roupas' | 'calcados' | 'acessorios';
           subcategory: any;
@@ -333,7 +281,12 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           const parentItem = parentId ? byBlingId.get(parentId) : null;
           const sourceForTitle = parentItem || bp;
           const rawName = (sourceForTitle.nome || bp.nome || '').trim();
-          const baseName = rawName.split(':')[0].trim();
+          const parsedTitle = parseBlingVariantMeta({
+            nome: rawName,
+            variacaoNome: sourceForTitle.variacao?.nome,
+            isParentContainer: Boolean(parentItem) || bp.formato === 'V' || referencedParentIds.has(bp.id),
+          });
+          const baseName = parsedTitle.baseName || rawName;
           const groupKey = parentId ? `parent:${parentId}` : `item:${bp.id}`;
 
           if (!productGroups[groupKey]) {
@@ -342,6 +295,8 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
               id: parentId || bp.id,
               baseName,
               items: [],
+              parentItem: null,
+              childItems: [],
               price: parseFloat(sourceForTitle.preco || bp.preco || '99.90'),
               category,
               subcategory,
@@ -349,11 +304,13 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           }
 
           if (parentId && bp.id === parentId) {
+            productGroups[groupKey].parentItem = bp;
             productGroups[groupKey].items.unshift(bp);
             if (bp.preco && parseFloat(bp.preco) > 0) {
               productGroups[groupKey].price = parseFloat(bp.preco);
             }
           } else {
+            productGroups[groupKey].childItems.push(bp);
             productGroups[groupKey].items.push(bp);
           }
         });
@@ -453,53 +410,6 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             continue;
           }
 
-          // Build sizes array from item variants
-          const sizesList: string[] = [];
-          group.items.forEach(it => {
-            const parts = (it.nome || '').split(':');
-            if (parts.length > 1) {
-              const sz = parts[1].trim();
-              if (sz && !sizesList.includes(sz)) sizesList.push(sz);
-            }
-          });
-
-          // Determine sizes: If item has variants, sort them cleanly. If no size variations, use 'Tamanho Único'.
-          let finalSizes: string[] = [];
-          if (sizesList.length > 0) {
-            const isNumericSizes = sizesList.every(s => !isNaN(Number(s)));
-            if (isNumericSizes) {
-              finalSizes = [...sizesList].sort((a, b) => Number(a) - Number(b));
-            } else {
-              const clothesOrder = ['PP', 'P', 'M', 'G', 'GG', 'XG', 'XGG', 'G1', 'G2', 'G3', 'G4'];
-              finalSizes = [...sizesList].sort((a, b) => {
-                const idxA = clothesOrder.indexOf(a.toUpperCase());
-                const idxB = clothesOrder.indexOf(b.toUpperCase());
-                if (idxA !== -1 && idxB !== -1) return idxA - idxB;
-                return a.localeCompare(b);
-              });
-            }
-          } else {
-            // Pieces without size variants (sunglasses, watches, hats, single-sized items)
-            finalSizes = ['Tamanho Único'];
-          }
-
-          // Determine real colors from item names and variants
-          const detectedColorsMap = new Map<string, { name: string; hex: string }>();
-          group.items.forEach(it => {
-            const colorFound = detectColorFromName(it.nome || '');
-            if (colorFound) {
-              detectedColorsMap.set(colorFound.name, colorFound);
-            }
-          });
-
-          let finalColors: { name: string; hex: string }[] = [];
-          if (detectedColorsMap.size > 0) {
-            finalColors = Array.from(detectedColorsMap.values());
-          } else {
-            // Single color piece or uniform color
-            finalColors = [{ name: 'Cor Única', hex: '#1C1C1C' }];
-          }
-
           const resolveItemStock = (it: any): number => {
             if (realStockMap.has(Number(it.id))) {
               return realStockMap.get(Number(it.id))!;
@@ -511,20 +421,33 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             return stockApiQueried ? 0 : 0;
           };
 
-          const variantsList = group.items.map(it => {
-            const szParts = (it.nome || '').split(':');
-            const vSize = szParts.length > 1 ? szParts[1].trim() : (finalSizes[0] || 'Tamanho Único');
+          // Exclude the parent container item whenever real child variations exist so parent 0-stock/name never pollutes variantsList
+          const effectiveItems = group.childItems.length > 0 ? group.childItems : group.items;
+
+          const parsedVariants = effectiveItems.map(it => {
+            const meta = parseBlingVariantMeta({
+              nome: it.nome || '',
+              variacaoNome: it.variacao?.nome || '',
+              isParentContainer: group.childItems.length === 0 && (it.formato === 'V' || referencedParentIds.has(it.id)),
+            });
             const vStock = resolveItemStock(it);
             return {
-              id: it.id,
-              sku: it.codigo || `${groupSku}-${vSize}`,
-              price: parseFloat(it.preco || String(group.price || '119.90')),
+              item: it,
+              meta,
               stock: vStock,
-              size: vSize
             };
           });
 
-          // Total stock across parent/variants
+          const variantsList = parsedVariants.map(({ item: it, meta, stock: vStock }) => ({
+            id: it.id,
+            sku: it.codigo || `${groupSku}-${meta.size}`,
+            price: parseFloat(it.preco || String(group.price || '119.90')),
+            stock: vStock,
+            size: meta.size,
+            ...(meta.color?.name ? { color: meta.color.name } : {}),
+          }));
+
+          // Total stock across actual sellable items/variants
           const totalStock = variantsList.reduce((acc, v) => acc + Math.max(0, v.stock), 0);
 
           // Automatically hide out-of-stock products from the storefront
@@ -537,11 +460,25 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             continue;
           }
 
-          // Keep only in-stock sizes if product has size variations
-          const inStockSizes = sizesList.length > 0
-            ? finalSizes.filter(sz => variantsList.some(v => v.size === sz && v.stock > 0))
-            : finalSizes;
-          const activeSizes = inStockSizes.length > 0 ? inStockSizes : finalSizes;
+          // Strictly display ONLY sizes registered with stock > 0, sorted in canonical ascending order
+          const inStockParsed = parsedVariants.filter(pv => pv.stock > 0);
+          const hasExplicitSizes = parsedVariants.some(pv => pv.meta.hasExplicitSize);
+          const activeSizes = hasExplicitSizes
+            ? sortSizes(inStockParsed.map(pv => pv.meta.size))
+            : ['Tamanho Único'];
+
+          if (hasExplicitSizes && activeSizes.length === 0) {
+            continue;
+          }
+
+          // Determine real colors strictly from in-stock sellable variants (never polluted by 0-stock variants or parent wash keywords)
+          const rawVariantColors = inStockParsed
+            .map(pv => pv.meta.color)
+            .filter((c): c is { name: string; hex: string } => Boolean(c));
+          const fallbackBaseColor = rawVariantColors.length === 0 ? detectColorFromName(group.baseName) : null;
+          const finalColors = normalizeColorOptions(
+            rawVariantColors.length > 0 ? rawVariantColors : (fallbackBaseColor ? [fallbackBaseColor] : [])
+          );
 
           // Select images: 1. Full-res live/cached midia.imagens.internas[0].link -> 2. Studio HD cutouts -> 3. List fallback -> 4. Crisp SVG brand card
           const cachedBlingImages = getBlingImagesForProduct({
@@ -724,17 +661,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
 
     // Helper to extract base product name (strips variation labels, sizes, colors)
     function extractBaseProductName(rawName: string): string {
-      let name = (rawName || '').trim();
-      if (name.includes(' // ')) {
-        name = name.split(' // ')[0].trim();
-      }
-      if (name.includes(': ')) {
-        name = name.split(': ')[0].trim();
-      }
-      if (name.includes(' - Tam')) {
-        name = name.split(' - Tam')[0].trim();
-      }
-      return name;
+      return parseBlingVariantMeta({ nome: rawName, isParentContainer: true }).baseName || rawName;
     }
 
     // DEDUPLICATION & STOCK AGGREGATION ENGINE
@@ -746,32 +673,40 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
       const key = blingKey || extractBaseProductName(item.name).toLowerCase().replace(/\s+/g, ' ');
 
       if (!consolidatedMap.has(key)) {
+        const variants = Array.isArray(item.variantsList) ? [...item.variantsList] : [];
+        const inStockSizesFromVars = sortSizes(
+          variants.filter((v: any) => (v?.stock ?? 0) > 0 && v?.size).map((v: any) => String(v.size))
+        );
         consolidatedMap.set(key, {
           ...item,
           name: extractBaseProductName(item.name) || item.name,
           stockCount: typeof item.stockCount === 'number' ? item.stockCount : 0,
-          sizes: Array.isArray(item.sizes) && item.sizes.length > 0 ? [...item.sizes] : ['Tamanho Único'],
-          colors: Array.isArray(item.colors) && item.colors.length > 0 ? [...item.colors] : [{ name: 'Padrão', hex: '#111111' }],
+          sizes: inStockSizesFromVars.length > 0
+            ? inStockSizesFromVars
+            : (Array.isArray(item.sizes) && item.sizes.length > 0 ? sortSizes(item.sizes) : ['Tamanho Único']),
+          colors: normalizeColorOptions(Array.isArray(item.colors) ? item.colors : []),
           images: Array.isArray(item.images) ? [...item.images] : [],
-          variantsList: Array.isArray(item.variantsList) ? [...item.variantsList] : []
+          variantsList: variants
         });
       } else {
         const canonical = consolidatedMap.get(key);
         canonical.stockCount += (typeof item.stockCount === 'number' ? item.stockCount : 0);
 
-        if (Array.isArray(item.sizes)) {
-          item.sizes.forEach((sz: string) => {
-            if (!canonical.sizes.includes(sz)) canonical.sizes.push(sz);
-          });
+        if (Array.isArray(item.variantsList)) {
+          canonical.variantsList.push(...item.variantsList);
         }
 
-        if (Array.isArray(item.colors)) {
-          item.colors.forEach((col: any) => {
-            if (!canonical.colors.some((ex: any) => ex.name === col.name)) {
-              canonical.colors.push(col);
-            }
-          });
-        }
+        const inStockVars = canonical.variantsList.filter((v: any) => (v?.stock ?? 0) > 0);
+        const aggregatedSizes = inStockVars.length > 0
+          ? sortSizes(inStockVars.map((v: any) => String(v.size || '')).filter(Boolean))
+          : sortSizes([...(canonical.sizes || []), ...(Array.isArray(item.sizes) ? item.sizes : [])]);
+        canonical.sizes = aggregatedSizes.length > 0 ? aggregatedSizes : ['Tamanho Único'];
+
+        const combinedColors = [
+          ...(Array.isArray(canonical.colors) ? canonical.colors : []),
+          ...(Array.isArray(item.colors) ? item.colors : []),
+        ];
+        canonical.colors = normalizeColorOptions(combinedColors);
 
         if (Array.isArray(item.images)) {
           const allCombined = [...canonical.images.map((u: string) => stripResizeAndCompressionParams(u))];
@@ -786,10 +721,6 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           const pool = nativeBlingOnly.length > 0 ? nativeBlingOnly : (realOnly.length > 0 ? realOnly : allCombined);
           const nonThumb = pool.filter((img: string) => !isThumbnailLikeUrl(img));
           canonical.images = (nonThumb.length > 0 ? nonThumb : pool).slice(0, 8);
-        }
-
-        if (Array.isArray(item.variantsList)) {
-          canonical.variantsList.push(...item.variantsList);
         }
 
         if (canonical.stockCount > 0 && canonical.tag === 'SEM ESTOQUE') {

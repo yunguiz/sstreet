@@ -9,6 +9,13 @@ import {
   BLING_OFFICIAL_API_BASE,
   BLING_API_BASE,
 } from './blingToken.js';
+import {
+  detectColorFromText,
+  inferStoreCategory,
+  normalizeColorName,
+  parseBlingVariantMeta,
+  sortSizes,
+} from '../src/lib/catalogVariants.js';
 
 export { BLING_OFFICIAL_API_BASE, BLING_API_BASE };
 
@@ -334,31 +341,24 @@ function inferCategory(item: BlingProdutoRaw): {
   subcategoriaStore: 'hoodies' | 'camisetas' | 'calcas' | 'shorts' | 'sneakers' | 'bones' | 'bags' | 'acessorios-metal';
 } {
   const rawDesc = String(item.categoria?.descricao || '').trim();
-  const lower = `${rawDesc} ${String(item.nome || '')}`.toLowerCase();
+  const { category, subcategory } = inferStoreCategory(String(item.nome || ''), rawDesc);
 
-  if (/\b(boné|bone|bucket|gorro|touca)\b/i.test(lower)) {
-    return { label: rawDesc || 'Acessórios', categoriaStore: 'acessorios', subcategoriaStore: 'bones' };
-  }
-  if (/\b(bag|shoulder|mochila|pochete|mala)\b/i.test(lower)) {
-    return { label: rawDesc || 'Acessórios', categoriaStore: 'acessorios', subcategoriaStore: 'bags' };
-  }
-  if (/\b(oculos|óculos|radar|juliet|penny|oakley|cartier|cinto|carteira|relogio|relógio|corrente|meia|cadarco|cadarço)\b/i.test(lower)) {
-    return { label: rawDesc || 'Acessórios', categoriaStore: 'acessorios', subcategoriaStore: 'acessorios-metal' };
-  }
-  if (/\b(tenis|tênis|sneaker|chinelo|bota|sandalia|sapato|dunk|jordan|air max|yeezy)\b/i.test(lower)) {
-    return { label: rawDesc || 'Calçados', categoriaStore: 'calcados', subcategoriaStore: 'sneakers' };
-  }
-  if (/\b(moletom|hoodie|jaqueta|corta vento|bobojoco|casaco)\b/i.test(lower)) {
-    return { label: rawDesc || 'Moletons & Jaquetas', categoriaStore: 'roupas', subcategoriaStore: 'hoodies' };
-  }
-  if (/\b(calca|calça|cargo|jogger|jeans)\b/i.test(lower)) {
-    return { label: rawDesc || 'Calças', categoriaStore: 'roupas', subcategoriaStore: 'calcas' };
-  }
-  if (/\b(bermuda|short)\b/i.test(lower)) {
-    return { label: rawDesc || 'Bermudas & Shorts', categoriaStore: 'roupas', subcategoriaStore: 'shorts' };
-  }
+  const labelBySubcategory: Record<string, string> = {
+    bones: 'Acessórios',
+    bags: 'Acessórios',
+    'acessorios-metal': 'Acessórios',
+    sneakers: 'Calçados',
+    hoodies: 'Moletons & Jaquetas',
+    calcas: 'Calças',
+    shorts: 'Bermudas & Shorts',
+    camisetas: 'Camisetas & Vestuário',
+  };
 
-  return { label: rawDesc || 'Camisetas & Vestuário', categoriaStore: 'roupas', subcategoriaStore: 'camisetas' };
+  return {
+    label: rawDesc || labelBySubcategory[subcategory] || 'Camisetas & Vestuário',
+    categoriaStore: category,
+    subcategoriaStore: subcategory,
+  };
 }
 
 function parseVariantMeta(item: BlingProdutoRaw): {
@@ -366,55 +366,17 @@ function parseVariantMeta(item: BlingProdutoRaw): {
   size: string;
   color: string;
 } {
-  const fullName = String(item.nome || '').trim();
-  const varLabel = String(item.variacao?.nome || '').trim();
-
-  let baseName = fullName;
-  if (baseName.includes(' // ')) {
-    baseName = baseName.split(' // ')[0].trim();
-  } else if (baseName.includes(': ')) {
-    baseName = baseName.split(': ')[0].trim();
-  } else if (baseName.includes(' - Tam')) {
-    baseName = baseName.split(' - Tam')[0].trim();
-  }
-
-  let size = '';
-  if (varLabel) {
-    const tamMatch = varLabel.match(/(?:tamanho|tam|size)\s*[:=]\s*([^;|,/]+)/i);
-    if (tamMatch?.[1]) {
-      size = tamMatch[1].trim();
-    } else if (/^(PP|P|M|G|GG|XG|XGG|XXG|G[1-4]|Único|Unico|\d{2})$/i.test(varLabel)) {
-      size = varLabel;
-    }
-  }
-
-  if (!size && fullName.includes(':')) {
-    const afterColon = fullName.split(':').slice(1).join(':').trim();
-    if (afterColon && afterColon.length <= 24) {
-      size = afterColon.replace(/^tam(?:anho)?\s*/i, '').trim();
-    }
-  }
-
-  if (!size) {
-    const endSizeMatch = fullName.match(/\b(PP|P|M|G|GG|XG|XGG|G[1-4]|3[4-9]|4[0-6])\s*$/i);
-    if (endSizeMatch?.[1]) {
-      size = endSizeMatch[1].toUpperCase();
-    }
-  }
-
-  let color = '';
-  const colorSource = `${varLabel} ${fullName}`;
-  const colorMatch = colorSource.match(
-    /\b(preto|preta|branco|branca|off[- ]?white|cinza|chumbo|grafite|azul|marinho|verde|militar|vermelho|vermelha|rosa|roxo|bege|caqui|marrom|laranja|amarelo)\b/i
-  );
-  if (colorMatch?.[1]) {
-    color = colorMatch[1].charAt(0).toUpperCase() + colorMatch[1].slice(1).toLowerCase();
-  }
+  const isParent = item.formato === 'V' && !item.idProdutoPai;
+  const parsed = parseBlingVariantMeta({
+    nome: item.nome,
+    variacaoNome: item.variacao?.nome,
+    isParentContainer: isParent,
+  });
 
   return {
-    baseName: baseName || fullName || `Produto ${item.id}`,
-    size: size || 'Único',
-    color: color || 'Padrão',
+    baseName: parsed.baseName || `Produto ${item.id}`,
+    size: parsed.size,
+    color: parsed.color?.name || 'Padrão',
   };
 }
 
@@ -878,18 +840,40 @@ export async function syncBlingProdutosPageToFirestore(
       const existingSizes = Array.isArray(existingData?.tamanhos)
         ? (existingData.tamanhos as string[]).filter((s) => typeof s === 'string' && s.trim() !== '')
         : [];
-      const sizeSet = new Set<string>([...existingSizes, ...Array.from(group.sizes)]);
-      if (sizeSet.size > 1 && sizeSet.has('Único')) {
-        sizeSet.delete('Único');
-      }
+      const inStockVarSizes = mergedVariacoesList
+        .filter((v) => Number(v?.estoque ?? 0) > 0 && v?.tamanho)
+        .map((v) => String(v.tamanho));
+      const activeTamanhos =
+        mergedVariacoesList.length > 0
+          ? sortSizes(inStockVarSizes)
+          : sortSizes([...existingSizes, ...Array.from(group.sizes)]);
 
       const existingColors = Array.isArray(existingData?.cores)
         ? (existingData.cores as string[]).filter((c) => typeof c === 'string' && c.trim() !== '')
         : [];
-      const colorSet = new Set<string>([...existingColors, ...Array.from(group.colors)]);
-      if (colorSet.size > 1 && colorSet.has('Padrão')) {
-        colorSet.delete('Padrão');
-      }
+      const inStockVarColors = mergedVariacoesList
+        .filter((v) => Number(v?.estoque ?? 0) > 0)
+        .map((v) => {
+          const parsedVar = parseBlingVariantMeta({ nome: v.nome || '', isParentContainer: false });
+          return parsedVar.color?.name || normalizeColorName(String(v.cor || ''));
+        })
+        .filter(Boolean);
+      const fallbackTitleColor =
+        inStockVarColors.length === 0
+          ? detectColorFromText(String(group.nome || existingData?.nome || ''))?.name || ''
+          : '';
+      const activeCores = Array.from(
+        new Set(
+          (inStockVarColors.length > 0
+            ? inStockVarColors
+            : [
+                ...Array.from(group.colors).map((c) => normalizeColorName(c)),
+                ...existingColors.map((c) => normalizeColorName(c)),
+                fallbackTitleColor,
+              ]
+          ).filter(Boolean)
+        )
+      );
 
       const payload: Record<string, unknown> = {
         blingId: group.blingId,
@@ -943,11 +927,9 @@ export async function syncBlingProdutosPageToFirestore(
         }
       }
 
-      if (sizeSet.size > 0) {
-        payload.tamanhos = Array.from(sizeSet);
-      }
-      if (colorSet.size > 0) {
-        payload.cores = Array.from(colorSet);
+      payload.tamanhos = activeTamanhos;
+      if (activeCores.length > 0) {
+        payload.cores = activeCores;
       }
       if (mergedVariacoesList.length > 0) {
         payload.variacoes = mergedVariacoes;
