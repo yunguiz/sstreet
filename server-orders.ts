@@ -32,6 +32,8 @@ export interface StoredOrder {
   trackingUrl?: string | null;
   paymentMethod: string;
   paymentId: string | number;
+  endToEndId?: string;
+  source?: string;
   blingOrderId?: number;
   blingOrderNumber?: number;
   melhorEnvioCartId?: string;
@@ -528,6 +530,11 @@ export async function createStoreOrder(params: {
   shippingCarrier?: string;
   paymentMethod: string;
   paymentId: string | number;
+  endToEndId?: string;
+  source?: string;
+  paidAt?: string;
+  skipBling?: boolean;
+  skipMelhorEnvio?: boolean;
   total: number;
 }): Promise<{
   success: boolean;
@@ -540,8 +547,8 @@ export async function createStoreOrder(params: {
 }> {
   const existing = await findExistingOrderByPaymentId(params.paymentId);
   if (existing) {
-    // If previous save missed Bling sync, retry Bling sync idempotently
-    if (!existing.blingOrderId) {
+    // If previous save missed Bling sync and skipBling is false, retry Bling sync idempotently
+    if (!existing.blingOrderId && !params.skipBling) {
       const blingSync = await syncOrderToBling({
         orderNumber: existing.orderNumber,
         paymentMethod: existing.paymentMethod,
@@ -584,7 +591,7 @@ export async function createStoreOrder(params: {
 
   const orderId = await getNextOrderSequence();
   const orderNumber = `#${orderId}`;
-  const nowIso = new Date().toISOString();
+  const nowIso = params.paidAt || new Date().toISOString();
 
   const newOrder: StoredOrder = {
     orderId,
@@ -597,6 +604,8 @@ export async function createStoreOrder(params: {
     trackingUrl: null,
     paymentMethod: params.paymentMethod,
     paymentId: String(params.paymentId),
+    ...(params.endToEndId ? { endToEndId: params.endToEndId } : {}),
+    ...(params.source ? { source: params.source } : {}),
     customer: {
       name: params.customer.name?.trim() || 'Cliente Street Store',
       email: params.customer.email,
@@ -630,29 +639,31 @@ export async function createStoreOrder(params: {
     shippedAt: null,
   };
 
-  // Sync order to Bling ERP
-  try {
-    const blingSync = await syncOrderToBling({
-      orderNumber,
-      paymentMethod: params.paymentMethod,
-      paymentId: params.paymentId,
-      customer: newOrder.customer,
-      items: params.items || [],
-      shippingAddress: params.shippingAddress,
-      total: newOrder.total,
-      nowIso,
-    });
-    if (blingSync.blingOrderId) {
-      newOrder.blingOrderId = blingSync.blingOrderId;
-      newOrder.blingOrderNumber = blingSync.blingOrderNumber;
+  // Sync order to Bling ERP unless skipped (e.g. manual historical reconciliation)
+  if (!params.skipBling) {
+    try {
+      const blingSync = await syncOrderToBling({
+        orderNumber,
+        paymentMethod: params.paymentMethod,
+        paymentId: params.paymentId,
+        customer: newOrder.customer,
+        items: params.items || [],
+        shippingAddress: params.shippingAddress,
+        total: newOrder.total,
+        nowIso,
+      });
+      if (blingSync.blingOrderId) {
+        newOrder.blingOrderId = blingSync.blingOrderId;
+        newOrder.blingOrderNumber = blingSync.blingOrderNumber;
+      }
+    } catch (blingErr: any) {
+      console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP:', blingErr?.message || blingErr);
     }
-  } catch (blingErr: any) {
-    console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP:', blingErr?.message || blingErr);
   }
 
   // Register shipment in Melhor Envio Cart if connected & address provided
   let melhorEnvioCartId: string | undefined;
-  if (params.shippingAddress?.zip && params.shippingAddress?.street) {
+  if (!params.skipMelhorEnvio && params.shippingAddress?.zip && params.shippingAddress?.street) {
     try {
       const meCart = await addOrderToMelhorEnvioCart({
         serviceId: params.shippingServiceId || 1,

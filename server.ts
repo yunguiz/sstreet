@@ -1539,6 +1539,25 @@ function calculateCRC16(payload: string): string {
   return crc.toString(16).toUpperCase().padStart(4, '0');
 }
 
+function resolveStorePixKey(): string {
+  const raw = (process.env.PIX_KEY || '+5531984806556').trim();
+  if (!raw) return '+5531984806556';
+  if (raw.includes('@') || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
+    return raw;
+  }
+  if (raw.startsWith('+')) {
+    return `+${raw.replace(/\D/g, '')}`;
+  }
+  const digits = raw.replace(/\D/g, '');
+  if (digits === '31984806556' || digits === '5531984806556' || (digits.length >= 12 && digits.startsWith('55'))) {
+    return digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
+  }
+  if (/[()\s-]/.test(raw) && (digits.length === 10 || digits.length === 11)) {
+    return `+55${digits}`;
+  }
+  return raw;
+}
+
 function generatePixBRCode(params: {
   pixKey: string;
   merchantName: string;
@@ -1549,7 +1568,7 @@ function generatePixBRCode(params: {
   const { pixKey, merchantName, merchantCity, amount, txId = 'STREETSTORE' } = params;
   const formattedAmount = amount.toFixed(2);
   const f00 = formatEMV('00', '01');
-  const f01 = formatEMV('01', '12');
+  const f01 = formatEMV('01', '11');
   const gui = formatEMV('00', 'br.gov.bcb.pix');
   const key = formatEMV('01', pixKey);
   const f26 = formatEMV('26', `${gui}${key}`);
@@ -1680,7 +1699,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
 
     // Generate 100% native in-app BACEN EMV BR Code QR Code for Street Store:
     console.log('Generating 100% in-app transparent Pix QR Code...');
-    const pixKey = process.env.PIX_KEY || 'streetstore364@gmail.com';
+    const pixKey = resolveStorePixKey();
     const txId = `ST${Date.now().toString().slice(-8)}`;
     const emvString = generatePixBRCode({
       pixKey,
