@@ -7,6 +7,7 @@ import { ProductCard } from './ProductCard';
 import { db, handleFirestoreError, OperationType } from '../lib/firebase';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
+import { matchesBrandFilter } from '../data/brands';
 
 interface CatalogSectionProps {
   products: Product[];
@@ -111,8 +112,17 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
   const rawOriginal = Number(data.originalPrice ?? 0);
   const originalPrice = Number.isFinite(rawOriginal) && rawOriginal > price ? rawOriginal : Math.round(price * 1.25);
 
+  const variacoesObj =
+    data.variacoes && typeof data.variacoes === 'object' && !Array.isArray(data.variacoes)
+      ? (data.variacoes as Record<string, Record<string, unknown>>)
+      : null;
+
+  const variacoesStock = variacoesObj
+    ? Object.values(variacoesObj).reduce((sum, v) => sum + Math.max(0, Number(v?.estoque ?? 0) || 0), 0)
+    : 0;
   const rawStock = Number(data.estoque ?? data.stockCount ?? 0);
-  const stockCount = Number.isFinite(rawStock) ? Math.max(0, rawStock) : 0;
+  const directStock = Number.isFinite(rawStock) ? Math.max(0, rawStock) : 0;
+  const stockCount = variacoesObj ? Math.max(variacoesStock, directStock) : directStock;
 
   const rawImages: string[] = [];
   if (Array.isArray(data.imagens)) {
@@ -168,11 +178,6 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
     .filter((c): c is { name: string; hex: string } => Boolean(c));
 
   const finalColors = colors.length > 0 ? colors : [{ name: 'Padrão', hex: '#1C1C1C' }];
-
-  const variacoesObj =
-    data.variacoes && typeof data.variacoes === 'object' && !Array.isArray(data.variacoes)
-      ? (data.variacoes as Record<string, Record<string, unknown>>)
-      : null;
 
   const variantsList = variacoesObj
     ? Object.values(variacoesObj).map((v) => ({
@@ -286,33 +291,32 @@ export function CatalogSection({
     return () => unsubscribe();
   }, []);
 
-  // Merge API & Firestore products so newest drops and highest-resolution images always win
+  // Merge API & Firestore products so newest drops, complete inventory, and highest-resolution images always win
   const catalogSourceProducts = useMemo(() => {
-    const apiByBlingId = new Map<string, Product>();
-    for (const ap of products) {
-      const bid = String(ap.integration?.blingId || ap.id || '').replace(/^bling-/, '');
-      if (bid) apiByBlingId.set(bid, ap);
+    const mergedByKey = new Map<string, Product>();
+    const getKey = (p: Product) =>
+      String(p.integration?.blingId || p.id || '').replace(/^bling-/, '').trim() || p.name;
+
+    for (const fp of firestoreProducts) {
+      mergedByKey.set(getKey(fp), fp);
     }
 
-    const baseList =
-      products.length > 0 && products.length >= firestoreProducts.length
-        ? products
-        : firestoreProducts.length > 0
-          ? firestoreProducts.map((fp) => {
-              const bid = String(fp.integration?.blingId || fp.id || '').replace(/^bling-/, '');
-              const apiMatch = bid ? apiByBlingId.get(bid) : undefined;
-              if (apiMatch && apiMatch.images?.length > 0) {
-                const fpHasGood = fp.images?.some((u) => !isLowResOrBrokenImage(u));
-                const apiHasGood = apiMatch.images?.some((u) => !isLowResOrBrokenImage(u));
-                if (!fpHasGood && apiHasGood) {
-                  return { ...fp, images: apiMatch.images };
-                }
-              }
-              return fp;
-            })
-          : products;
+    for (const ap of products) {
+      const key = getKey(ap);
+      const existingFp = mergedByKey.get(key);
+      if (!existingFp) {
+        mergedByKey.set(key, ap);
+      } else {
+        const apiHasGood = ap.images?.some((u) => !isLowResOrBrokenImage(u));
+        const fpHasGood = existingFp.images?.some((u) => !isLowResOrBrokenImage(u));
+        mergedByKey.set(key, {
+          ...ap,
+          images: !apiHasGood && fpHasGood ? existingFp.images : ap.images,
+        });
+      }
+    }
 
-    return [...baseList].sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
+    return Array.from(mergedByKey.values()).sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
   }, [products, firestoreProducts]);
 
   // Reset pagination whenever user changes category, subcategory, brand, or sort
@@ -331,14 +335,9 @@ export function CatalogSection({
   const filteredProducts = useMemo(() => {
     let list = catalogSourceProducts.filter(p => (p.stockCount ?? 0) > 0);
 
-    // Filter by brand name if active
+    // Filter by brand name & aliases if active
     if (brandFilter) {
-      const q = brandFilter.toLowerCase().trim();
-      list = list.filter(p =>
-        (p.name || '').toLowerCase().includes(q) ||
-        (p.description || '').toLowerCase().includes(q) ||
-        (p.integration?.sku || '').toLowerCase().includes(q)
-      );
+      list = list.filter(p => matchesBrandFilter(p, brandFilter));
     }
 
     // Filter by main category & subcategory
@@ -477,13 +476,35 @@ export function CatalogSection({
             </div>
           ) : filteredProducts.length === 0 ? (
             <div className="py-16 text-center space-y-3 bg-[#111111] rounded-xl border border-dashed border-zinc-800 p-8">
-              <p className="text-base font-bold text-white">Nenhum produto nesta categoria no momento.</p>
-              <button
-                onClick={() => onSelectCategory('all')}
-                className="px-5 py-2 bg-[#E50914] text-white text-xs font-bold rounded-lg uppercase tracking-wider cursor-pointer"
-              >
-                Ver Todos os Drops
-              </button>
+              <p className="text-base font-bold text-white">
+                {brandFilter
+                  ? `Nenhum produto disponível para "${brandFilter}" nesta categoria no momento.`
+                  : 'Nenhum produto nesta categoria no momento.'}
+              </p>
+              <div className="flex items-center justify-center gap-3 flex-wrap">
+                {brandFilter && onClearBrandFilter && (
+                  <button
+                    onClick={() => {
+                      onClearBrandFilter();
+                      onSelectCategory('all');
+                    }}
+                    className="px-5 py-2 bg-[#E50914] text-white text-xs font-bold rounded-lg uppercase tracking-wider cursor-pointer"
+                  >
+                    Ver Todos os Drops
+                  </button>
+                )}
+                {(!brandFilter || activeCategory !== 'all') && (
+                  <button
+                    onClick={() => {
+                      if (!brandFilter) onClearBrandFilter?.();
+                      onSelectCategory('all');
+                    }}
+                    className="px-5 py-2 bg-zinc-800 hover:bg-zinc-700 text-white text-xs font-bold rounded-lg uppercase tracking-wider cursor-pointer"
+                  >
+                    {brandFilter ? `Ver Todas as Peças da ${brandFilter}` : 'Ver Todos os Drops'}
+                  </button>
+                )}
+              </div>
             </div>
           ) : (
             <>

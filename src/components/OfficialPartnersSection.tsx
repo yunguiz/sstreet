@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { 
   ShieldCheck, 
   ChevronLeft, 
@@ -12,13 +12,15 @@ import {
   Flame
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { OFFICIAL_BRANDS, OfficialBrand } from '../data/brands';
+import { OFFICIAL_BRANDS, OfficialBrand, matchesBrandFilter } from '../data/brands';
+import { Product } from '../types';
 
 interface OfficialPartnersSectionProps {
+  products?: Product[];
   onSelectBrandSearch?: (query: string) => void;
 }
 
-export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartnersSectionProps) {
+export function OfficialPartnersSection({ products = [], onSelectBrandSearch }: OfficialPartnersSectionProps) {
   const [activeCategory, setActiveCategory] = useState<'all' | 'tenis' | 'roupas'>('all');
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isPaused, setIsPaused] = useState(false);
@@ -29,14 +31,32 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
   const glareRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);
 
-  const filteredBrands = activeCategory === 'all' 
-    ? OFFICIAL_BRANDS 
-    : OFFICIAL_BRANDS.filter((b) => b.category === activeCategory);
+  const brandCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    const inStockProducts = products.filter((p) => (p.stockCount ?? 0) > 0);
+    for (const brand of OFFICIAL_BRANDS) {
+      const count = inStockProducts.filter((p) => matchesBrandFilter(p, brand.name)).length;
+      counts.set(brand.id, count);
+    }
+    return counts;
+  }, [products]);
 
-  // Keep index within bounds when switching category
+  const availableBrands = useMemo(() => {
+    if (products.length === 0) return OFFICIAL_BRANDS;
+    const withStock = OFFICIAL_BRANDS.filter((b) => (brandCounts.get(b.id) ?? 0) > 0);
+    return withStock.length > 0 ? withStock : OFFICIAL_BRANDS;
+  }, [products.length, brandCounts]);
+
+  const filteredBrands = useMemo(() => {
+    return activeCategory === 'all'
+      ? availableBrands
+      : availableBrands.filter((b) => b.category === activeCategory);
+  }, [activeCategory, availableBrands]);
+
+  // Keep index within bounds when switching category or brand list updates
   useEffect(() => {
-    setCurrentIndex(0);
-  }, [activeCategory]);
+    setCurrentIndex((prev) => (filteredBrands.length > 0 && prev >= filteredBrands.length ? 0 : prev));
+  }, [activeCategory, filteredBrands.length]);
 
   // Autoplay slider every 4.5 seconds
   useEffect(() => {
@@ -151,18 +171,24 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
           {/* Category Tabs: Todas / Tênis / Roupas */}
           <div className="pt-3 flex items-center justify-center gap-2 flex-wrap">
             <button
-              onClick={() => setActiveCategory('all')}
+              onClick={() => {
+                setCurrentIndex(0);
+                setActiveCategory('all');
+              }}
               className={`px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
                 activeCategory === 'all'
                   ? 'bg-white text-black shadow-lg font-black'
                   : 'bg-[#161616] text-zinc-400 hover:text-white border border-zinc-800'
               }`}
             >
-              Todas as Marcas ({OFFICIAL_BRANDS.length})
+              Todas as Marcas ({availableBrands.length})
             </button>
 
             <button
-              onClick={() => setActiveCategory('tenis')}
+              onClick={() => {
+                setCurrentIndex(0);
+                setActiveCategory('tenis');
+              }}
               className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
                 activeCategory === 'tenis'
                   ? 'bg-[#E50914] text-white shadow-lg shadow-red-950/60 font-black'
@@ -174,7 +200,10 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
             </button>
 
             <button
-              onClick={() => setActiveCategory('roupas')}
+              onClick={() => {
+                setCurrentIndex(0);
+                setActiveCategory('roupas');
+              }}
               className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold uppercase tracking-wider transition-all cursor-pointer ${
                 activeCategory === 'roupas'
                   ? 'bg-[#E50914] text-white shadow-lg shadow-red-950/60 font-black'
@@ -182,7 +211,7 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
               }`}
             >
               <span>👕 Roupas & Streetwear</span>
-              <span className="text-[10px] opacity-80">(Chronic, Tripside, Fire, Anth Co...)</span>
+              <span className="text-[10px] opacity-80">(Chronic, Trip Side, Compton, Oncross...)</span>
             </button>
           </div>
         </motion.div>
@@ -372,11 +401,15 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
                         onClick={(e) => {
                           e.preventDefault();
                           e.stopPropagation();
-                          handleBrandClick(currentBrand.searchQuery);
+                          handleBrandClick(currentBrand.name);
                         }}
                         className="group/cta relative z-30 inline-flex items-center gap-2.5 px-6 py-3.5 rounded-xl bg-white hover:bg-zinc-100 active:scale-95 text-black font-black text-xs uppercase tracking-wider transition-all duration-300 shadow-xl cursor-pointer hover:shadow-2xl hover:shadow-white/20 pointer-events-auto"
                       >
-                        <span className="pointer-events-none">Ver Peças da {currentBrand.name}</span>
+                        <span className="pointer-events-none">
+                          {products.length > 0 && (brandCounts.get(currentBrand.id) ?? 0) > 0
+                            ? `Ver ${brandCounts.get(currentBrand.id)} Peças da ${currentBrand.name}`
+                            : `Ver Peças da ${currentBrand.name}`}
+                        </span>
                         <ArrowRight className="w-4 h-4 text-black transition-transform duration-300 group-hover/cta:translate-x-1.5 pointer-events-none" />
                       </button>
                     </div>
@@ -460,13 +493,16 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
           </div>
 
           <div className="flex overflow-x-auto no-scrollbar gap-3 pb-2 -mx-4 px-4 sm:mx-0 sm:px-0 sm:flex-wrap sm:justify-center">
-            {OFFICIAL_BRANDS.map((brand, idx) => (
+            {availableBrands.map((brand, idx) => {
+              const liveCount = brandCounts.get(brand.id) ?? 0;
+              return (
               <button
                 key={brand.id}
+                type="button"
                 onClick={() => {
                   const targetIdx = filteredBrands.findIndex(b => b.id === brand.id);
                   if (targetIdx !== -1) setCurrentIndex(targetIdx);
-                  handleBrandClick(brand.searchQuery);
+                  handleBrandClick(brand.name);
                 }}
                 className="group shrink-0 px-4 py-2.5 rounded-xl bg-[#141414] hover:bg-[#1A1A1A] border border-zinc-800 transition-all duration-300 cursor-pointer flex items-center gap-2 text-left hover:-translate-y-1 hover:scale-105 active:scale-95"
                 onMouseEnter={(e) => {
@@ -491,10 +527,13 @@ export function OfficialPartnersSection({ onSelectBrandSearch }: OfficialPartner
                     color: brand.accentColor
                   }}
                 >
-                  {brand.category === 'tenis' ? 'Tênis' : 'Street'}
+                  {products.length > 0 && liveCount > 0
+                    ? `${liveCount} ${liveCount === 1 ? 'peça' : 'peças'}`
+                    : brand.category === 'tenis' ? 'Tênis' : 'Street'}
                 </span>
               </button>
-            ))}
+              );
+            })}
           </div>
         </div>
 

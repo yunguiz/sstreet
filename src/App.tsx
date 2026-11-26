@@ -307,8 +307,10 @@ function StorefrontApp() {
   };
 
   const scrollToCatalog = () => {
-    const el = document.getElementById('catalogo');
-    if (el) el.scrollIntoView({ behavior: 'smooth' });
+    requestAnimationFrame(() => {
+      const el = document.getElementById('catalogo');
+      if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
   };
 
   const scrollToPartners = () => {
@@ -405,6 +407,7 @@ function StorefrontApp() {
 
       {/* 5. Official Partner Brands Slider & Showcase */}
       <OfficialPartnersSection
+        products={products}
         onSelectBrandSearch={(query) => {
           setActiveCategory('all');
           setActiveSubcategory(undefined);
