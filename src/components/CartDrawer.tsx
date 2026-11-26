@@ -409,8 +409,9 @@ export function CartDrawer({
               method: 'Pix Instantâneo (Aprovado)',
               orderNumber: res.orderNumber,
               customerEmail: customerEmail,
-              raffleTicketCode: (res as any).raffleTicketCode
+              raffleTicketCode: res.raffleTicketCode
             });
+            window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
             confetti({
               particleCount: 120,
               spread: 110,
@@ -547,14 +548,22 @@ export function CartDrawer({
           cpf: cleanCpf,
           phone: customerPhone
         },
-        items: items.map((it) => ({
-          id: it.product.id,
-          name: `${it.product.name} (${it.selectedSize})`,
-          price: it.product.price,
-          quantity: it.quantity,
-          selectedSize: it.selectedSize,
-          variantId: it.product.variantsList?.[0]?.id
-        })),
+        items: items.map((it) => {
+          const matchedVariant =
+            it.product.variantsList?.find(
+              (v) => v.size && v.size.toLowerCase() === it.selectedSize.toLowerCase()
+            ) || it.product.variantsList?.[0];
+          return {
+            id: it.product.id,
+            sku: matchedVariant?.sku || it.product.integration?.sku,
+            name: `${it.product.name} (${it.selectedSize})`,
+            price: it.product.price,
+            quantity: it.quantity,
+            selectedSize: it.selectedSize,
+            variantId: matchedVariant?.id,
+            image: it.product.images?.[0]
+          };
+        }),
         shippingAddress: !isPickup ? {
           street: shippingAddress.street.trim(),
           number: shippingAddress.number.trim(),
@@ -576,8 +585,9 @@ export function CartDrawer({
           method: `Cartão de Crédito ${installments}x sem juros`,
           orderNumber: res.orderNumber,
           customerEmail: customerEmail,
-          raffleTicketCode: (res as any).raffleTicketCode
+          raffleTicketCode: res.raffleTicketCode
         });
+        window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
         confetti({
           particleCount: 130,
           spread: 110,
@@ -659,14 +669,22 @@ export function CartDrawer({
           cpf: cleanCpf.length === 11 ? cleanCpf : undefined,
           phone: customerPhone
         },
-        items: items.map((it) => ({
-          id: it.product.id,
-          name: `${it.product.name} (${it.selectedSize})`,
-          price: it.product.price,
-          quantity: it.quantity,
-          selectedSize: it.selectedSize,
-          variantId: it.product.variantsList?.[0]?.id
-        })),
+        items: items.map((it) => {
+          const matchedVariant =
+            it.product.variantsList?.find(
+              (v) => v.size && v.size.toLowerCase() === it.selectedSize.toLowerCase()
+            ) || it.product.variantsList?.[0];
+          return {
+            id: it.product.id,
+            sku: matchedVariant?.sku || it.product.integration?.sku,
+            name: `${it.product.name} (${it.selectedSize})`,
+            price: it.product.price,
+            quantity: it.quantity,
+            selectedSize: it.selectedSize,
+            variantId: matchedVariant?.id,
+            image: it.product.images?.[0]
+          };
+        }),
         shippingAddress: !isPickup ? {
           street: shippingAddress.street.trim(),
           number: shippingAddress.number.trim(),
@@ -708,8 +726,9 @@ export function CartDrawer({
           method: 'Pix Instantâneo (Aprovado)',
           orderNumber: res.orderNumber,
           customerEmail: customerEmail,
-          raffleTicketCode: (res as any).raffleTicketCode
+          raffleTicketCode: res.raffleTicketCode
         });
+        window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
         confetti({
           particleCount: 130,
           spread: 110,

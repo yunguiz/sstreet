@@ -1322,9 +1322,10 @@ app.post('/api/mercadopago/create-preference', async (req: Request, res: Respons
   }
 });
 
-// In-memory tracker for local Pix transactions
+// In-memory + Firestore tracker for Pix & pending checkout transactions
 interface LocalPayment {
   id: string;
+  mpPaymentId?: string;
   amount: number;
   status: 'pending' | 'approved' | 'rejected';
   statusDetail: string;
@@ -1335,11 +1336,187 @@ interface LocalPayment {
   shippingAddress?: any;
   shippingServiceId?: number;
   shippingCarrier?: string;
+  paymentMethod?: string;
   orderId?: number;
   orderNumber?: string;
+  blingOrderId?: number;
+  raffleTicketCode?: string;
 }
 
 const localPaymentsMap = new Map<string, LocalPayment>();
+const inFlightFinalizations = new Map<string, Promise<{
+  orderId?: number;
+  orderNumber?: string;
+  blingOrderId?: number;
+  raffleTicketCode?: string;
+}>>();
+
+function sanitizePaymentDocId(id: string | number): string {
+  return String(id).replace(/[^a-zA-Z0-9_-]/g, '_');
+}
+
+async function savePendingPaymentContext(id: string | number, data: LocalPayment): Promise<void> {
+  const key = String(id);
+  localPaymentsMap.set(key, data);
+
+  if (hasFirebaseAdminEnv()) {
+    try {
+      const db = getAdminFirestore();
+      const cleanData = JSON.parse(JSON.stringify(data));
+      await db.collection('pending_payments').doc(sanitizePaymentDocId(key)).set(cleanData, { merge: true });
+    } catch (err) {
+      console.warn(`[Pending Payment] Erro ao salvar contexto ${key} no Firestore:`, err);
+    }
+  }
+}
+
+async function loadPendingPaymentContext(id: string | number): Promise<LocalPayment | null> {
+  const key = String(id);
+  const local = localPaymentsMap.get(key);
+  if (local) return local;
+
+  if (hasFirebaseAdminEnv()) {
+    try {
+      const db = getAdminFirestore();
+      const snap = await db.collection('pending_payments').doc(sanitizePaymentDocId(key)).get();
+      if (snap.exists) {
+        const data = snap.data() as LocalPayment;
+        localPaymentsMap.set(key, data);
+        return data;
+      }
+    } catch (err) {
+      console.warn(`[Pending Payment] Erro ao carregar contexto ${key} do Firestore:`, err);
+    }
+  }
+
+  return null;
+}
+
+async function finalizeApprovedPayment(params: {
+  canonicalPaymentId: string | number;
+  contextKeys?: Array<string | number>;
+  amount: number;
+  paymentMethod: string;
+  dateApproved?: string;
+  payer?: any;
+  items?: any[];
+  shippingAddress?: any;
+  shippingServiceId?: number;
+  shippingCarrier?: string;
+}): Promise<{
+  orderId?: number;
+  orderNumber?: string;
+  blingOrderId?: number;
+  raffleTicketCode?: string;
+}> {
+  const canonicalId = String(params.canonicalPaymentId);
+  const existingPromise = inFlightFinalizations.get(canonicalId);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const run = (async () => {
+    let orderId: number | undefined;
+    let orderNumber: string | undefined;
+    let blingOrderId: number | undefined;
+    let raffleTicketCode: string | undefined;
+
+    const payerEmail =
+      params.payer?.email && String(params.payer.email).includes('@')
+        ? String(params.payer.email)
+        : 'streetstore364@gmail.com';
+    const payerName =
+      params.payer?.name && String(params.payer.name).trim()
+        ? String(params.payer.name).trim()
+        : [params.payer?.first_name, params.payer?.last_name].filter(Boolean).join(' ').trim() || 'Cliente Street Store';
+    const payerCpf = params.payer?.cpf || params.payer?.identification?.number;
+    const payerPhone = params.payer?.phone;
+
+    try {
+      const orderRes = await createStoreOrder({
+        customer: {
+          name: payerName,
+          email: payerEmail,
+          phone: payerPhone,
+          cpf: payerCpf,
+        },
+        items: params.items || [],
+        shippingAddress: params.shippingAddress,
+        shippingServiceId: params.shippingServiceId,
+        shippingCarrier: params.shippingCarrier,
+        paymentMethod: params.paymentMethod,
+        paymentId: canonicalId,
+        total: Number(params.amount || 0),
+      });
+
+      if (orderRes.success) {
+        orderId = orderRes.id;
+        orderNumber = orderRes.number;
+        blingOrderId = orderRes.blingOrderId;
+        if (!orderRes.alreadyExisted) {
+          invalidateCatalogCache();
+        }
+      }
+    } catch (orderErr) {
+      console.error(`[Payment Finalize] Erro ao criar pedido para pagamento ${canonicalId}:`, orderErr);
+    }
+
+    try {
+      raffleTicketCode =
+        (await processPs5RaffleEntry({
+          customerName: payerName,
+          customerEmail: payerEmail,
+          customerPhone: payerPhone,
+          customerCpf: payerCpf ? String(payerCpf) : undefined,
+          orderNumber,
+          paymentId: canonicalId,
+          orderTotal: Number(params.amount || 0),
+          shippingAddress: params.shippingAddress,
+        })) || undefined;
+    } catch (raffleErr) {
+      console.warn(`[Payment Finalize] Erro ao gerar bilhete PS5 para pagamento ${canonicalId}:`, raffleErr);
+    }
+
+    const keysToUpdate = Array.from(
+      new Set([canonicalId, ...(params.contextKeys || []).map((k) => String(k))])
+    );
+    for (const key of keysToUpdate) {
+      const prev = await loadPendingPaymentContext(key);
+      await savePendingPaymentContext(key, {
+        ...(prev || {
+          id: key,
+          amount: Number(params.amount || 0),
+          createdAt: Date.now(),
+        }),
+        id: key,
+        mpPaymentId: canonicalId,
+        amount: Number(prev?.amount || params.amount || 0),
+        status: 'approved',
+        statusDetail: 'accredited',
+        dateApproved: params.dateApproved || prev?.dateApproved || new Date().toISOString(),
+        payer: prev?.payer || params.payer,
+        items: prev?.items || params.items,
+        shippingAddress: prev?.shippingAddress || params.shippingAddress,
+        shippingServiceId: prev?.shippingServiceId ?? params.shippingServiceId,
+        shippingCarrier: prev?.shippingCarrier || params.shippingCarrier,
+        paymentMethod: params.paymentMethod,
+        orderId,
+        orderNumber,
+        blingOrderId,
+        raffleTicketCode,
+      });
+    }
+
+    return { orderId, orderNumber, blingOrderId, raffleTicketCode };
+  })();
+
+  inFlightFinalizations.set(canonicalId, run);
+  try {
+    return await run;
+  } finally {
+    inFlightFinalizations.delete(canonicalId);
+  }
+}
 
 // EMV BR Code Helpers for BACEN Standard Pix QR Codes
 function formatEMV(id: string, value: string): string {
@@ -1409,10 +1586,20 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
     const firstName = nameParts[0] || 'Cliente';
     const lastName = nameParts.slice(1).join(' ') || 'Street';
 
-    const paymentPayload = {
+    const appUrl = process.env.APP_URL || '';
+    const rawOrigin = req.headers.origin || (req.headers.host ? `https://${req.headers.host}` : '');
+    const validBaseUrl =
+      rawOrigin.startsWith('https://') && !rawOrigin.includes('localhost')
+        ? rawOrigin
+        : appUrl.startsWith('https://')
+          ? appUrl
+          : 'https://www.streetstore.com.br';
+
+    const paymentPayload: Record<string, any> = {
       transaction_amount: numericAmount,
       description: description || 'Street Store - Pedido Streetwear Oficial',
       payment_method_id: 'pix',
+      external_reference: `ST-PIX-${Date.now()}`,
       payer: {
         email,
         first_name: firstName,
@@ -1423,6 +1610,10 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         } : undefined
       }
     };
+
+    if (validBaseUrl.startsWith('https://') && !validBaseUrl.includes('localhost')) {
+      paymentPayload.notification_url = `${validBaseUrl}/api/mercadopago/webhook`;
+    }
 
     const idempotencyKey = `pix-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
 
@@ -1451,6 +1642,28 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
 
     if (officialMpSuccess && data) {
       const txData = data.point_of_interaction?.transaction_data;
+      const mpPaymentIdStr = String(data.id);
+
+      await savePendingPaymentContext(mpPaymentIdStr, {
+        id: mpPaymentIdStr,
+        mpPaymentId: mpPaymentIdStr,
+        amount: Number(data.transaction_amount || numericAmount),
+        status: data.status === 'approved' ? 'approved' : 'pending',
+        statusDetail: data.status_detail || 'waiting_payment',
+        createdAt: Date.now(),
+        payer: {
+          name: fullName,
+          email,
+          cpf: payer?.cpf,
+          phone: payer?.phone,
+        },
+        items,
+        shippingAddress,
+        shippingServiceId,
+        shippingCarrier,
+        paymentMethod: 'Pix Instantâneo Mercado Pago',
+      });
+
       return res.json({
         success: true,
         paymentId: data.id,
@@ -1490,17 +1703,23 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
     const qrCodeBase64 = qrDataUrl.replace(/^data:image\/png;base64,/, '');
     const localPaymentId = `pix_st_${Date.now()}`;
 
-    localPaymentsMap.set(localPaymentId, {
+    await savePendingPaymentContext(localPaymentId, {
       id: localPaymentId,
       amount: numericAmount,
       status: 'pending',
       statusDetail: 'waiting_payment',
       createdAt: Date.now(),
-      payer,
+      payer: {
+        name: fullName,
+        email,
+        cpf: payer?.cpf,
+        phone: payer?.phone,
+      },
       items,
       shippingAddress,
       shippingServiceId,
-      shippingCarrier
+      shippingCarrier,
+      paymentMethod: 'Pix Instantâneo Mercado Pago',
     });
 
     return res.json({
@@ -1532,7 +1751,7 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
 
     // If local BACEN Pix QR Code
     if (id.startsWith('pix_st_')) {
-      const payment = localPaymentsMap.get(id);
+      const payment = await loadPendingPaymentContext(id);
       if (!payment) {
         return res.status(404).json({
           success: false,
@@ -1543,13 +1762,27 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
       }
 
       if (payment.status === 'approved') {
+        const finalized = await finalizeApprovedPayment({
+          canonicalPaymentId: payment.mpPaymentId || payment.id,
+          contextKeys: [id],
+          amount: payment.amount,
+          paymentMethod: payment.paymentMethod || 'Pix Instantâneo Mercado Pago',
+          dateApproved: payment.dateApproved,
+          payer: payment.payer,
+          items: payment.items,
+          shippingAddress: payment.shippingAddress,
+          shippingServiceId: payment.shippingServiceId,
+          shippingCarrier: payment.shippingCarrier,
+        });
+
         return res.json({
           success: true,
           approved: true,
           status: 'approved',
           statusDetail: 'accredited',
-          orderNumber: payment.orderNumber,
-          orderId: payment.orderId,
+          orderNumber: finalized.orderNumber || payment.orderNumber,
+          orderId: finalized.orderId || payment.orderId,
+          raffleTicketCode: finalized.raffleTicketCode || payment.raffleTicketCode,
           message: 'Pagamento Pix aprovado com sucesso!'
         });
       }
@@ -1588,57 +1821,27 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
       }
 
       if (paymentFoundInMp && matchedMpPayment) {
-        // Genuine payment confirmed!
-        payment.status = 'approved';
-        payment.statusDetail = 'accredited';
-        payment.dateApproved = matchedMpPayment.date_approved || new Date().toISOString();
-
-        // Create official store order & sync with Bling ERP if not created yet
-        if (!payment.orderId) {
-          const orderRes = await createStoreOrder({
-            customer: payment.payer || { email: 'streetstore364@gmail.com' },
-            items: payment.items || [],
-            shippingAddress: payment.shippingAddress,
-            shippingServiceId: payment.shippingServiceId,
-            shippingCarrier: payment.shippingCarrier,
-            paymentMethod: 'Pix Instantâneo Mercado Pago',
-            paymentId: matchedMpPayment.id,
-            total: payment.amount
-          });
-
-          if (orderRes.success) {
-            payment.orderId = orderRes.id;
-            payment.orderNumber = orderRes.number;
-            invalidateCatalogCache();
-          }
-        }
-
-        localPaymentsMap.set(id, payment);
-
-        let raffleTicketCode: string | undefined = undefined;
-        try {
-          raffleTicketCode = await processPs5RaffleEntry({
-            customerName: payment.payer?.name || 'Cliente Street Store',
-            customerEmail: payment.payer?.email || 'streetstore364@gmail.com',
-            customerPhone: payment.payer?.phone,
-            customerCpf: payment.payer?.cpf,
-            orderNumber: payment.orderNumber,
-            paymentId: matchedMpPayment.id,
-            orderTotal: payment.amount,
-            shippingAddress: payment.shippingAddress
-          }) || undefined;
-        } catch (e) {
-          console.warn('Could not generate PS5 raffle ticket for pix:', e);
-        }
+        const finalized = await finalizeApprovedPayment({
+          canonicalPaymentId: matchedMpPayment.id,
+          contextKeys: [id],
+          amount: payment.amount,
+          paymentMethod: 'Pix Instantâneo Mercado Pago',
+          dateApproved: matchedMpPayment.date_approved || new Date().toISOString(),
+          payer: payment.payer,
+          items: payment.items,
+          shippingAddress: payment.shippingAddress,
+          shippingServiceId: payment.shippingServiceId,
+          shippingCarrier: payment.shippingCarrier,
+        });
 
         return res.json({
           success: true,
           approved: true,
           status: 'approved',
           statusDetail: 'accredited',
-          orderNumber: payment.orderNumber,
-          orderId: payment.orderId,
-          raffleTicketCode,
+          orderNumber: finalized.orderNumber,
+          orderId: finalized.orderId,
+          raffleTicketCode: finalized.raffleTicketCode,
           message: 'Pagamento Pix identificado e aprovado pelo Mercado Pago!'
         });
       }
@@ -1671,6 +1874,20 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
 
     const data = await mpRes.json();
     if (data.status === 'approved') {
+      const pendingCtx = await loadPendingPaymentContext(id);
+      const finalized = await finalizeApprovedPayment({
+        canonicalPaymentId: data.id,
+        contextKeys: [id],
+        amount: Number(pendingCtx?.amount || data.transaction_amount || 0),
+        paymentMethod: pendingCtx?.paymentMethod || 'Pix Instantâneo Mercado Pago',
+        dateApproved: data.date_approved,
+        payer: pendingCtx?.payer || data.payer,
+        items: pendingCtx?.items || [],
+        shippingAddress: pendingCtx?.shippingAddress,
+        shippingServiceId: pendingCtx?.shippingServiceId,
+        shippingCarrier: pendingCtx?.shippingCarrier,
+      });
+
       return res.json({
         success: true,
         approved: true,
@@ -1678,6 +1895,9 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
         status: 'approved',
         statusDetail: data.status_detail,
         dateApproved: data.date_approved,
+        orderNumber: finalized.orderNumber,
+        orderId: finalized.orderId,
+        raffleTicketCode: finalized.raffleTicketCode,
         message: 'Pagamento Pix verificado e aprovado com sucesso!'
       });
     }
@@ -1703,11 +1923,12 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
 
 // 5. Check Payment Status (Strict verification)
 app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     const { id } = req.params;
 
     if (id.startsWith('pix_st_')) {
-      const p = localPaymentsMap.get(id);
+      const p = await loadPendingPaymentContext(id);
       if (!p) {
         return res.status(404).json({ success: false, approved: false, error: 'Pagamento não encontrado' });
       }
@@ -1727,27 +1948,30 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
                 new Date(item.date_created).getTime() > (p.createdAt - 180000);
             });
             if (match) {
-              p.status = 'approved';
-              p.statusDetail = 'accredited';
-              p.dateApproved = match.date_approved || new Date().toISOString();
-              
-              if (!p.orderId) {
-                const orderRes = await createStoreOrder({
-                  customer: p.payer || { email: 'streetstore364@gmail.com' },
-                  items: p.items || [],
-                  shippingAddress: p.shippingAddress,
-                  shippingServiceId: p.shippingServiceId,
-                  shippingCarrier: p.shippingCarrier,
-                  paymentMethod: 'Pix Instantâneo Mercado Pago',
-                  paymentId: match.id,
-                  total: p.amount
-                });
-                if (orderRes.success) {
-                  p.orderId = orderRes.id;
-                  p.orderNumber = orderRes.number;
-                }
-              }
-              localPaymentsMap.set(id, p);
+              const finalized = await finalizeApprovedPayment({
+                canonicalPaymentId: match.id,
+                contextKeys: [id],
+                amount: p.amount,
+                paymentMethod: 'Pix Instantâneo Mercado Pago',
+                dateApproved: match.date_approved || new Date().toISOString(),
+                payer: p.payer,
+                items: p.items,
+                shippingAddress: p.shippingAddress,
+                shippingServiceId: p.shippingServiceId,
+                shippingCarrier: p.shippingCarrier,
+              });
+
+              return res.json({
+                success: true,
+                approved: true,
+                id: p.id,
+                status: 'approved',
+                statusDetail: 'accredited',
+                dateApproved: match.date_approved || new Date().toISOString(),
+                orderNumber: finalized.orderNumber,
+                orderId: finalized.orderId,
+                raffleTicketCode: finalized.raffleTicketCode,
+              });
             }
           }
         } catch {
@@ -1755,34 +1979,40 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
         }
       }
 
-      let raffleTicketCode: string | undefined = undefined;
       if (p.status === 'approved') {
-        try {
-          raffleTicketCode = await processPs5RaffleEntry({
-            customerName: p.payer?.name || 'Cliente Street Store',
-            customerEmail: p.payer?.email || 'streetstore364@gmail.com',
-            customerPhone: p.payer?.phone,
-            customerCpf: p.payer?.cpf,
-            orderNumber: p.orderNumber,
-            paymentId: p.id,
-            orderTotal: p.amount,
-            shippingAddress: p.shippingAddress
-          }) || undefined;
-        } catch (e) {
-          console.warn('Could not generate PS5 raffle ticket for payment-status:', e);
-        }
+        const finalized = await finalizeApprovedPayment({
+          canonicalPaymentId: p.mpPaymentId || p.id,
+          contextKeys: [id],
+          amount: p.amount,
+          paymentMethod: p.paymentMethod || 'Pix Instantâneo Mercado Pago',
+          dateApproved: p.dateApproved,
+          payer: p.payer,
+          items: p.items,
+          shippingAddress: p.shippingAddress,
+          shippingServiceId: p.shippingServiceId,
+          shippingCarrier: p.shippingCarrier,
+        });
+
+        return res.json({
+          success: true,
+          approved: true,
+          id: p.id,
+          status: 'approved',
+          statusDetail: 'accredited',
+          dateApproved: p.dateApproved,
+          orderNumber: finalized.orderNumber || p.orderNumber,
+          orderId: finalized.orderId || p.orderId,
+          raffleTicketCode: finalized.raffleTicketCode || p.raffleTicketCode,
+        });
       }
 
       return res.json({
         success: true,
-        approved: p.status === 'approved',
+        approved: false,
         id: p.id,
         status: p.status,
         statusDetail: p.statusDetail,
         dateApproved: p.dateApproved,
-        orderNumber: p.orderNumber,
-        orderId: p.orderId,
-        raffleTicketCode
       });
     }
 
@@ -1801,13 +2031,39 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
     }
 
     const data = await mpRes.json();
+    let orderNumber: string | undefined;
+    let orderId: number | undefined;
+    let raffleTicketCode: string | undefined;
+
+    if (data.status === 'approved') {
+      const pendingCtx = await loadPendingPaymentContext(id);
+      const finalized = await finalizeApprovedPayment({
+        canonicalPaymentId: data.id,
+        contextKeys: [id],
+        amount: Number(pendingCtx?.amount || data.transaction_amount || 0),
+        paymentMethod: pendingCtx?.paymentMethod || 'Pix Instantâneo Mercado Pago',
+        dateApproved: data.date_approved,
+        payer: pendingCtx?.payer || data.payer,
+        items: pendingCtx?.items || [],
+        shippingAddress: pendingCtx?.shippingAddress,
+        shippingServiceId: pendingCtx?.shippingServiceId,
+        shippingCarrier: pendingCtx?.shippingCarrier,
+      });
+      orderNumber = finalized.orderNumber;
+      orderId = finalized.orderId;
+      raffleTicketCode = finalized.raffleTicketCode;
+    }
+
     return res.json({
       success: true,
       approved: data.status === 'approved',
       id: data.id,
       status: data.status,
       statusDetail: data.status_detail,
-      dateApproved: data.date_approved
+      dateApproved: data.date_approved,
+      orderNumber,
+      orderId,
+      raffleTicketCode,
     });
   } catch (error: any) {
     return res.status(500).json({
@@ -1940,53 +2196,31 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
       });
     }
 
-    // Sync order on card approval & register in Bling ERP if connected
+    // Sync order on card approval & register in Bling ERP + PS5 Raffle if connected
     let orderNumber: string | undefined = undefined;
     let orderId: number | undefined = undefined;
-
-    if (paymentResult.status === 'approved') {
-      try {
-        const orderRes = await createStoreOrder({
-          customer: {
-            name: fullName,
-            email,
-            phone: payer?.phone,
-            cpf: cleanCpf
-          },
-          items: items || [],
-          shippingAddress,
-          shippingServiceId,
-          shippingCarrier,
-          paymentMethod: `Cartão de Crédito ${installments}x (${methodId})`,
-          paymentId: paymentResult.id,
-          total: parseFloat(Number(transactionAmount).toFixed(2))
-        });
-        if (orderRes.success) {
-          orderNumber = orderRes.number;
-          orderId = orderRes.id;
-          invalidateCatalogCache();
-        }
-      } catch (err) {
-        console.warn('Could not register store order after card approval:', err);
-      }
-    }
-
     let raffleTicketCode: string | undefined = undefined;
+
     if (paymentResult.status === 'approved') {
-      try {
-        raffleTicketCode = await processPs5RaffleEntry({
-          customerName: fullName,
-          customerEmail: email,
-          customerPhone: payer?.phone,
-          customerCpf: cleanCpf,
-          orderNumber,
-          paymentId: paymentResult.id,
-          orderTotal: Number(transactionAmount),
-          shippingAddress
-        }) || undefined;
-      } catch (e) {
-        console.warn('Could not generate PS5 raffle ticket for card:', e);
-      }
+      const finalized = await finalizeApprovedPayment({
+        canonicalPaymentId: paymentResult.id,
+        amount: parseFloat(Number(transactionAmount).toFixed(2)),
+        paymentMethod: `Cartão de Crédito ${installments}x (${methodId})`,
+        dateApproved: paymentResult.date_approved,
+        payer: {
+          name: fullName,
+          email,
+          phone: payer?.phone,
+          cpf: cleanCpf,
+        },
+        items: items || [],
+        shippingAddress,
+        shippingServiceId,
+        shippingCarrier,
+      });
+      orderNumber = finalized.orderNumber;
+      orderId = finalized.orderId;
+      raffleTicketCode = finalized.raffleTicketCode;
     }
 
     return res.json({
@@ -2038,40 +2272,59 @@ async function processPs5RaffleEntry(params: {
     }
     const db = getAdminFirestore();
     const entriesRef = db.collection('raffle_ps5_entries');
+    const paymentIdStr = String(params.paymentId);
+    const deterministicDocId = `mp_${paymentIdStr.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
 
-    const existingSnap = await entriesRef.where('paymentId', '==', String(params.paymentId)).get();
+    // Check legacy auto-ID docs first to avoid duplicating previously created tickets
+    const existingSnap = await entriesRef.where('paymentId', '==', paymentIdStr).limit(1).get();
     if (!existingSnap.empty) {
       const existingData = existingSnap.docs[0].data();
       return existingData.ticketCode || null;
     }
 
+    const docRef = entriesRef.doc(deterministicDocId);
+    const counterRef = db.collection('counters').doc('raffle_ps5');
     const countSnap = await entriesRef.count().get();
-    const currentCount = countSnap.data().count || 0;
-    const ticketNumber = currentCount + 1;
-
-    const randomSuffix = crypto.randomBytes(2).toString('hex').toUpperCase();
-    const ticketCode = `PS5-${String(ticketNumber).padStart(4, '0')}-${randomSuffix}`;
+    const existingCount = countSnap.data().count || 0;
 
     const cityState = params.shippingAddress?.city && params.shippingAddress?.state
       ? `${params.shippingAddress.city} - ${params.shippingAddress.state}`
       : 'Itabira - MG';
 
-    const entryData = {
-      ticketCode,
-      ticketNumber,
-      customerName: params.customerName || 'Cliente Street Store',
-      customerEmail: params.customerEmail || 'streetstore364@gmail.com',
-      customerPhone: params.customerPhone || '',
-      customerCpf: params.customerCpf || '',
-      orderNumber: params.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`,
-      paymentId: String(params.paymentId),
-      orderTotal: total,
-      cityState,
-      createdAt: Date.now()
-    };
+    const ticketCode = await db.runTransaction(async (tx) => {
+      const docSnap = await tx.get(docRef);
+      if (docSnap.exists) {
+        return (docSnap.data()?.ticketCode as string) || null;
+      }
 
-    await entriesRef.add(entryData);
-    console.log(`[PS5 Raffle] New ticket generated successfully: ${ticketCode} for payment ${params.paymentId} (Total: R$ ${total})`);
+      const counterSnap = await tx.get(counterRef);
+      const currentCounter = counterSnap.exists ? Number(counterSnap.data()?.lastTicketNumber || 0) : 0;
+      const ticketNumber = Math.max(existingCount, currentCounter) + 1;
+
+      const randomSuffix = crypto.randomBytes(2).toString('hex').toUpperCase();
+      const generatedCode = `PS5-${String(ticketNumber).padStart(4, '0')}-${randomSuffix}`;
+
+      tx.set(counterRef, { lastTicketNumber: ticketNumber, updatedAt: Date.now() }, { merge: true });
+      tx.set(docRef, {
+        ticketCode: generatedCode,
+        ticketNumber,
+        customerName: params.customerName || 'Cliente Street Store',
+        customerEmail: params.customerEmail || 'streetstore364@gmail.com',
+        customerPhone: params.customerPhone || '',
+        customerCpf: params.customerCpf || '',
+        orderNumber: params.orderNumber || `#${Math.floor(1000 + Math.random() * 9000)}`,
+        paymentId: paymentIdStr,
+        orderTotal: total,
+        cityState,
+        createdAt: Date.now()
+      });
+
+      return generatedCode;
+    });
+
+    if (ticketCode) {
+      console.log(`[PS5 Raffle] New ticket generated successfully: ${ticketCode} for payment ${paymentIdStr} (Total: R$ ${total})`);
+    }
     return ticketCode;
   } catch (err) {
     console.error('[PS5 Raffle Error]:', err);
@@ -2081,6 +2334,7 @@ async function processPs5RaffleEntry(params: {
 
 // Public raffle status route
 app.get('/api/raffle/ps5/status', async (_req: Request, res: Response) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
   try {
     const active = process.env.PS5_RAFFLE_ACTIVE !== 'false';
     if (!active) {
@@ -2211,10 +2465,49 @@ app.post('/api/raffle/ps5/admin/draw', async (req: Request, res: Response) => {
   }
 });
 
-// 6. Webhook receiver
+// 6. Webhook receiver (Processes approved payments even if customer closes browser)
 app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
-  // Acknowledge notification from Mercado Pago
-  console.log('[Mercado Pago Webhook Received]:', req.body);
+  try {
+    console.log('[Mercado Pago Webhook Received]:', JSON.stringify(req.body || {}), req.query || {});
+    const topic = String(req.body?.type || req.body?.topic || req.query?.topic || req.query?.type || '').toLowerCase();
+    const action = String(req.body?.action || '').toLowerCase();
+    const paymentId = req.body?.data?.id || req.query?.['data.id'] || req.query?.id;
+
+    if (paymentId && (topic === 'payment' || action.startsWith('payment.') || !topic)) {
+      const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/${paymentId}`, {
+        headers: {
+          'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
+        }
+      });
+
+      if (mpRes.ok) {
+        const mpData = await mpRes.json();
+        if (mpData?.status === 'approved') {
+          const pendingCtx = await loadPendingPaymentContext(paymentId);
+          const methodLabel =
+            pendingCtx?.paymentMethod ||
+            (mpData.payment_method_id === 'pix'
+              ? 'Pix Instantâneo Mercado Pago'
+              : `Mercado Pago (${mpData.payment_method_id || 'Online'})`);
+
+          await finalizeApprovedPayment({
+            canonicalPaymentId: mpData.id,
+            contextKeys: [String(paymentId)],
+            amount: Number(pendingCtx?.amount || mpData.transaction_amount || 0),
+            paymentMethod: methodLabel,
+            dateApproved: mpData.date_approved,
+            payer: pendingCtx?.payer || mpData.payer,
+            items: pendingCtx?.items || [],
+            shippingAddress: pendingCtx?.shippingAddress,
+            shippingServiceId: pendingCtx?.shippingServiceId,
+            shippingCarrier: pendingCtx?.shippingCarrier,
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Mercado Pago Webhook Error]:', err);
+  }
   res.status(200).send('OK');
 });
 
