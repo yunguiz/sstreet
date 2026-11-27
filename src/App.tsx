@@ -18,6 +18,7 @@ import { Product, ProductCategory, CartItem } from './types';
 import { getLiveCatalog } from './services/catalog';
 import { AdminBlingSyncPage } from './components/AdminBlingSyncPage';
 import { Ps5RaffleSection } from './components/Ps5RaffleSection';
+import { MiamiRaffleHeroBanner } from './components/MiamiRaffleHeroBanner';
 import { CustomerAuthModal, AuthModalMode } from './components/CustomerAuthModal';
 import {
   CustomerProfile,
@@ -77,6 +78,17 @@ function StorefrontApp() {
   const [authModalMode, setAuthModalMode] = useState<AuthModalMode>('register');
   const [authModalReason, setAuthModalReason] = useState<string | null>(null);
   const [pendingCheckoutAfterAuth, setPendingCheckoutAfterAuth] = useState(false);
+  const [currentRoutePath, setCurrentRoutePath] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.pathname.replace(/\/+$/, '') || '/' : '/'
+  );
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setCurrentRoutePath(window.location.pathname.replace(/\/+$/, '') || '/');
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     const unsubscribe = subscribeToCustomerAuth((profile) => {
@@ -325,17 +337,39 @@ function StorefrontApp() {
     setIsCartOpen(true);
   };
 
-  const scrollToCatalog = () => {
-    requestAnimationFrame(() => {
-      const el = document.getElementById('catalogo');
+  const navigateToHomeSection = (sectionId?: string) => {
+    const isOnRaffleRoute = currentRoutePath === '/sorteio';
+    if (isOnRaffleRoute && typeof window !== 'undefined') {
+      window.history.pushState({}, '', '/');
+      setCurrentRoutePath('/');
+    }
+    if (!sectionId) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
+    setTimeout(() => {
+      const el = document.getElementById(sectionId);
       if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
+    }, isOnRaffleRoute ? 80 : 0);
+  };
+
+  const openRafflePage = () => {
+    if (typeof window !== 'undefined') {
+      window.history.pushState({}, '', '/sorteio');
+      setCurrentRoutePath('/sorteio');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
+  const scrollToCatalog = () => {
+    navigateToHomeSection('catalogo');
   };
 
   const scrollToPartners = () => {
-    const el = document.getElementById('parceiros');
-    if (el) el.scrollIntoView({ behavior: 'smooth' });
+    navigateToHomeSection('parceiros');
   };
+
+  const isRafflePage = currentRoutePath === '/sorteio';
 
   return (
     <div className="min-h-screen bg-[#0D0D0D] text-white flex flex-col selection:bg-[#E50914] selection:text-white w-full max-w-full overflow-x-hidden">
@@ -366,6 +400,8 @@ function StorefrontApp() {
           setPoliciesInitialTab(tab);
           setIsPoliciesOpen(true);
         }}
+        onGoHome={() => navigateToHomeSection()}
+        onNavigateSection={(secId) => navigateToHomeSection(secId)}
         activeCategory={activeCategory}
         onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
           setActiveCategory(cat);
@@ -390,60 +426,79 @@ function StorefrontApp() {
         </div>
       )}
 
-      {/* 3. Hero Section with exact layout matching screenshot */}
-      <Hero
-        onExploreCatalog={scrollToCatalog}
-        onExplorePartners={scrollToPartners}
-      />
+      {isRafflePage ? (
+        <main className="flex-1">
+          <Ps5RaffleSection
+            id="sorteio-ps5"
+            isDedicatedPage
+            onBackToStore={() => navigateToHomeSection()}
+            onExploreCatalog={scrollToCatalog}
+          />
+        </main>
+      ) : (
+        <>
+          {/* 3A. Top Miami PS5 + GTA VI Raffle Animated Spotlight (Clicks open /sorteio) */}
+          <MiamiRaffleHeroBanner onOpenRafflePage={openRafflePage} />
 
-      {/* 4. Clean Catalog Section */}
-      <CatalogSection
-        products={products}
-        isCatalogLive={isCatalogLive}
-        catalogCount={products.length}
-        activeCategory={activeCategory}
-        activeSubcategory={activeSubcategory}
-        brandFilter={brandFilter}
-        onClearBrandFilter={() => setBrandFilter(undefined)}
-        favorites={favorites}
-        onToggleFavorite={handleToggleFavorite}
-        onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
-          setActiveCategory(cat);
-          setActiveSubcategory(subcat);
-        }}
-        onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
-        onQuickAdd={handleQuickAdd}
-      />
+          {/* 3B. Hero Section */}
+          <Hero
+            onExploreCatalog={scrollToCatalog}
+            onExplorePartners={scrollToPartners}
+          />
 
-      {/* 4. PS5 Raffle Official Section */}
-      <Ps5RaffleSection />
+          {/* 4. Clean Catalog Section */}
+          <CatalogSection
+            products={products}
+            isCatalogLive={isCatalogLive}
+            catalogCount={products.length}
+            activeCategory={activeCategory}
+            activeSubcategory={activeSubcategory}
+            brandFilter={brandFilter}
+            onClearBrandFilter={() => setBrandFilter(undefined)}
+            favorites={favorites}
+            onToggleFavorite={handleToggleFavorite}
+            onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
+              setActiveCategory(cat);
+              setActiveSubcategory(subcat);
+            }}
+            onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+            onQuickAdd={handleQuickAdd}
+          />
 
-      {/* 4.5 Interactive 3D Clothing Rail Gallery Section */}
-      <div id="arara-virtual">
-        <StreetwearRailSection
-          products={products}
-          onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
-          onQuickAdd={handleQuickAdd}
-          onExploreCatalog={scrollToCatalog}
-        />
-      </div>
+          {/* 4.5 Decorated PS5 + GTA VI Raffle Section */}
+          <Ps5RaffleSection
+            id="sorteio-ps5"
+            onExploreCatalog={scrollToCatalog}
+          />
 
-      {/* 5. Official Partner Brands Slider & Showcase */}
-      <OfficialPartnersSection
-        products={products}
-        onSelectBrandSearch={(query) => {
-          setActiveCategory('all');
-          setActiveSubcategory(undefined);
-          setBrandFilter(query);
-          scrollToCatalog();
-        }}
-      />
+          {/* 4.8 Interactive 3D Clothing Rail Gallery Section */}
+          <div id="arara-virtual">
+            <StreetwearRailSection
+              products={products}
+              onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+              onQuickAdd={handleQuickAdd}
+              onExploreCatalog={scrollToCatalog}
+            />
+          </div>
 
-      {/* 6. VIP WhatsApp Club Section */}
-      <VipBanner />
+          {/* 5. Official Partner Brands Slider & Showcase */}
+          <OfficialPartnersSection
+            products={products}
+            onSelectBrandSearch={(query) => {
+              setActiveCategory('all');
+              setActiveSubcategory(undefined);
+              setBrandFilter(query);
+              scrollToCatalog();
+            }}
+          />
 
-      {/* 7. Instagram Feed (@streetstoreitabira) & Customer Social Proof */}
-      <SocialProofSection products={products} />
+          {/* 6. VIP WhatsApp Club Section */}
+          <VipBanner />
+
+          {/* 7. Instagram Feed (@streetstoreitabira) & Customer Social Proof */}
+          <SocialProofSection products={products} />
+        </>
+      )}
 
       {/* 8. Complete Official Footer */}
       <Footer

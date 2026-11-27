@@ -94,12 +94,38 @@ export function reapplyImagesToCachedCatalog() {
   }
 }
 
-// Mercado Pago Credentials
-const MERCADO_PAGO_PUBLIC_KEY = process.env.MERCADO_PAGO_PUBLIC_KEY || 'APP_USR-20a95c8d-1249-4b33-b19f-39e50c1a8407';
-const MERCADO_PAGO_ACCESS_TOKEN = process.env.MERCADO_PAGO_ACCESS_TOKEN || 'APP_USR-303476054689744-112315-34c48d816c8619d52cd21d0e66089953-2461933848';
-const MERCADO_PAGO_CLIENT_ID = process.env.MERCADO_PAGO_CLIENT_ID || '303476054639744';
-const MERCADO_PAGO_CLIENT_SECRET = process.env.MERCADO_PAGO_CLIENT_SECRET || '8rOCfqthFSr1w61r2PXOHf3yA4uAs8SM';
+// Mercado Pago Credentials (exclusively from environment variables — zero hardcoded account fallbacks)
 const MERCADO_PAGO_API_BASE = 'https://api.mercadopago.com';
+const OFFICIAL_STORE_EMAIL = 'streetstore364@gmail.com';
+const OFFICIAL_MP_WEBHOOK_URL = 'https://www.streetstore.com.br/api/webhooks/mercadopago';
+
+function getMercadoPagoAccessToken(): string {
+  return (process.env.MERCADO_PAGO_ACCESS_TOKEN || '').trim();
+}
+
+function getMercadoPagoPublicKey(): string {
+  return (process.env.MERCADO_PAGO_PUBLIC_KEY || process.env.VITE_MERCADO_PAGO_PUBLIC_KEY || '').trim();
+}
+
+function getMercadoPagoClientId(): string {
+  return (process.env.MERCADO_PAGO_CLIENT_ID || '').trim();
+}
+
+function resolveMercadoPagoNotificationUrl(req: Request): string {
+  const explicitWebhook = (process.env.MERCADO_PAGO_WEBHOOK_URL || '').trim();
+  if (explicitWebhook.startsWith('https://') && !explicitWebhook.includes('localhost')) {
+    return explicitWebhook;
+  }
+  const appUrl = (process.env.APP_URL || '').trim().replace(/\/+$/, '');
+  if (appUrl.startsWith('https://') && !appUrl.includes('localhost') && !appUrl.includes('.run.app')) {
+    return `${appUrl}/api/webhooks/mercadopago`;
+  }
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+  if (host && host.includes('streetstore.com.br')) {
+    return `https://${host.replace(/\/+$/, '')}/api/webhooks/mercadopago`;
+  }
+  return OFFICIAL_MP_WEBHOOK_URL;
+}
 
 // Robust HTML cleaning function that strips <p>, <br>, tags and entities
 function cleanDescription(raw?: string): string {
@@ -1199,36 +1225,6 @@ app.get('/api/bling/catalog-meta', (_req: Request, res: Response) => {
   });
 });
 
-// Newsletter Subscription
-const newsletterSubscribers = new Set<string>();
-
-app.post('/api/newsletter', (req: Request, res: Response) => {
-  try {
-    const { email } = req.body;
-    if (!email || typeof email !== 'string' || !email.includes('@') || !email.includes('.')) {
-      return res.status(400).json({
-        success: false,
-        error: 'Por favor, informe um e-mail válido para assinar a newsletter.'
-      });
-    }
-
-    const cleanEmail = email.trim().toLowerCase();
-    newsletterSubscribers.add(cleanEmail);
-    console.log(`[Newsletter] Novo assinante exclusivo Street Store: ${cleanEmail} (Total: ${newsletterSubscribers.size})`);
-
-    return res.json({
-      success: true,
-      message: 'Inscrição confirmada! Você receberá todos os novos drops e descontos exclusivos.',
-      couponCode: 'STREETVIP',
-      discount: '15% OFF'
-    });
-  } catch (error: any) {
-    return res.status(500).json({
-      success: false,
-      error: error.message || 'Erro ao processar inscrição na newsletter'
-    });
-  }
-});
 
 // Track Order with Store Database + Bling ERP & Melhor Envio
 app.get('/api/orders/track', async (req: Request, res: Response) => {
@@ -1337,10 +1333,21 @@ app.post('/api/orders/:id/return', (req: Request, res: Response) => {
 // 1. Status / Config Check
 app.get('/api/mercadopago/status', async (_req: Request, res: Response) => {
   try {
+    const mpAccessToken = getMercadoPagoAccessToken();
+    const mpPublicKey = getMercadoPagoPublicKey();
+    const mpClientId = getMercadoPagoClientId();
+    if (!mpAccessToken) {
+      return res.status(500).json({
+        connected: false,
+        publicKey: mpPublicKey,
+        error: 'MERCADO_PAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente.'
+      });
+    }
+
     // Validate access token with Mercado Pago user endpoint
     const response = await fetch(`${MERCADO_PAGO_API_BASE}/users/me`, {
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        'Authorization': `Bearer ${mpAccessToken}`,
       },
     });
 
@@ -1348,7 +1355,7 @@ app.get('/api/mercadopago/status', async (_req: Request, res: Response) => {
       const errorText = await response.text();
       return res.status(response.status).json({
         connected: false,
-        publicKey: MERCADO_PAGO_PUBLIC_KEY,
+        publicKey: mpPublicKey,
         error: `Mercado Pago API validation failed: ${errorText}`
       });
     }
@@ -1356,11 +1363,11 @@ app.get('/api/mercadopago/status', async (_req: Request, res: Response) => {
     const userData = await response.json();
     return res.json({
       connected: true,
-      publicKey: MERCADO_PAGO_PUBLIC_KEY,
-      clientId: MERCADO_PAGO_CLIENT_ID,
+      publicKey: mpPublicKey,
+      clientId: mpClientId,
       siteId: userData.site_id || 'MLB',
       nickname: userData.nickname || 'Street Store',
-      email: userData.email || 'streetstore364@gmail.com'
+      email: userData.email || OFFICIAL_STORE_EMAIL
     });
   } catch (error: any) {
     return res.status(500).json({
@@ -1436,14 +1443,20 @@ app.post('/api/mercadopago/create-preference', async (req: Request, res: Respons
       }
     };
 
-    if (validBaseUrl.startsWith('https://') && !validBaseUrl.includes('localhost')) {
-      preferencePayload.notification_url = `${validBaseUrl}/api/mercadopago/webhook`;
+    preferencePayload.notification_url = resolveMercadoPagoNotificationUrl(req);
+
+    const mpAccessToken = getMercadoPagoAccessToken();
+    if (!mpAccessToken) {
+      return res.status(500).json({
+        success: false,
+        error: 'MERCADO_PAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente.'
+      });
     }
 
     const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/checkout/preferences`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        'Authorization': `Bearer ${mpAccessToken}`,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(preferencePayload)
@@ -1476,6 +1489,8 @@ app.post('/api/mercadopago/create-preference', async (req: Request, res: Respons
 });
 
 // In-memory + Firestore tracker for Pix & pending checkout transactions
+const PIX_EXPIRATION_MS = 15 * 60 * 1000;
+
 interface LocalPayment {
   id: string;
   mpPaymentId?: string;
@@ -1484,9 +1499,15 @@ interface LocalPayment {
   mpFallbackReason?: string;
   userId?: string;
   amount: number;
-  status: 'pending' | 'approved' | 'rejected';
+  status: 'pending' | 'approved' | 'rejected' | 'expired' | 'cancelled';
   statusDetail: string;
   createdAt: number;
+  expiresAt?: string;
+  expiresAtMs?: number;
+  expiredAt?: string;
+  qrCode?: string;
+  qrCodeBase64?: string;
+  pixKey?: string;
   dateApproved?: string;
   movedToOrders?: boolean;
   payer?: any;
@@ -1502,6 +1523,30 @@ interface LocalPayment {
   raffleTicketCode?: string;
 }
 
+function formatMpDateOfExpiration(ms: number): string {
+  const brtDate = new Date(ms - 3 * 60 * 60 * 1000);
+  const pad = (n: number, len = 2) => String(n).padStart(len, '0');
+  return `${brtDate.getUTCFullYear()}-${pad(brtDate.getUTCMonth() + 1)}-${pad(brtDate.getUTCDate())}T${pad(brtDate.getUTCHours())}:${pad(brtDate.getUTCMinutes())}:${pad(brtDate.getUTCSeconds())}.${pad(brtDate.getUTCMilliseconds(), 3)}-03:00`;
+}
+
+function resolveLocalPaymentExpiresAtMs(p: LocalPayment): number {
+  if (typeof p.expiresAtMs === 'number' && Number.isFinite(p.expiresAtMs) && p.expiresAtMs > 0) {
+    return p.expiresAtMs;
+  }
+  if (p.expiresAt) {
+    const parsed = Date.parse(p.expiresAt);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return Number(p.createdAt || 0) + PIX_EXPIRATION_MS;
+}
+
+function isLocalPaymentExpired(p: LocalPayment, nowMs: number = Date.now()): boolean {
+  if (p.status === 'approved') return false;
+  if (p.status === 'expired' || p.status === 'cancelled' || p.status === 'rejected') return true;
+  const expMs = resolveLocalPaymentExpiresAtMs(p);
+  return !expMs || expMs <= nowMs;
+}
+
 const localPaymentsMap = new Map<string, LocalPayment>();
 const inFlightFinalizations = new Map<string, Promise<{
   orderId?: number;
@@ -1514,13 +1559,15 @@ const inFlightFinalizations = new Map<string, Promise<{
 let cachedMpCollectorEmail: { email: string; fetchedAt: number } | null = null;
 
 async function getMpCollectorEmail(): Promise<string> {
+  const mpAccessToken = getMercadoPagoAccessToken();
+  if (!mpAccessToken) return OFFICIAL_STORE_EMAIL;
   const now = Date.now();
   if (cachedMpCollectorEmail && now - cachedMpCollectorEmail.fetchedAt < 30 * 60 * 1000) {
     return cachedMpCollectorEmail.email;
   }
   try {
     const res = await fetch(`${MERCADO_PAGO_API_BASE}/users/me`, {
-      headers: { Authorization: `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}` },
+      headers: { Authorization: `Bearer ${mpAccessToken}` },
     });
     if (res.ok) {
       const data = await res.json();
@@ -1531,7 +1578,7 @@ async function getMpCollectorEmail(): Promise<string> {
   } catch {
     // ignore
   }
-  return '';
+  return OFFICIAL_STORE_EMAIL;
 }
 
 function sanitizePaymentDocId(id: string | number): string {
@@ -1803,8 +1850,8 @@ function calculateCRC16(payload: string): string {
 }
 
 function resolveStorePixKey(): string {
-  const raw = (process.env.PIX_KEY || 'streetstore364@gmail.com').trim();
-  if (!raw) return 'streetstore364@gmail.com';
+  const raw = (process.env.PIX_KEY || OFFICIAL_STORE_EMAIL).trim();
+  if (!raw) return OFFICIAL_STORE_EMAIL;
   if (raw.includes('@') || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
     return raw;
   }
@@ -1812,9 +1859,6 @@ function resolveStorePixKey(): string {
     return `+${raw.replace(/\D/g, '')}`;
   }
   const digits = raw.replace(/\D/g, '');
-  if (digits === '31984806556' || digits === '5531984806556' || (digits.length >= 12 && digits.startsWith('55'))) {
-    return digits.startsWith('55') ? `+${digits}` : `+55${digits}`;
-  }
   if (/[()\s-]/.test(raw) && (digits.length === 10 || digits.length === 11)) {
     return `+55${digits}`;
   }
@@ -1877,16 +1921,11 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         ? `cliente+${Date.now()}@streetstore.com.br`
         : email;
 
-    const appUrl = process.env.APP_URL || '';
-    const rawOrigin = req.headers.origin || (req.headers.host ? `https://${req.headers.host}` : '');
-    const validBaseUrl =
-      rawOrigin.startsWith('https://') && !rawOrigin.includes('localhost')
-        ? rawOrigin
-        : appUrl.startsWith('https://')
-          ? appUrl
-          : 'https://www.streetstore.com.br';
-
-    const localPaymentId = `pix_st_${Date.now()}`;
+    const notificationUrl = resolveMercadoPagoNotificationUrl(req);
+    const createdAtMs = Date.now();
+    const defaultExpiresAtMs = createdAtMs + PIX_EXPIRATION_MS;
+    const defaultExpiresAtIso = new Date(defaultExpiresAtMs).toISOString();
+    const localPaymentId = `pix_st_${createdAtMs}`;
     const externalReference = localPaymentId;
 
     const paymentPayload: Record<string, any> = {
@@ -1894,6 +1933,8 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       description: description || 'Street Store - Pedido Streetwear Oficial',
       payment_method_id: 'pix',
       external_reference: externalReference,
+      notification_url: notificationUrl,
+      date_of_expiration: formatMpDateOfExpiration(defaultExpiresAtMs),
       payer: {
         email: mpPayerEmail,
         first_name: firstName,
@@ -1905,41 +1946,51 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       }
     };
 
-    if (validBaseUrl.startsWith('https://') && !validBaseUrl.includes('localhost')) {
-      paymentPayload.notification_url = `${validBaseUrl}/api/mercadopago/webhook`;
-    }
-
-    const idempotencyKey = `pix-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
+    const idempotencyKey = `pix-${createdAtMs}-${Math.floor(Math.random() * 1000000)}`;
 
     let officialMpSuccess = false;
     let mpFallbackReason: string | undefined;
     let data: any = null;
+    const mpAccessToken = getMercadoPagoAccessToken();
 
-    try {
-      const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
-          'Content-Type': 'application/json',
-          'X-Idempotency-Key': idempotencyKey
-        },
-        body: JSON.stringify(paymentPayload)
-      });
-      data = await mpRes.json();
-      if (mpRes.ok && data?.point_of_interaction?.transaction_data?.qr_code) {
-        officialMpSuccess = true;
-      } else {
-        mpFallbackReason = data?.message || data?.cause?.[0]?.description || `MP status ${mpRes.status}`;
-        console.warn('Mercado Pago direct pix response:', data?.status, mpFallbackReason);
+    if (!mpAccessToken) {
+      mpFallbackReason = 'MERCADO_PAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente.';
+    } else {
+      try {
+        const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${mpAccessToken}`,
+            'Content-Type': 'application/json',
+            'X-Idempotency-Key': idempotencyKey
+          },
+          body: JSON.stringify(paymentPayload)
+        });
+        data = await mpRes.json();
+        if (mpRes.ok && data?.point_of_interaction?.transaction_data?.qr_code) {
+          officialMpSuccess = true;
+        } else {
+          mpFallbackReason = data?.message || data?.cause?.[0]?.description || `MP status ${mpRes.status}`;
+          console.warn('Mercado Pago direct pix response:', data?.status, mpFallbackReason);
+        }
+      } catch (apiErr: any) {
+        mpFallbackReason = apiErr?.message || String(apiErr);
+        console.warn('Direct Mercado Pago API fetch failed:', mpFallbackReason);
       }
-    } catch (apiErr: any) {
-      mpFallbackReason = apiErr?.message || String(apiErr);
-      console.warn('Direct Mercado Pago API fetch failed:', mpFallbackReason);
     }
 
     if (officialMpSuccess && data) {
       const txData = data.point_of_interaction?.transaction_data;
       const mpPaymentIdStr = String(data.id);
+      const parsedExp = data.date_of_expiration ? Date.parse(data.date_of_expiration) : NaN;
+      const expiresAtMs =
+        Number.isFinite(parsedExp) && parsedExp > createdAtMs
+          ? Math.min(parsedExp, defaultExpiresAtMs + 60_000)
+          : defaultExpiresAtMs;
+      const expiresAtIso = new Date(expiresAtMs).toISOString();
+      const officialQrCode = String(txData?.qr_code || '');
+      const officialQrCodeBase64 = String(txData?.qr_code_base64 || '');
+      const storePixKey = resolveStorePixKey();
 
       await savePendingPaymentContext(mpPaymentIdStr, {
         id: mpPaymentIdStr,
@@ -1949,7 +2000,12 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         amount: Number(data.transaction_amount || numericAmount),
         status: data.status === 'approved' ? 'approved' : 'pending',
         statusDetail: data.status_detail || 'waiting_payment',
-        createdAt: Date.now(),
+        createdAt: createdAtMs,
+        expiresAt: expiresAtIso,
+        expiresAtMs,
+        qrCode: officialQrCode,
+        qrCodeBase64: officialQrCodeBase64,
+        pixKey: storePixKey,
         payer: {
           ...(resolvedUserId ? { uid: resolvedUserId } : {}),
           name: fullName,
@@ -1970,10 +2026,12 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         status: data.status,
         statusDetail: data.status_detail,
         amount: data.transaction_amount,
-        qrCode: txData?.qr_code || '',
-        qrCodeBase64: txData?.qr_code_base64 || '',
+        qrCode: officialQrCode,
+        qrCodeBase64: officialQrCodeBase64,
         ticketUrl: txData?.ticket_url || '',
-        expiresAt: data.date_of_expiration,
+        expiresAt: expiresAtIso,
+        expiresAtMs,
+        pixKey: storePixKey,
         isOfficialMp: true
       });
     }
@@ -1981,7 +2039,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
     // Generate 100% native in-app BACEN EMV BR Code QR Code for Street Store:
     console.log('Generating 100% in-app transparent Pix QR Code...');
     const pixKey = resolveStorePixKey();
-    const txId = `ST${Date.now().toString().slice(-8)}`;
+    const txId = `ST${createdAtMs.toString().slice(-8)}`;
     const emvString = generatePixBRCode({
       pixKey,
       merchantName: 'STREET STORE',
@@ -2011,7 +2069,12 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       amount: numericAmount,
       status: 'pending',
       statusDetail: 'waiting_payment',
-      createdAt: Date.now(),
+      createdAt: createdAtMs,
+      expiresAt: defaultExpiresAtIso,
+      expiresAtMs: defaultExpiresAtMs,
+      qrCode: emvString,
+      qrCodeBase64,
+      pixKey,
       payer: {
         ...(resolvedUserId ? { uid: resolvedUserId } : {}),
         name: fullName,
@@ -2034,7 +2097,8 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       amount: numericAmount,
       qrCode: emvString,
       qrCodeBase64,
-      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+      expiresAt: defaultExpiresAtIso,
+      expiresAtMs: defaultExpiresAtMs,
       pixKey,
       isDirectPix: true
     });
@@ -2048,10 +2112,12 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
 });
 
 async function searchApprovedMpMatchForPending(p: LocalPayment, pendingId: string): Promise<any | null> {
+  const mpAccessToken = getMercadoPagoAccessToken();
+  if (!mpAccessToken) return null;
   try {
     const mpSearchRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/search?sort=date_created&criteria=desc&limit=30`, {
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
+        'Authorization': `Bearer ${mpAccessToken}`
       }
     });
 
@@ -2157,6 +2223,28 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
         });
       }
 
+      // Money has NOT arrived yet - check 15-minute expiration before returning pending
+      if (isLocalPaymentExpired(payment)) {
+        const expMs = resolveLocalPaymentExpiresAtMs(payment);
+        if (payment.status !== 'expired') {
+          await savePendingPaymentContext(id, {
+            ...payment,
+            status: 'expired',
+            statusDetail: 'expired_15m',
+            expiredAt: new Date().toISOString(),
+            ...(expMs > 0 ? { expiresAtMs: expMs, expiresAt: new Date(expMs).toISOString() } : {}),
+          });
+        }
+        return res.json({
+          success: false,
+          approved: false,
+          expired: true,
+          status: 'expired',
+          statusDetail: 'expired_15m',
+          message: 'O prazo de 15 minutos deste Pix expirou. Gere um novo pagamento na sacola.'
+        });
+      }
+
       // Money has NOT arrived yet - return pending!
       return res.json({
         success: false,
@@ -2167,10 +2255,20 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
       });
     }
 
+    const mpAccessToken = getMercadoPagoAccessToken();
+    if (!mpAccessToken) {
+      return res.json({
+        success: false,
+        approved: false,
+        status: 'pending',
+        message: 'MERCADO_PAGO_ACCESS_TOKEN não configurado no ambiente do servidor.'
+      });
+    }
+
     // Official numeric Mercado Pago Payment ID
     const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/${id}`, {
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
+        'Authorization': `Bearer ${mpAccessToken}`
       }
     });
 
@@ -2214,6 +2312,36 @@ app.post('/api/mercadopago/confirm-pix/:id', async (req: Request, res: Response)
         orderId: finalized.orderId,
         raffleTicketCode: finalized.raffleTicketCode,
         message: 'Pagamento Pix verificado e aprovado com sucesso!'
+      });
+    }
+
+    const pendingCtx = await loadPendingPaymentContext(id);
+    const mpStatusLower = String(data.status || '').toLowerCase();
+    const isExpiredOrClosed =
+      mpStatusLower === 'cancelled' ||
+      mpStatusLower === 'rejected' ||
+      mpStatusLower === 'expired' ||
+      (pendingCtx ? isLocalPaymentExpired(pendingCtx) : false);
+
+    if (isExpiredOrClosed) {
+      if (pendingCtx && pendingCtx.status !== 'expired') {
+        const expMs = resolveLocalPaymentExpiresAtMs(pendingCtx);
+        await savePendingPaymentContext(id, {
+          ...pendingCtx,
+          status: 'expired',
+          statusDetail: data.status_detail || 'expired_15m',
+          expiredAt: new Date().toISOString(),
+          ...(expMs > 0 ? { expiresAtMs: expMs, expiresAt: new Date(expMs).toISOString() } : {}),
+        });
+      }
+      return res.json({
+        success: false,
+        approved: false,
+        expired: true,
+        id: data.id,
+        status: 'expired',
+        statusDetail: data.status_detail || 'expired_15m',
+        message: 'O prazo de 15 minutos deste Pix expirou. Gere um novo pagamento na sacola.'
       });
     }
 
@@ -2278,6 +2406,28 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
             raffleTicketCode: finalized.raffleTicketCode,
           });
         }
+
+        if (isLocalPaymentExpired(p)) {
+          const expMs = resolveLocalPaymentExpiresAtMs(p);
+          if (p.status !== 'expired') {
+            await savePendingPaymentContext(id, {
+              ...p,
+              status: 'expired',
+              statusDetail: 'expired_15m',
+              expiredAt: new Date().toISOString(),
+              ...(expMs > 0 ? { expiresAtMs: expMs, expiresAt: new Date(expMs).toISOString() } : {}),
+            });
+          }
+          return res.json({
+            success: true,
+            approved: false,
+            expired: true,
+            id: p.id,
+            status: 'expired',
+            statusDetail: 'expired_15m',
+            dateApproved: p.dateApproved,
+          });
+        }
       }
 
       if (p.status === 'approved') {
@@ -2319,9 +2469,18 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
       });
     }
 
+    const mpAccessToken = getMercadoPagoAccessToken();
+    if (!mpAccessToken) {
+      return res.status(500).json({
+        success: false,
+        approved: false,
+        error: 'MERCADO_PAGO_ACCESS_TOKEN não configurado no servidor.'
+      });
+    }
+
     const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/${id}`, {
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        'Authorization': `Bearer ${mpAccessToken}`,
       }
     });
 
@@ -2359,6 +2518,36 @@ app.get('/api/mercadopago/payment-status/:id', async (req: Request, res: Respons
       orderNumber = finalized.orderNumber;
       orderId = finalized.orderId;
       raffleTicketCode = finalized.raffleTicketCode;
+    } else {
+      const pendingCtx = await loadPendingPaymentContext(id);
+      const mpStatusLower = String(data.status || '').toLowerCase();
+      const isExpiredOrClosed =
+        mpStatusLower === 'cancelled' ||
+        mpStatusLower === 'rejected' ||
+        mpStatusLower === 'expired' ||
+        (pendingCtx ? isLocalPaymentExpired(pendingCtx) : false);
+
+      if (isExpiredOrClosed) {
+        if (pendingCtx && pendingCtx.status !== 'expired') {
+          const expMs = resolveLocalPaymentExpiresAtMs(pendingCtx);
+          await savePendingPaymentContext(id, {
+            ...pendingCtx,
+            status: 'expired',
+            statusDetail: data.status_detail || 'expired_15m',
+            expiredAt: new Date().toISOString(),
+            ...(expMs > 0 ? { expiresAtMs: expMs, expiresAt: new Date(expMs).toISOString() } : {}),
+          });
+        }
+        return res.json({
+          success: true,
+          approved: false,
+          expired: true,
+          id: data.id,
+          status: 'expired',
+          statusDetail: data.status_detail || 'expired_15m',
+          dateApproved: data.date_approved,
+        });
+      }
     }
 
     return res.json({
@@ -2402,14 +2591,29 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
     const resolvedUserId = String(userId || payer?.uid || '').trim() || undefined;
     let cardToken = clientToken;
 
+    const mpAccessToken = getMercadoPagoAccessToken();
+    const mpPublicKey = getMercadoPagoPublicKey();
+    if (!mpAccessToken) {
+      return res.status(500).json({
+        success: false,
+        error: 'MERCADO_PAGO_ACCESS_TOKEN não configurado nas variáveis de ambiente.'
+      });
+    }
+
     // Se o frontend enviou dados do cartão, tokenizar no Mercado Pago
     if (!cardToken && cardData) {
+      if (!mpPublicKey) {
+        return res.status(500).json({
+          success: false,
+          error: 'MERCADO_PAGO_PUBLIC_KEY não configurada nas variáveis de ambiente.'
+        });
+      }
       const cleanCardNum = String(cardData.cardNumber).replace(/\D/g, '');
       const expMonth = parseInt(String(cardData.expirationMonth), 10);
       let expYear = String(cardData.expirationYear).trim();
       if (expYear.length === 2) expYear = `20${expYear}`;
 
-      const tokenRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/card_tokens?public_key=${MERCADO_PAGO_PUBLIC_KEY}`, {
+      const tokenRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/card_tokens?public_key=${encodeURIComponent(mpPublicKey)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2477,7 +2681,8 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
           number: cleanCpf
         }
       },
-      statement_descriptor: 'STREET STORE'
+      statement_descriptor: 'STREET STORE',
+      notification_url: resolveMercadoPagoNotificationUrl(req)
     };
 
     const idempotencyKey = `card-${Date.now()}-${Math.floor(Math.random() * 1000000)}`;
@@ -2485,7 +2690,7 @@ app.post('/api/mercadopago/process-card', async (req: Request, res: Response) =>
     const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`,
+        'Authorization': `Bearer ${mpAccessToken}`,
         'Content-Type': 'application/json',
         'X-Idempotency-Key': idempotencyKey
       },
@@ -3079,17 +3284,18 @@ app.post('/api/orders/admin/retry-bling', async (req: Request, res: Response) =>
 });
 
 // 6. Webhook receiver (Processes approved payments even if customer closes browser)
-app.post('/api/mercadopago/webhook', async (req: Request, res: Response) => {
+app.post(['/api/webhooks/mercadopago', '/api/mercadopago/webhook'], async (req: Request, res: Response) => {
   try {
     console.log('[Mercado Pago Webhook Received]:', JSON.stringify(req.body || {}), req.query || {});
     const topic = String(req.body?.type || req.body?.topic || req.query?.topic || req.query?.type || '').toLowerCase();
     const action = String(req.body?.action || '').toLowerCase();
     const paymentId = req.body?.data?.id || req.query?.['data.id'] || req.query?.id;
+    const mpAccessToken = getMercadoPagoAccessToken();
 
-    if (paymentId && (topic === 'payment' || action.startsWith('payment.') || !topic)) {
+    if (paymentId && mpAccessToken && (topic === 'payment' || action.startsWith('payment.') || !topic)) {
       const mpRes = await fetch(`${MERCADO_PAGO_API_BASE}/v1/payments/${paymentId}`, {
         headers: {
-          'Authorization': `Bearer ${MERCADO_PAGO_ACCESS_TOKEN}`
+          'Authorization': `Bearer ${mpAccessToken}`
         }
       });
 

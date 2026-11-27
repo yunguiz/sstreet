@@ -1,4 +1,3 @@
-import { useState } from 'react';
 import { 
   MapPin, 
   Phone, 
@@ -7,13 +6,6 @@ import {
   ShieldCheck, 
   Truck, 
   RefreshCw, 
-  Sparkles, 
-  ArrowRight, 
-  Check, 
-  Loader2, 
-  Copy,
-  Tag,
-  AlertCircle,
   HelpCircle
 } from 'lucide-react';
 import { motion } from 'motion/react';
@@ -27,60 +19,6 @@ interface FooterProps {
 }
 
 export function Footer({ onOpenTracking, onSelectCategory, onOpenPolicies }: FooterProps = {}) {
-  const [email, setEmail] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isSubscribed, setIsSubscribed] = useState(false);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [couponCopied, setCouponCopied] = useState(false);
-
-  const handleSubscribeNewsletter = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const cleanEmail = email.trim();
-
-    if (!cleanEmail || !cleanEmail.includes('@') || !cleanEmail.includes('.')) {
-      setErrorMessage('Por favor, informe um endereço de e-mail válido.');
-      return;
-    }
-
-    setIsLoading(true);
-    setErrorMessage(null);
-
-    try {
-      const res = await fetch('/api/newsletter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: cleanEmail })
-      });
-
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setIsSubscribed(true);
-        try {
-          localStorage.setItem('street_newsletter_subscribed', cleanEmail);
-        } catch {
-          // ignore
-        }
-      } else {
-        setErrorMessage(data.error || 'Não foi possível assinar no momento. Tente novamente.');
-      }
-    } catch {
-      // Fallback local persistence
-      setIsSubscribed(true);
-      try {
-        localStorage.setItem('street_newsletter_subscribed', cleanEmail);
-      } catch {
-        // ignore
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  const handleCopyCoupon = () => {
-    navigator.clipboard.writeText('STREETVIP');
-    setCouponCopied(true);
-    setTimeout(() => setCouponCopied(false), 2500);
-  };
 
   return (
     <footer className="bg-[#080808] border-t border-[#1F1F1F] text-zinc-400 text-xs">
@@ -120,137 +58,6 @@ export function Footer({ onOpenTracking, onSelectCategory, onOpenPolicies }: Foo
             <div>
               <p className="font-bold text-white text-sm">100% Original e Autêntico</p>
               <p className="text-zinc-500">Garantia total de procedência e qualidade</p>
-            </div>
-          </div>
-        </motion.div>
-      </div>
-
-      {/* Exclusive Street Store Newsletter Section */}
-      <div className="border-b border-[#1A1A1A] py-10 sm:py-12 bg-gradient-to-b from-[#0E0E0E] to-[#080808] relative overflow-hidden">
-        <div className="absolute top-0 right-1/4 w-80 h-80 bg-red-600/5 blur-3xl pointer-events-none rounded-full" />
-        <div className="absolute bottom-0 left-1/4 w-80 h-80 bg-red-600/5 blur-3xl pointer-events-none rounded-full" />
-
-        <motion.div
-          initial={{ opacity: 0, y: 22 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: '-40px' }}
-          transition={{ duration: 0.5, ease: 'easeOut' }}
-          className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8"
-        >
-          <div className="bg-gradient-to-r from-zinc-950 via-[#111111] to-zinc-950 border border-zinc-800 rounded-2xl p-6 sm:p-10 shadow-2xl relative">
-            <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8">
-              
-              {/* Copy & Highlights */}
-              <div className="max-w-xl space-y-2">
-                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-red-600/10 border border-red-500/20 text-[#E50914] text-[11px] font-black tracking-widest uppercase">
-                  <Sparkles className="w-3.5 h-3.5" />
-                  <span>DROP ALERT // NEWSLETTER EXCLUSIVA</span>
-                </div>
-
-                <h3 className="text-xl sm:text-2xl lg:text-3xl font-black text-white uppercase font-oswald tracking-wide">
-                  ASSINE A NEWSLETTER & RECEBA <span className="text-[#E50914]">15% OFF</span>
-                </h3>
-
-                <p className="text-zinc-400 text-xs sm:text-sm leading-relaxed">
-                  Cadastre-se na lista exclusiva da Street Store para receber lançamentos antecipados, reposições secretas e cupons de desconto direto no seu e-mail.
-                </p>
-              </div>
-
-              {/* Form / Success Feedback */}
-              <div className="w-full lg:max-w-md">
-                {isSubscribed ? (
-                  <motion.div
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    className="p-4 sm:p-5 bg-zinc-900/90 border border-emerald-500/40 rounded-xl space-y-3 text-left"
-                  >
-                    <div className="flex items-center gap-2 text-emerald-400 font-bold text-xs">
-                      <div className="w-6 h-6 rounded-full bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center shrink-0">
-                        <Check className="w-3.5 h-3.5" />
-                      </div>
-                      <span>Inscrição Confirmada na Street Store!</span>
-                    </div>
-
-                    <p className="text-xs text-zinc-300">
-                      Você está na lista VIP! Use seu cupom de boas-vindas na sacola para garantir <strong>15% de desconto</strong> no seu próximo pedido:
-                    </p>
-
-                    <div className="flex items-center justify-between p-2.5 bg-black/60 border border-zinc-800 rounded-lg">
-                      <div className="flex items-center gap-2">
-                        <Tag className="w-3.5 h-3.5 text-[#E50914]" />
-                        <span className="font-mono text-sm font-black text-white tracking-wider">
-                          STREETVIP
-                        </span>
-                      </div>
-
-                      <button
-                        type="button"
-                        onClick={handleCopyCoupon}
-                        className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-bold rounded-md flex items-center gap-1 transition-colors cursor-pointer"
-                      >
-                        {couponCopied ? (
-                          <>
-                            <Check className="w-3 h-3 text-emerald-400" />
-                            <span>Copiado</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3 h-3" />
-                            <span>Copiar Cupom</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </motion.div>
-                ) : (
-                  <form onSubmit={handleSubscribeNewsletter} className="space-y-2.5">
-                    <div className="flex flex-col sm:flex-row gap-2">
-                      <div className="relative flex-1">
-                        <Mail className="w-4 h-4 text-zinc-500 absolute left-3.5 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="email"
-                          required
-                          value={email}
-                          onChange={(e) => setEmail(e.target.value)}
-                          placeholder="Digite seu melhor e-mail..."
-                          className="w-full pl-10 pr-4 py-3 bg-zinc-900 border border-zinc-800 rounded-xl text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-[#E50914] focus:ring-1 focus:ring-[#E50914] transition-all"
-                        />
-                      </div>
-
-                      <button
-                        type="submit"
-                        disabled={isLoading}
-                        className="px-6 py-3 bg-[#E50914] hover:bg-[#c90812] disabled:opacity-60 text-white font-black text-xs uppercase tracking-wider rounded-xl transition-all cursor-pointer shadow-lg shadow-red-950/50 flex items-center justify-center gap-2 shrink-0 active:scale-95"
-                      >
-                        {isLoading ? (
-                          <>
-                            <Loader2 className="w-4 h-4 animate-spin" />
-                            <span>Cadastrando...</span>
-                          </>
-                        ) : (
-                          <>
-                            <span>QUERO 15% OFF</span>
-                            <ArrowRight className="w-4 h-4" />
-                          </>
-                        )}
-                      </button>
-                    </div>
-
-                    {errorMessage && (
-                      <div className="p-2.5 bg-red-950/50 border border-red-500/40 rounded-lg text-xs text-red-200 flex items-center gap-2">
-                        <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                        <span>{errorMessage}</span>
-                      </div>
-                    )}
-
-                    <div className="flex items-center gap-2 text-[11px] text-zinc-500 pt-0.5">
-                      <ShieldCheck className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                      <span>Privacidade garantida. Zero spam, apenas novidades e cupons reais.</span>
-                    </div>
-                  </form>
-                )}
-              </div>
-
             </div>
           </div>
         </motion.div>

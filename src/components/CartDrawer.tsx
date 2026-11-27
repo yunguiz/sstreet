@@ -22,7 +22,8 @@ import {
   Sparkles,
   CheckCircle2,
   HelpCircle,
-  MapPin
+  MapPin,
+  Clock
 } from 'lucide-react';
 import confetti from 'canvas-confetti';
 import { loadMercadoPago } from '@mercadopago/sdk-js';
@@ -195,6 +196,7 @@ export function CartDrawer({
   // Pix state (Checkout Transparente)
   const [pixData, setPixData] = useState<MercadoPagoPixResponse | null>(null);
   const [pixCopied, setPixCopied] = useState(false);
+  const [pixRemainingSec, setPixRemainingSec] = useState<number>(15 * 60);
   const [paymentApproved, setPaymentApproved] = useState(false);
   const [approvedPaymentDetails, setApprovedPaymentDetails] = useState<{
     id?: string | number;
@@ -246,14 +248,15 @@ export function CartDrawer({
     };
   });
 
-  // Mercado Pago SDK from @mercadopago/sdk-js initialized with .env key
-  const MP_PUBLIC_KEY = (import.meta as any).env?.VITE_MERCADO_PAGO_PUBLIC_KEY || 'APP_USR-20a95c8d-1249-4b33-b19f-39e50c1a8407';
+  // Mercado Pago SDK from @mercadopago/sdk-js initialized exclusively from VITE_MERCADO_PAGO_PUBLIC_KEY
+  const MP_PUBLIC_KEY = ((import.meta as any).env?.VITE_MERCADO_PAGO_PUBLIC_KEY || '').trim();
   const [mpInstance, setMpInstance] = useState<any>(null);
   const [isMpLoaded, setIsMpLoaded] = useState(false);
 
   useEffect(() => {
     let active = true;
     async function initSdk() {
+      if (!MP_PUBLIC_KEY) return;
       try {
         await loadMercadoPago();
         if ((window as any).MercadoPago && active) {
@@ -397,11 +400,33 @@ export function CartDrawer({
   // Poll Pix payment status in background (strict real bank accreditation)
   useEffect(() => {
     if (pixData?.paymentId && !paymentApproved) {
+      const targetExpiresMs =
+        typeof pixData.expiresAtMs === 'number' && pixData.expiresAtMs > 0
+          ? pixData.expiresAtMs
+          : pixData.expiresAt && Number.isFinite(Date.parse(pixData.expiresAt))
+            ? Date.parse(pixData.expiresAt)
+            : Date.now() + 15 * 60 * 1000;
+
+      const updateCountdown = () => {
+        const diffSec = Math.max(0, Math.ceil((targetExpiresMs - Date.now()) / 1000));
+        setPixRemainingSec(diffSec);
+        if (diffSec === 0) {
+          if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+          setPixData(null);
+          setErrorMessage('O prazo de 15 minutos do Pix expirou. Gere um novo código Pix para finalizar seu pedido.');
+          window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
+        }
+      };
+
+      updateCountdown();
+      const countdownTimer = setInterval(updateCountdown, 1000);
+
       pollIntervalRef.current = setInterval(async () => {
         try {
           const res = await getPaymentStatus(pixData.paymentId!);
           if (res.approved === true && res.status === 'approved') {
             clearInterval(pollIntervalRef.current);
+            clearInterval(countdownTimer);
             setPaymentApproved(true);
             setApprovedPaymentDetails({
               id: res.orderNumber || pixData.paymentId,
@@ -419,6 +444,12 @@ export function CartDrawer({
               origin: { y: 0.6 },
               colors: ['#009EE3', '#E50914', '#00FF66', '#FFFFFF']
             });
+          } else if ((res as any).expired || res.status === 'expired') {
+            clearInterval(pollIntervalRef.current);
+            clearInterval(countdownTimer);
+            setPixData(null);
+            setErrorMessage('O prazo de 15 minutos do Pix expirou. Gere um novo código Pix para finalizar seu pedido.');
+            window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
           }
         } catch (e) {
           console.error('Error polling pix status:', e);
@@ -426,6 +457,7 @@ export function CartDrawer({
       }, 3500);
 
       return () => {
+        clearInterval(countdownTimer);
         if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
       };
     }
@@ -434,14 +466,12 @@ export function CartDrawer({
   const handleApplyCoupon = (e: React.FormEvent) => {
     e.preventDefault();
     const code = couponCode.trim().toUpperCase();
-    if (code === 'STREETVIP') {
-      setAppliedDiscount(15);
-      setCouponMessage('Cupom VIP aplicado! 15% de desconto!');
-    } else if (code === 'PRIMEIRACOMPRA') {
+    if (code === 'PRIMEIRACOMPRA') {
       setAppliedDiscount(10);
       setCouponMessage('Cupom de primeira compra aplicado! 10% de desconto!');
     } else {
-      setCouponMessage('Cupom inválido. Tente STREETVIP ou PRIMEIRACOMPRA.');
+      setAppliedDiscount(0);
+      setCouponMessage('Cupom inválido ou expirado.');
     }
   };
 
@@ -985,9 +1015,22 @@ export function CartDrawer({
                 </div>
 
                 <div className="p-4 bg-zinc-950 border border-zinc-800 rounded-2xl text-center space-y-3">
-                  <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px] font-bold">
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>Pagamento Seguro no Site · Sem Redirecionamento</span>
+                  <div className="flex flex-wrap items-center justify-center gap-2">
+                    <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-emerald-400 text-[11px] font-bold">
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>Pagamento Seguro no Site · Sem Redirecionamento</span>
+                    </div>
+                    <div className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full border text-[11px] font-black font-mono tabular-nums ${
+                      pixRemainingSec <= 180
+                        ? 'bg-red-500/15 border-red-500/40 text-red-400 animate-pulse'
+                        : 'bg-amber-500/15 border-amber-500/30 text-amber-300'
+                    }`}>
+                      <Clock className="w-3.5 h-3.5" />
+                      <span>
+                        Expira em {String(Math.floor(pixRemainingSec / 60)).padStart(2, '0')}:
+                        {String(pixRemainingSec % 60).padStart(2, '0')}
+                      </span>
+                    </div>
                   </div>
 
                   <p className="text-xs text-zinc-300">
@@ -1017,6 +1060,16 @@ export function CartDrawer({
 
                   {/* Copy Pix Copia e Cola */}
                   <div className="space-y-2 pt-1">
+                    {pixData.pixKey && (
+                      <div className="p-2 bg-zinc-900/80 border border-zinc-800 rounded-lg text-left flex items-center justify-between gap-2">
+                        <span className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold">
+                          Chave Pix Oficial:
+                        </span>
+                        <span className="font-mono text-[11px] text-emerald-400 font-bold select-all">
+                          {pixData.pixKey}
+                        </span>
+                      </div>
+                    )}
                     <div className="p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg text-left">
                       <span className="text-[10px] text-zinc-500 uppercase tracking-wider block font-bold mb-1">
                         Código Pix Copia e Cola:
@@ -1774,7 +1827,7 @@ export function CartDrawer({
                     type="text"
                     value={couponCode}
                     onChange={(e) => setCouponCode(e.target.value)}
-                    placeholder="Cupom (ex: STREETVIP)"
+                    placeholder="Cupom (ex: PRIMEIRACOMPRA)"
                     className="w-full pl-8 pr-2 py-1.5 text-xs bg-zinc-900 border border-zinc-800 rounded-lg text-white placeholder-zinc-500 uppercase focus:outline-none focus:border-[#E50914]"
                   />
                 </div>

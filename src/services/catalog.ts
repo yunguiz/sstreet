@@ -28,6 +28,7 @@ export interface TrackedOrder {
   status: 'open' | 'closed' | 'cancelled';
   paymentStatus: 'paid' | 'pending' | 'voided' | 'refunded';
   paymentMethod?: string;
+  paymentId?: string | number;
   blingOrderId?: number;
   blingSyncStatus?: string;
   pendingPaymentId?: string;
@@ -55,6 +56,11 @@ export interface TrackedOrder {
   createdAt: string;
   paidAt?: string | null;
   shippedAt?: string | null;
+  expiresAt?: string;
+  expiresAtMs?: number;
+  qrCode?: string;
+  qrCodeBase64?: string;
+  pixKey?: string;
 }
 
 export interface ReturnRequestResult {

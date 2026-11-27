@@ -16,6 +16,11 @@ export interface MercadoPagoPixResponse {
   qrCodeBase64?: string;
   ticketUrl?: string;
   expiresAt?: string;
+  expiresAtMs?: number;
+  expired?: boolean;
+  pixKey?: string;
+  isDirectPix?: boolean;
+  isOfficialMp?: boolean;
   fallbackToPreference?: boolean;
   initPoint?: string;
   error?: string;
@@ -137,6 +142,7 @@ export async function createDirectPix(params: {
 export async function getPaymentStatus(paymentId: string | number): Promise<{
   success: boolean;
   approved: boolean;
+  expired?: boolean;
   status?: string;
   statusDetail?: string;
   dateApproved?: string;
@@ -164,6 +170,7 @@ export async function getPaymentStatus(paymentId: string | number): Promise<{
 export async function confirmPixPayment(paymentId: string | number): Promise<{
   success: boolean;
   approved: boolean;
+  expired?: boolean;
   status?: string;
   statusDetail?: string;
   message?: string;

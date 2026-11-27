@@ -16,6 +16,8 @@ interface HeaderProps {
   onOpenMyOrders?: () => void;
   onOpenPolicies?: (tab: 'faq' | 'shipping' | 'returns') => void;
   onSelectCategory: (cat: ProductCategory | 'all', subcat?: string) => void;
+  onGoHome?: () => void;
+  onNavigateSection?: (sectionId: string) => void;
   activeCategory: ProductCategory | 'all';
 }
 
@@ -32,6 +34,8 @@ export function Header({
   onOpenMyOrders,
   onOpenPolicies,
   onSelectCategory,
+  onGoHome,
+  onNavigateSection,
   activeCategory
 }: HeaderProps) {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -47,16 +51,22 @@ export function Header({
 
   return (
     <header className="sticky top-0 z-40 w-full bg-[#000000]/95 backdrop-blur-md border-b border-[#1A1A1A] overflow-x-clip">
-      <div className="max-w-7xl mx-auto px-2.5 sm:px-5 lg:px-6 h-16 sm:h-20 flex items-center justify-between gap-2 lg:gap-4">
+      <div className="max-w-7xl mx-auto px-3 sm:px-5 lg:px-6 h-16 sm:h-20 flex items-center justify-between gap-3 xl:gap-4">
         
         {/* Left: Brand Logo (Responsive scaling for all screens) */}
         <div className="flex items-center shrink-0">
           <a
-            href="#"
+            href="/"
+            onClick={(e) => {
+              if (onGoHome) {
+                e.preventDefault();
+                onGoHome();
+              }
+            }}
             className="flex items-center focus:outline-none transition-transform hover:scale-105 active:scale-95 duration-200"
             aria-label="Street Store Página Inicial"
           >
-            <div className="h-9 sm:h-12 lg:h-14 w-24 sm:w-32 lg:w-36 xl:w-40 flex items-center">
+            <div className="h-9 sm:h-11 lg:h-12 w-24 sm:w-32 xl:w-32 2xl:w-36 flex items-center">
               <img
                 src="/assets/aistudio/nova-logo_0b1a92f5.png"
                 alt="Street Store Oficial"
@@ -67,16 +77,20 @@ export function Header({
         </div>
 
         {/* Center: Navigation Links */}
-        <nav className="hidden xl:flex items-center gap-4 2xl:gap-6 text-[11px] 2xl:text-xs font-bold tracking-normal 2xl:tracking-wider min-w-0">
+        <nav className="hidden xl:flex flex-1 min-w-0 items-center justify-center gap-3.5 2xl:gap-6 px-2 text-[11px] 2xl:text-xs font-bold tracking-normal 2xl:tracking-wider overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {navLinks.map((item) => {
             const isActive = 'cat' in item && activeCategory === item.cat;
             return (
               <a
                 key={item.label}
                 href={item.href}
-                onClick={() => {
+                onClick={(e) => {
                   if (item.cat) {
+                    e.preventDefault();
                     onSelectCategory(item.cat, item.subcat);
+                  } else if (onNavigateSection) {
+                    e.preventDefault();
+                    onNavigateSection(item.href.replace('#', ''));
                   }
                 }}
                 className={`transition-colors whitespace-nowrap shrink-0 pb-1 relative flex items-center gap-1.5 ${
@@ -88,7 +102,7 @@ export function Header({
                 }`}
               >
                 {item.highlight && (
-                  <span className="w-2 h-2 rounded-full bg-[#E50914] animate-pulse" />
+                  <span className="w-2 h-2 rounded-full bg-[#E50914] animate-pulse shrink-0" />
                 )}
                 <span>{item.label}</span>
                 {isActive && (
@@ -100,7 +114,7 @@ export function Header({
         </nav>
 
         {/* Right: Search, Rastrear, Cadastro, Favoritos & Sacola */}
-        <div className="flex items-center gap-1 sm:gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0 relative z-10">
           <button
             onClick={onOpenSearch}
             aria-label="Buscar produtos"
@@ -127,10 +141,10 @@ export function Header({
                 onClick={onOpenMyOrders || onOpenTracking}
                 title={`Meus Pedidos (${currentUser.email})`}
                 aria-label="Abrir Meus Pedidos"
-                className="hidden sm:inline-flex items-center gap-1.5 h-8 sm:h-9 px-2.5 bg-[#141414] hover:bg-zinc-800 border border-zinc-800 hover:border-emerald-500/40 rounded-lg text-[11px] font-bold text-zinc-200 hover:text-white transition-colors cursor-pointer"
+                className="hidden sm:inline-flex items-center gap-1.5 h-8 sm:h-9 px-2.5 bg-[#141414] hover:bg-zinc-800 border border-zinc-800 hover:border-emerald-500/40 rounded-lg text-[11px] font-bold text-zinc-200 hover:text-white transition-colors cursor-pointer whitespace-nowrap"
               >
                 <User className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <span className="max-w-[76px] truncate">{firstName}</span>
+                <span className="max-w-[72px] truncate">{firstName}</span>
                 <span className="hidden xl:inline text-[10px] text-emerald-400 font-black uppercase">Pedidos</span>
               </button>
               <button
@@ -138,7 +152,7 @@ export function Header({
                 onClick={onLogout}
                 aria-label="Sair da conta"
                 title="Sair da conta"
-                className="h-8 sm:h-9 px-2 sm:px-2.5 bg-[#141414] hover:bg-zinc-800 border border-zinc-800 rounded-lg text-zinc-300 hover:text-white text-[11px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors cursor-pointer shrink-0"
+                className="h-8 sm:h-9 px-2 sm:px-2.5 bg-[#141414] hover:bg-zinc-800 border border-zinc-800 rounded-lg text-zinc-300 hover:text-white text-[11px] font-bold uppercase tracking-wider flex items-center gap-1 transition-colors cursor-pointer shrink-0 whitespace-nowrap"
               >
                 <LogOut className="w-3.5 h-3.5" />
                 <span className="hidden md:inline">Sair</span>
@@ -208,9 +222,13 @@ export function Header({
               <a
                 key={item.label}
                 href={item.href}
-                onClick={() => {
+                onClick={(e) => {
                   if (item.cat) {
+                    e.preventDefault();
                     onSelectCategory(item.cat, item.subcat);
+                  } else if (onNavigateSection) {
+                    e.preventDefault();
+                    onNavigateSection(item.href.replace('#', ''));
                   }
                   setMobileMenuOpen(false);
                 }}
