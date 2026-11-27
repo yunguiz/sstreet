@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect } from 'react';
 import { Search, X, ArrowRight } from 'lucide-react';
 import { Product } from '../types';
+import { ProductImage } from './ProductImage';
+import { filterVisibleProducts } from '../lib/hiddenProducts';
 
 interface SearchBarProps {
   products: Product[];
@@ -23,12 +25,15 @@ export function SearchBar({ products, onSelectProduct, isOpen, onClose }: Search
 
   if (!isOpen) return null;
 
-  const filtered = query.trim() === '' ? [] : products.filter(p => 
-    p.name.toLowerCase().includes(query.toLowerCase()) ||
-    p.subcategory.toLowerCase().includes(query.toLowerCase()) ||
-    p.category.toLowerCase().includes(query.toLowerCase()) ||
-    p.description.toLowerCase().includes(query.toLowerCase())
-  ).slice(0, 5);
+  const visibleProducts = filterVisibleProducts(products);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filtered = normalizedQuery === '' ? [] : visibleProducts.filter(p => 
+    p.name.toLowerCase().includes(normalizedQuery) ||
+    p.subcategory.toLowerCase().includes(normalizedQuery) ||
+    p.category.toLowerCase().includes(normalizedQuery) ||
+    p.description.toLowerCase().includes(normalizedQuery) ||
+    (p.colors || []).some((c) => c.name.toLowerCase().includes(normalizedQuery))
+  ).slice(0, 6);
 
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-start justify-center pt-20 px-4">
@@ -68,7 +73,7 @@ export function SearchBar({ products, onSelectProduct, isOpen, onClose }: Search
             <div className="p-6 text-center text-zinc-500 text-sm">
               <p className="font-semibold text-zinc-400 mb-1">Sugestões rápidas de busca:</p>
               <div className="flex flex-wrap gap-2 justify-center mt-3">
-                {['Moletom Oversized', 'Calça Cargo', 'Sneaker Retro', 'Snapback', 'Shoulder Bag'].map(tag => (
+                {['Moletom Oversized', 'Calça Cargo', 'Sneaker Retro', 'Snapback', 'Boné New Era'].map(tag => (
                   <button
                     key={tag}
                     onClick={() => setQuery(tag)}
@@ -98,9 +103,10 @@ export function SearchBar({ products, onSelectProduct, isOpen, onClose }: Search
                   className="w-full flex items-center gap-3 p-2.5 rounded-lg hover:bg-[#1E1E1E] transition-colors text-left group"
                 >
                   <div className="w-12 h-12 rounded bg-zinc-900 border border-zinc-800 overflow-hidden shrink-0">
-                    <img 
-                      src={product.images[0]} 
-                      alt={product.name} 
+                    <ProductImage
+                      src={product.images[0]}
+                      candidates={product.images}
+                      alt={product.name}
                       className="w-full h-full object-cover group-hover:scale-105 transition-transform"
                     />
                   </div>

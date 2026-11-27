@@ -9,6 +9,7 @@ import {
   normalizeColorOptions,
   parseBlingVariantMeta,
   sortSizes,
+  unifyProductsByColor,
 } from '../lib/catalogVariants';
 import { auth, db } from '../lib/firebase';
 
@@ -94,6 +95,12 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
       : null;
     const rawSize = parsedMeta?.hasExplicitSize ? parsedMeta.size : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
     const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
+    const rawVarImg =
+      typeof v.imagemURL === 'string' && v.imagemURL.trim()
+        ? v.imagemURL.trim()
+        : typeof v.image === 'string' && v.image.trim()
+          ? v.image.trim()
+          : '';
     return {
       id: Number(v.blingId || v.id || 0),
       sku: String(v.codigo || ''),
@@ -101,6 +108,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
       stock: Math.max(0, Number(v.estoque || 0)),
       size: sortSizes([rawSize])[0] || 'Tamanho Único',
       ...(rawColor ? { color: rawColor } : {}),
+      ...(rawVarImg ? { image: rawVarImg } : {}),
     };
   });
 
@@ -184,7 +192,7 @@ async function fetchProductsFromClientFirestore(): Promise<Product[]> {
     });
 
     parsed.sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0));
-    return filterVisibleProducts<Product>(parsed);
+    return unifyProductsByColor(filterVisibleProducts<Product>(parsed));
   } catch (err) {
     console.warn('[Catalog] Aviso ao consultar Firestore direto:', err);
     return [];
@@ -224,7 +232,7 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
         ...p,
         description: cleanDescription(p.description),
       }));
-      const sanitizedProducts = filterVisibleProducts<Product>(rawList).sort(
+      const sanitizedProducts = unifyProductsByColor(filterVisibleProducts<Product>(rawList)).sort(
         (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
       );
       return {
@@ -255,7 +263,7 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
         ...p,
         description: cleanDescription(p.description),
       }));
-      const sanitizedProducts = filterVisibleProducts<Product>(rawList).sort(
+      const sanitizedProducts = unifyProductsByColor(filterVisibleProducts<Product>(rawList)).sort(
         (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
       );
       return {

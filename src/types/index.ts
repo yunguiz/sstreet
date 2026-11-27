@@ -21,6 +21,7 @@ export interface Product {
   rating: number;
   reviewsCount: number;
   images: string[];
+  colorImages?: Record<string, string[]>;
   sizes: string[];
   colors: { name: string; hex: string }[];
   description: string;
@@ -48,6 +49,7 @@ export interface Product {
     stock: number;
     size?: string;
     color?: string;
+    image?: string;
   }[];
 }
 

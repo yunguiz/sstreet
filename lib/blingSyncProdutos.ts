@@ -20,6 +20,7 @@ import {
   parseBlingVariantMeta,
   sortSizes,
 } from '../src/lib/catalogVariants.js';
+import { isExcludedCatalogItem } from '../src/lib/hiddenProducts.js';
 
 export { BLING_OFFICIAL_API_BASE, BLING_API_BASE };
 
@@ -905,9 +906,24 @@ export async function syncBlingProdutosPageToFirestore(
       );
 
       const checkedAtTs = detailCheckedAtMap.get(group.docId);
+      const effectiveName = String(group.nome || existingData?.nome || '');
+      const effectiveSku = String(group.codigo || existingData?.codigo || '');
+      const effectiveCat = String(group.categoriaStore || existingData?.categoriaStore || '');
+      const effectiveSubcat = String(group.subcategoriaStore || existingData?.subcategoriaStore || '');
+      const effectiveDesc = String(group.descricao || existingData?.descricao || '');
+      const excludedFromStore = isExcludedCatalogItem({
+        name: effectiveName,
+        integration: { sku: effectiveSku },
+        category: effectiveCat,
+        subcategory: effectiveSubcat,
+        description: effectiveDesc,
+        sizes: activeTamanhos,
+        variacoes: mergedVariacoes,
+      });
+
       const payload: Record<string, unknown> = {
         blingId: group.blingId,
-        ativo: true,
+        ativo: !excludedFromStore,
         updatedAt: FieldValue.serverTimestamp(),
         syncedAtIso: nowIso,
         ...(checkedAtTs ? { detailCheckedAt: checkedAtTs } : {}),

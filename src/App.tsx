@@ -22,9 +22,6 @@ const OfficialPartnersSection = lazy(() =>
 const SocialProofSection = lazy(() =>
   import('./components/SocialProofSection').then((m) => ({ default: m.SocialProofSection }))
 );
-const StreetwearRailSection = lazy(() =>
-  import('./components/StreetwearRailSection').then((m) => ({ default: m.StreetwearRailSection }))
-);
 const Ps5RaffleSection = lazy(() =>
   import('./components/Ps5RaffleSection').then((m) => ({ default: m.Ps5RaffleSection }))
 );
@@ -90,6 +87,7 @@ function StorefrontApp() {
   const [isPoliciesOpen, setIsPoliciesOpen] = useState(false);
   const [policiesInitialTab, setPoliciesInitialTab] = useState<PolicyTab>('faq');
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
+  const [selectedProductInitialColor, setSelectedProductInitialColor] = useState<string | undefined>(undefined);
   const [activeCategory, setActiveCategory] = useState<ProductCategory | 'all'>('all');
   const [activeSubcategory, setActiveSubcategory] = useState<string | undefined>(undefined);
   const [brandFilter, setBrandFilter] = useState<string | undefined>(undefined);
@@ -262,6 +260,7 @@ function StorefrontApp() {
   ) => {
     const availableStock = getAvailableStockForChoice(product, size, color);
     if ((product.stockCount ?? 0) <= 0 || availableStock <= 0) {
+      setSelectedProductInitialColor(color || undefined);
       setSelectedProduct(product);
       return;
     }
@@ -291,15 +290,24 @@ function StorefrontApp() {
     setIsCartOpen(true);
   };
 
-  // Quick add from card (uses first in-stock size & color; opens details if out of stock)
-  const handleQuickAdd = (product: Product) => {
+  // Quick add from card (uses first in-stock size & color, honoring selected card swatch; opens details if out of stock)
+  const handleQuickAdd = (product: Product, preferredColor?: string) => {
     if ((product.stockCount ?? 0) <= 0) {
+      setSelectedProductInitialColor(preferredColor);
       setSelectedProduct(product);
       return;
     }
-    const firstInStockVar = (product.variantsList || []).find((v) => v.stock > 0);
+    const inStockVars = (product.variantsList || []).filter((v) => v.stock > 0);
+    const matchingColorVar =
+      preferredColor && preferredColor !== 'Cor Única'
+        ? inStockVars.find((v) => (v.color || '').toLowerCase() === preferredColor.toLowerCase())
+        : undefined;
+    const firstInStockVar = matchingColorVar || inStockVars[0];
     const chosenSize = firstInStockVar?.size || product.sizes[0] || 'Tamanho Único';
-    const chosenColor = firstInStockVar?.color || product.colors[0]?.name || 'Cor Única';
+    const chosenColor =
+      firstInStockVar?.color ||
+      (preferredColor && preferredColor !== 'Cor Única' ? preferredColor : product.colors[0]?.name) ||
+      'Cor Única';
     handleAddToCart(product, chosenSize, chosenColor, 1);
   };
 
@@ -490,7 +498,10 @@ function StorefrontApp() {
               setActiveCategory(cat);
               setActiveSubcategory(subcat);
             }}
-            onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+            onOpenProduct={(prod: Product, initialColor?: string) => {
+              setSelectedProductInitialColor(initialColor);
+              setSelectedProduct(prod);
+            }}
             onQuickAdd={handleQuickAdd}
           />
 
@@ -502,18 +513,6 @@ function StorefrontApp() {
               onOpenRafflePage={openRafflePage}
             />
           </Suspense>
-
-          {/* 4.8 Interactive 3D Clothing Rail Gallery Section */}
-          <div id="arara-virtual">
-            <Suspense fallback={null}>
-              <StreetwearRailSection
-                products={products}
-                onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
-                onQuickAdd={handleQuickAdd}
-                onExploreCatalog={scrollToCatalog}
-              />
-            </Suspense>
-          </div>
 
           {/* 5. Official Partner Brands Slider & Showcase */}
           <Suspense fallback={null}>
@@ -561,10 +560,14 @@ function StorefrontApp() {
         {selectedProduct && (
           <ProductModal
             product={selectedProduct}
+            initialColor={selectedProductInitialColor}
             isOpen={Boolean(selectedProduct)}
             isFavorited={favorites.includes(selectedProduct.id)}
             onToggleFavorite={handleToggleFavorite}
-            onClose={() => setSelectedProduct(null)}
+            onClose={() => {
+              setSelectedProduct(null);
+              setSelectedProductInitialColor(undefined);
+            }}
             onAddToCart={handleAddToCart}
             onBuyNow={handleBuyNow}
           />
@@ -622,12 +625,15 @@ function StorefrontApp() {
 
         {/* Slide-over Favorites Wishlist Drawer */}
         {isFavoritesOpen && (
-          <FavoritesDrawer
+            <FavoritesDrawer
             isOpen={isFavoritesOpen}
             onClose={() => setIsFavoritesOpen(false)}
             favoriteProducts={products.filter((p) => favorites.includes(p.id))}
             onRemoveFavorite={handleToggleFavorite}
-            onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+            onOpenProduct={(prod: Product) => {
+              setSelectedProductInitialColor(undefined);
+              setSelectedProduct(prod);
+            }}
             onQuickAdd={handleQuickAdd}
           />
         )}
@@ -638,7 +644,10 @@ function StorefrontApp() {
             isOpen={isSearchOpen}
             onClose={() => setIsSearchOpen(false)}
             products={products}
-            onSelectProduct={(prod: Product) => setSelectedProduct(prod)}
+            onSelectProduct={(prod: Product) => {
+              setSelectedProductInitialColor(undefined);
+              setSelectedProduct(prod);
+            }}
           />
         )}
 

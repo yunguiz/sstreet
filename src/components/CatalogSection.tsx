@@ -15,6 +15,7 @@ import {
   normalizeColorOptions,
   parseBlingVariantMeta,
   sortSizes,
+  unifyProductsByColor,
 } from '../lib/catalogVariants';
 
 interface CatalogSectionProps {
@@ -28,8 +29,8 @@ interface CatalogSectionProps {
   catalogCount?: number;
   onToggleFavorite: (productId: string) => void;
   onSelectCategory: (cat: ProductCategory | 'all', subcat?: string) => void;
-  onOpenProduct: (product: Product) => void;
-  onQuickAdd: (product: Product) => void;
+  onOpenProduct: (product: Product, initialColor?: string) => void;
+  onQuickAdd: (product: Product, preferredColor?: string) => void;
 }
 
 const DEFAULT_PRODUCT_IMAGE = '/assets/streetstore-fallback.svg';
@@ -88,6 +89,12 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
             ? parsedMeta.size
             : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
           const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
+          const rawVarImg =
+            typeof v.imagemURL === 'string' && v.imagemURL.trim()
+              ? v.imagemURL.trim()
+              : typeof v.image === 'string' && v.image.trim()
+                ? v.image.trim()
+                : '';
           return {
             id: Number(v.blingId || 0) || 0,
             sku: String(v.codigo || ''),
@@ -95,6 +102,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
             stock: Math.max(0, Number(v.estoque ?? 0) || 0),
             size: sortSizes([rawSize])[0] || 'Tamanho Único',
             ...(rawColor ? { color: rawColor } : {}),
+            ...(rawVarImg ? { image: rawVarImg } : {}),
           };
         })
       : undefined;
@@ -283,7 +291,10 @@ export function CatalogSection({
       }
     }
 
-    return Array.from(mergedByKey.values()).sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
+    const visibleMerged = filterVisibleProducts<Product>(Array.from(mergedByKey.values()));
+    return unifyProductsByColor(visibleMerged).sort(
+      (a, b) => getNumericBlingId(b) - getNumericBlingId(a)
+    );
   }, [products, firestoreProducts]);
 
   // Reset pagination whenever user changes category, subcategory, brand, or sort
@@ -382,14 +393,6 @@ export function CatalogSection({
                 </button>
               );
             })}
-
-            <a
-              href="#arara-virtual"
-              className="px-3 sm:px-4 py-1.5 sm:py-2 text-[11px] sm:text-xs font-black uppercase tracking-wider rounded-lg transition-all duration-150 whitespace-nowrap shrink-0 cursor-pointer bg-gradient-to-r from-red-950 via-zinc-900 to-red-950 text-red-400 border border-red-700/60 hover:text-white flex items-center gap-1.5 shadow-sm"
-            >
-              <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
-              Novidades na Street
-            </a>
           </div>
 
           {/* Sort Selector */}

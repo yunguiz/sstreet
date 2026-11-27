@@ -1,15 +1,16 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useMemo, useEffect } from 'react';
 import { motion } from 'motion/react';
-import { Eye, Plus, Star, Crown } from 'lucide-react';
+import { Eye, Plus, Crown } from 'lucide-react';
 import { Product } from '../types';
 import { ProductImage } from './ProductImage';
+import { getImagesForColor } from '../lib/catalogVariants';
 
 interface ProductCardProps {
   product: Product;
   isFavorited?: boolean;
   onToggleFavorite?: (productId: string) => void;
-  onOpenDetails: (product: Product) => void;
-  onQuickAdd: (product: Product) => void;
+  onOpenDetails: (product: Product, initialColor?: string) => void;
+  onQuickAdd: (product: Product, preferredColor?: string) => void;
 }
 
 export function ProductCard({
@@ -24,6 +25,29 @@ export function ProductCard({
   const [rotateY, setRotateY] = useState(0);
   const [isHovered, setIsHovered] = useState(false);
 
+  const visibleColors = useMemo(
+    () => (product.colors || []).filter((c) => c?.name && c.name.toLowerCase() !== 'cor única'),
+    [product.colors]
+  );
+
+  const [selectedColor, setSelectedColor] = useState<string>(
+    () => visibleColors[0]?.name || product.colors?.[0]?.name || 'Cor Única'
+  );
+
+  useEffect(() => {
+    setSelectedColor(visibleColors[0]?.name || product.colors?.[0]?.name || 'Cor Única');
+  }, [product.id, visibleColors]);
+
+  const activeImages = useMemo(() => {
+    if (visibleColors.length > 0 && selectedColor) {
+      const colorImgs = getImagesForColor(product, selectedColor);
+      if (colorImgs.length > 0) return colorImgs;
+    }
+    return product.images;
+  }, [product, visibleColors.length, selectedColor]);
+
+  const primaryImage = activeImages[0] || product.images[0];
+
   const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!cardRef.current) return;
     const rect = cardRef.current.getBoundingClientRect();
@@ -33,7 +57,6 @@ export function ProductCard({
     const centerX = rect.width / 2;
     const centerY = rect.height / 2;
 
-    // Subtle 3D tilt angles (max ~8 degrees for elegant responsive feel)
     const rotX = -((y - centerY) / centerY) * 7;
     const rotY = ((x - centerX) / centerX) * 7;
 
@@ -77,13 +100,13 @@ export function ProductCard({
       )}
 
       {/* Visual Image Container */}
-      <div 
-        onClick={() => onOpenDetails(product)}
+      <div
+        onClick={() => onOpenDetails(product, selectedColor)}
         className="relative aspect-[4/3] sm:aspect-[1/1] w-full overflow-hidden bg-zinc-950 cursor-pointer"
       >
         <ProductImage
-          src={product.images[0]}
-          candidates={product.images}
+          src={primaryImage}
+          candidates={activeImages}
           alt={product.name}
           className={`w-full h-full object-cover object-center group-hover:scale-108 transition-transform duration-500 ease-out ${
             isOutOfStock ? 'grayscale-[40%] contrast-90' : ''
@@ -102,7 +125,7 @@ export function ProductCard({
           </div>
         )}
 
-        {/* Minimalist Editorial Tag (Unboxed / Clean) */}
+        {/* Minimalist Editorial Tag */}
         {isOutOfStock ? (
           <div className="absolute top-2 left-2 sm:top-3 sm:left-3 z-10">
             <span className="text-[8px] sm:text-[10px] font-black uppercase tracking-wider px-2 py-0.5 sm:py-1 rounded bg-black/90 text-[#E50914] border border-red-800/80 shadow-md">
@@ -145,14 +168,14 @@ export function ProductCard({
           <button
             onClick={(e) => {
               e.stopPropagation();
-              onOpenDetails(product);
+              onOpenDetails(product, selectedColor);
             }}
             className="flex-1 py-2 px-3 rounded-lg bg-zinc-900/90 hover:bg-black text-white text-xs font-bold uppercase tracking-wider backdrop-blur-md border border-zinc-700 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
           >
             <Eye className="w-3.5 h-3.5" />
-            <span>{isOutOfStock ? 'Ver Detalhes' : 'Ver Detalhes'}</span>
+            <span>Ver Detalhes</span>
           </button>
-          
+
           {isOutOfStock ? (
             <button
               disabled
@@ -165,7 +188,7 @@ export function ProductCard({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                onQuickAdd(product);
+                onQuickAdd(product, selectedColor);
               }}
               title="Adicionar ao Carrinho"
               className="p-2 rounded-lg bg-[#E50914] hover:bg-[#c90812] text-white text-xs font-bold transition-colors cursor-pointer active:scale-95"
@@ -186,12 +209,44 @@ export function ProductCard({
             <span>{product.details.weight.split(' ')[0]}</span>
           </div>
 
-          <h3 
-            onClick={() => onOpenDetails(product)}
+          <h3
+            onClick={() => onOpenDetails(product, selectedColor)}
             className="text-xs sm:text-base font-bold text-white group-hover:text-[#E50914] transition-colors cursor-pointer mt-1 line-clamp-2 leading-tight sm:leading-snug"
           >
             {product.name}
           </h3>
+
+          {/* Interactive Color Swatches when product has multiple colors */}
+          {visibleColors.length > 1 && (
+            <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+              {visibleColors.slice(0, 6).map((c) => {
+                const isSelected = selectedColor.toLowerCase() === c.name.toLowerCase();
+                return (
+                  <button
+                    key={c.name}
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setSelectedColor(c.name);
+                    }}
+                    title={`Cor: ${c.name}`}
+                    aria-label={`Selecionar cor ${c.name}`}
+                    className={`w-4 h-4 sm:w-4.5 sm:h-4.5 rounded-full border transition-all cursor-pointer ${
+                      isSelected
+                        ? 'ring-2 ring-[#E50914] ring-offset-1 ring-offset-[#121212] border-white scale-110'
+                        : 'border-zinc-600 hover:border-zinc-300 opacity-85 hover:opacity-100'
+                    }`}
+                    style={{ backgroundColor: c.hex }}
+                  />
+                );
+              })}
+              {visibleColors.length > 6 && (
+                <span className="text-[10px] text-zinc-400 font-semibold">
+                  +{visibleColors.length - 6}
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Price & Installments Module */}
@@ -231,7 +286,7 @@ export function ProductCard({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                onQuickAdd(product);
+                onQuickAdd(product, selectedColor);
               }}
               title={`Adicionar ${product.name} à sacola`}
               aria-label={`Adicionar ${product.name} à sacola`}

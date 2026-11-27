@@ -42,7 +42,7 @@ export function Header({
   const firstName = currentUser?.name?.trim().split(/\s+/)[0] || 'Cliente';
 
   const navLinks = [
-    { label: 'NOVIDADES NA STREET', href: '#arara-virtual', highlight: true },
+    { label: 'NOVIDADES NA STREET', cat: 'all' as const, subcat: undefined, href: '#catalogo', highlight: true },
     { label: 'Moletoms', cat: 'roupas' as const, subcat: 'hoodies', href: '#catalogo' },
     { label: 'Cargos', cat: 'roupas' as const, subcat: 'calcas', href: '#catalogo' },
     { label: 'Camisetas', cat: 'roupas' as const, subcat: 'camisetas', href: '#catalogo' },
@@ -80,7 +80,7 @@ export function Header({
         {/* Center: Navigation Links */}
         <nav className="hidden xl:flex flex-1 min-w-0 items-center justify-center gap-3.5 2xl:gap-6 px-2 text-[11px] 2xl:text-xs font-bold tracking-normal 2xl:tracking-wider overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {navLinks.map((item) => {
-            const isActive = 'cat' in item && activeCategory === item.cat;
+            const isActive = 'cat' in item && item.cat !== 'all' && activeCategory === item.cat;
             return (
               <a
                 key={item.label}

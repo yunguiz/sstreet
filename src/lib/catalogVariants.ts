@@ -11,6 +11,7 @@ export interface CatalogVariantItem {
   stock: number;
   size?: string;
   color?: string;
+  image?: string;
 }
 
 interface ColorRule {
@@ -499,4 +500,377 @@ export function inferStoreCategory(
 
   return { category: 'roupas', subcategory: 'camisetas' };
 }
+
+const TITLE_COLOR_STRIP_REGEX =
+  /\b(?:off[\s-]*(?:white|withe|whithe)|offwhite|rose\s*gold|azul\s+marinho|all[\s-]?black|multi[\s-]?cor|colorid[oa]|pret[oa]s?|branc[oa]s?|cinza|grafite|chumbo|mescla|azul|verde|militar|musgo|oliva|vermelh[oa]s?|bord[oô]|vinho|marsala|burgundy|rox[oa]s?|lil[aá]s|violeta|lavanda|ros[ae]|pink|marrom|marron|caf[eé]|chocolate|terracota|beg[eé]|areia|caramelo|caqui|khaki|camelo|amarel[oa]s?|laranja|coral|creme|cream|marfim|nude|mostarda|prata|pratead[oa]|dourad[oa]|ouro|estonad[oa]|transparente|cristal|black|white|navy|grey|gray|blue|green|red|purple|brown|yellow|orange|silver|gold)\b/gi;
+
+function isValidPhotoUrl(url?: string): boolean {
+  const u = String(url || '').trim();
+  if (!u) return false;
+  const low = u.toLowerCase();
+  if (low.includes('streetstore-fallback') || low.includes('placeholder') || low.includes('unsplash.com')) {
+    return false;
+  }
+  return true;
+}
+
+function isThumbPhotoUrl(url?: string): boolean {
+  const low = String(url || '').toLowerCase();
+  return low.includes('/t/') || low.includes('/p/') || low.includes('miniatura') || low.includes('_thumb');
+}
+
+function mergeUniquePhotos(...lists: Array<string[] | undefined>): string[] {
+  const seen = new Set<string>();
+  const full: string[] = [];
+  const thumbs: string[] = [];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const raw of list) {
+      const clean = typeof raw === 'string' ? raw.trim() : '';
+      if (!clean || seen.has(clean) || !isValidPhotoUrl(clean)) continue;
+      seen.add(clean);
+      if (isThumbPhotoUrl(clean)) {
+        thumbs.push(clean);
+      } else {
+        full.push(clean);
+      }
+    }
+  }
+  return [...full, ...thumbs];
+}
+
+export function stripColorFromProductTitle(rawTitle: string): string {
+  const original = String(rawTitle || '').replace(/\s+/g, ' ').trim();
+  if (!original) return '';
+
+  // Remove trailing "com off" / color clauses first
+  let cleaned = original
+    .replace(/\bcom\s+off[\s-]*(?:white|withe|whithe)?\b/gi, ' ')
+    .replace(TITLE_COLOR_STRIP_REGEX, ' ');
+
+  // Clean orphaned separators left behind where colors were stripped
+  cleaned = cleaned
+    .replace(/\(\s*[-/+&,\s]*\)/g, ' ')
+    .replace(/\s*[/+&]+\s*(?=[/+&\s]|$)/g, ' ')
+    .replace(/(?:^|\s)[/+&-]+(?=\s|$)/g, ' ')
+    .replace(/\s*[-/:+&]+\s*$/g, '')
+    .replace(/^\s*[-/:+&]+\s*/g, '')
+    .replace(/\s+(?:com|e|de|no|na|em|cor)$/i, '')
+    .replace(/\s*[-/:+&]+\s*$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return cleaned.length >= 3 ? cleaned : original;
+}
+
+export function getImagesForColor(
+  product: {
+    images?: string[];
+    colorImages?: Record<string, string[]>;
+    variantsList?: Array<{ color?: string; image?: string }>;
+  },
+  colorName?: string
+): string[] {
+  const target = normalizeColorName(colorName || '').toLowerCase();
+  if (!target || target === 'cor única' || target === 'cor unica') {
+    return Array.isArray(product.images) ? product.images : [];
+  }
+
+  const fromMap: string[] = [];
+  if (product.colorImages && typeof product.colorImages === 'object') {
+    for (const [k, urls] of Object.entries(product.colorImages)) {
+      if (normalizeColorName(k).toLowerCase() === target && Array.isArray(urls)) {
+        fromMap.push(...urls);
+      }
+    }
+  }
+
+  const fromVars: string[] = [];
+  if (Array.isArray(product.variantsList)) {
+    for (const v of product.variantsList) {
+      if (v?.color && normalizeColorName(v.color).toLowerCase() === target && v.image) {
+        fromVars.push(v.image);
+      }
+    }
+  }
+
+  const resolved = mergeUniquePhotos(fromMap, fromVars);
+  return resolved.length > 0 ? resolved : Array.isArray(product.images) ? product.images : [];
+}
+
+/**
+ * Unifies duplicate storefront products representing the exact same piece in different colors
+ * (e.g., "Camisa Compton Refletiva Preta" + "Camisa Compton Refletiva Branca") into a single
+ * product card with interactive color swatches and per-color image mapping.
+ */
+export function unifyProductsByColor<
+  T extends {
+    id: string;
+    name: string;
+    category: string;
+    subcategory: string;
+    price: number;
+    originalPrice?: number;
+    tag?: any;
+    images: string[];
+    colorImages?: Record<string, string[]>;
+    sizes: string[];
+    colors: { name: string; hex: string }[];
+    stockCount: number;
+    integration?: { sku?: string; blingId?: string; [k: string]: any };
+    variantsList?: Array<{
+      id: number;
+      sku?: string;
+      price: number;
+      comparePrice?: number;
+      stock: number;
+      size?: string;
+      color?: string;
+      image?: string;
+    }>;
+    [k: string]: any;
+  }
+>(products: T[]): T[] {
+  if (!Array.isArray(products) || products.length === 0) return [];
+
+  const normalizeKeyPart = (val: string) =>
+    stripAccents(val).toLowerCase().replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+
+  type PreparedEntry = {
+    product: T;
+    strippedTitle: string;
+    normStrippedTitle: string;
+    titleHadColor: boolean;
+    realColors: string[];
+    colorImages: Record<string, string[]>;
+    variants: NonNullable<T['variantsList']>;
+  };
+
+  const prepared: PreparedEntry[] = products.map((p) => {
+    const strippedTitle = stripColorFromProductTitle(p.name);
+    const normOrig = normalizeKeyPart(p.name);
+    const normStrippedTitle = normalizeKeyPart(strippedTitle);
+    const titleHadColor = Boolean(normStrippedTitle) && normStrippedTitle !== normOrig;
+
+    const titleColor = detectColorFromText(p.name)?.name || '';
+    const existingColors = (p.colors || [])
+      .map((c) => normalizeColorName(c?.name || ''))
+      .filter((c) => Boolean(c) && c.toLowerCase() !== 'cor única');
+
+    const varColors = (p.variantsList || [])
+      .map((v) => normalizeColorName(v?.color || ''))
+      .filter(Boolean);
+
+    const realColors = Array.from(
+      new Set([...existingColors, ...varColors, ...(titleColor ? [titleColor] : [])])
+    );
+    const fallbackSingleColor = realColors.length === 1 ? realColors[0] : titleColor;
+    const validProductImgs = mergeUniquePhotos(p.images);
+
+    const colorImages: Record<string, string[]> = {};
+    if (p.colorImages && typeof p.colorImages === 'object') {
+      for (const [k, urls] of Object.entries(p.colorImages)) {
+        const nk = normalizeColorName(k);
+        if (!nk) continue;
+        const merged = mergeUniquePhotos(colorImages[nk], urls);
+        if (merged.length > 0) colorImages[nk] = merged;
+      }
+    }
+
+    const baseVariants =
+      Array.isArray(p.variantsList) && p.variantsList.length > 0
+        ? p.variantsList.map((v) => {
+            const vColor = normalizeColorName(v.color || '') || fallbackSingleColor || undefined;
+            const vImg = isValidPhotoUrl(v.image) ? String(v.image).trim() : validProductImgs[0];
+            return {
+              ...v,
+              ...(vColor ? { color: vColor } : {}),
+              ...(vImg ? { image: vImg } : {}),
+            };
+          })
+        : [
+            {
+              id: Number(String(p.integration?.blingId || p.id).replace(/\D/g, '')) || 0,
+              sku: p.integration?.sku || p.id,
+              price: p.price,
+              stock: Math.max(0, p.stockCount ?? 0),
+              size: p.sizes?.[0] || 'Tamanho Único',
+              ...(fallbackSingleColor ? { color: fallbackSingleColor } : {}),
+              ...(validProductImgs[0] ? { image: validProductImgs[0] } : {}),
+            },
+          ];
+
+    for (const v of baseVariants) {
+      if (v.color && v.image && isValidPhotoUrl(v.image)) {
+        colorImages[v.color] = mergeUniquePhotos(colorImages[v.color], [v.image]);
+      }
+    }
+    if (fallbackSingleColor && validProductImgs.length > 0) {
+      colorImages[fallbackSingleColor] = mergeUniquePhotos(colorImages[fallbackSingleColor], validProductImgs);
+    }
+
+    return {
+      product: p,
+      strippedTitle,
+      normStrippedTitle,
+      titleHadColor,
+      realColors,
+      colorImages,
+      variants: baseVariants,
+    };
+  });
+
+  const buckets = new Map<string, PreparedEntry[][]>();
+
+  for (const entry of prepared) {
+    const baseBucketKey = `${entry.product.category}::${entry.product.subcategory}::${entry.normStrippedTitle}`;
+    let groups = buckets.get(baseBucketKey);
+    if (!groups) {
+      groups = [];
+      buckets.set(baseBucketKey, groups);
+    }
+
+    const entryColorSet = new Set(entry.realColors.map((c) => c.toLowerCase()));
+    const entryHasColor = entry.titleHadColor || entryColorSet.size > 0;
+
+    const targetGroup = groups.find((group) => {
+      const cand = group[0];
+      const sameBlingId =
+        Boolean(cand.product.integration?.blingId) &&
+        cand.product.integration?.blingId === entry.product.integration?.blingId;
+      if (sameBlingId) return true;
+
+      const maxPrice = Math.max(cand.product.price || 0, entry.product.price || 0, 1);
+      const priceDiffRatio = Math.abs((cand.product.price || 0) - (entry.product.price || 0)) / maxPrice;
+      if (priceDiffRatio > 0.25) return false;
+
+      const candColorSet = new Set(cand.realColors.map((c) => c.toLowerCase()));
+      const candHasColor = cand.titleHadColor || candColorSet.size > 0;
+      if (!candHasColor || !entryHasColor) return false;
+
+      const hasDistinctColor =
+        entry.realColors.some((c) => !candColorSet.has(c.toLowerCase())) ||
+        cand.realColors.some((c) => !entryColorSet.has(c.toLowerCase()));
+      return hasDistinctColor || (cand.titleHadColor && entry.titleHadColor);
+    });
+
+    if (targetGroup) {
+      targetGroup.push(entry);
+    } else {
+      groups.push([entry]);
+    }
+  }
+
+  const unified: T[] = [];
+
+  for (const groups of buckets.values()) {
+    for (const entries of groups) {
+    if (entries.length === 1) {
+      const single = entries[0];
+      const mergedImgs = mergeUniquePhotos(
+        single.product.images,
+        ...Object.values(single.colorImages)
+      );
+      unified.push({
+        ...single.product,
+        images: mergedImgs.length > 0 ? mergedImgs : single.product.images,
+        ...(Object.keys(single.colorImages).length > 0 ? { colorImages: single.colorImages } : {}),
+        variantsList: single.variants,
+      });
+      continue;
+    }
+
+    // Group entries that actually matched each other (first entry is canonical; check price compatibility for remaining)
+    const primary = entries[0];
+    const cleanTitle = entries.some((e) => e.titleHadColor)
+      ? primary.strippedTitle
+      : primary.product.name;
+
+    const variantMap = new Map<string, NonNullable<T['variantsList']>[number]>();
+    for (const e of entries) {
+      for (const v of e.variants) {
+        const varKey =
+          v.id > 0
+            ? `id:${v.id}`
+            : `meta:${String(v.sku || '').toLowerCase()}::${String(v.size || '').toLowerCase()}::${String(v.color || '').toLowerCase()}`;
+        const prev = variantMap.get(varKey);
+        if (!prev) {
+          variantMap.set(varKey, { ...v });
+        } else {
+          variantMap.set(varKey, {
+            ...prev,
+            stock: Math.max(prev.stock, v.stock),
+            image: prev.image || v.image,
+          });
+        }
+      }
+    }
+
+    const combinedVariants = Array.from(variantMap.values());
+    const inStockVariants = combinedVariants.filter((v) => v.stock > 0);
+    const totalStock = inStockVariants.reduce((sum, v) => sum + v.stock, 0);
+
+    const combinedSizes = sortSizes(
+      (inStockVariants.length > 0 ? inStockVariants : combinedVariants)
+        .map((v) => v.size || '')
+        .filter(Boolean)
+    );
+
+    const combinedColorImages: Record<string, string[]> = {};
+    for (const e of entries) {
+      for (const [colorKey, urls] of Object.entries(e.colorImages)) {
+        const nk = normalizeColorName(colorKey);
+        if (!nk) continue;
+        const merged = mergeUniquePhotos(combinedColorImages[nk], urls);
+        if (merged.length > 0) combinedColorImages[nk] = merged;
+      }
+    }
+
+    const inStockColors = inStockVariants
+      .map((v) => v.color || '')
+      .filter(Boolean);
+    const allColorNames =
+      inStockColors.length > 0
+        ? inStockColors
+        : entries.flatMap((e) => e.realColors);
+    const combinedColors = normalizeColorOptions(allColorNames);
+
+    const combinedImages = mergeUniquePhotos(
+      ...entries.map((e) => e.product.images),
+      ...Object.values(combinedColorImages)
+    );
+
+    const lowestPrice = Math.min(...entries.map((e) => e.product.price).filter((n) => n > 0));
+    const highestOriginal = Math.max(
+      ...entries.map((e) => e.product.originalPrice || Math.round(e.product.price * 1.3))
+    );
+
+    const nextTag =
+      totalStock <= 0
+        ? 'SEM ESTOQUE'
+        : totalStock <= 3
+          ? 'POUCAS UNIDADES'
+          : entries.some((e) => e.product.tag === 'NOVO DROP')
+            ? 'NOVO DROP'
+            : primary.product.tag;
+
+    unified.push({
+      ...primary.product,
+      name: cleanTitle || primary.product.name,
+      price: Number.isFinite(lowestPrice) ? lowestPrice : primary.product.price,
+      originalPrice: Number.isFinite(highestOriginal) ? highestOriginal : primary.product.originalPrice,
+      tag: nextTag,
+      stockCount: totalStock,
+      sizes: combinedSizes.length > 0 ? combinedSizes : primary.product.sizes,
+      colors: combinedColors,
+      images: combinedImages.length > 0 ? combinedImages : primary.product.images,
+      ...(Object.keys(combinedColorImages).length > 0 ? { colorImages: combinedColorImages } : {}),
+      variantsList: combinedVariants,
+    });
+    }
+  }
+
+  return unified;
+}
+
 

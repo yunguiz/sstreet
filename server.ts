@@ -26,6 +26,7 @@ import {
   normalizeColorOptions,
   parseBlingVariantMeta,
   sortSizes,
+  unifyProductsByColor,
 } from './src/lib/catalogVariants.js';
 import {
   applyBlingImageOverrides,
@@ -220,6 +221,9 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
             const vMeta = parseBlingVariantMeta({ nome: String(v.nome || ''), isParentContainer: false });
             const vStock = Math.max(0, Number(v.estoque || 0) || 0);
             const vPrice = Number(v.preco || priceVal);
+            const rawVarImg = typeof v.imagemURL === 'string' && v.imagemURL.trim() && !isPlaceholderImageUrl(v.imagemURL)
+              ? v.imagemURL.trim()
+              : (typeof v.image === 'string' && v.image.trim() && !isPlaceholderImageUrl(v.image) ? v.image.trim() : '');
             return {
               id: Number(v.blingId || blingId),
               sku: String(v.codigo || `${groupSku}-${vMeta.size}`),
@@ -227,6 +231,7 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
               stock: vStock,
               size: String(v.tamanho || vMeta.size || 'Tamanho Único'),
               ...(v.cor || vMeta.color?.name ? { color: String(v.cor || vMeta.color?.name) } : {}),
+              ...(rawVarImg ? { image: rawVarImg } : {}),
             };
           })
         : [
@@ -236,6 +241,9 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
               price: priceVal,
               stock: Math.max(0, Number(d.estoque || 0) || 0),
               size: Array.isArray(d.tamanhos) && d.tamanhos.length > 0 ? String(d.tamanhos[0]) : 'Tamanho Único',
+              ...(typeof d.imagemURL === 'string' && d.imagemURL.trim() && !isPlaceholderImageUrl(d.imagemURL)
+                ? { image: d.imagemURL.trim() }
+                : {}),
             },
           ];
 
@@ -320,7 +328,7 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
       });
     });
 
-    const filtered = applyBlingImageOverrides(filterVisibleProducts(fallbackProducts))
+    const filtered = unifyProductsByColor(applyBlingImageOverrides(filterVisibleProducts(fallbackProducts)))
       .sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0))
       .map((p, idx) => ({
         ...p,
@@ -632,14 +640,19 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
             };
           });
 
-          const variantsList = parsedVariants.map(({ item: it, meta, stock: vStock }) => ({
-            id: it.id,
-            sku: it.codigo || `${groupSku}-${meta.size}`,
-            price: parseFloat(it.preco || String(group.price || '119.90')),
-            stock: vStock,
-            size: meta.size,
-            ...(meta.color?.name ? { color: meta.color.name } : {}),
-          }));
+          const variantsList = parsedVariants.map(({ item: it, meta, stock: vStock }) => {
+            const varImgs = extractImagesFromBlingItem(it).filter((u) => !isPlaceholderImageUrl(u));
+            const fullVarImg = varImgs.find((u) => !isThumbnailLikeUrl(u)) || varImgs[0] || '';
+            return {
+              id: it.id,
+              sku: it.codigo || `${groupSku}-${meta.size}`,
+              price: parseFloat(it.preco || String(group.price || '119.90')),
+              stock: vStock,
+              size: meta.size,
+              ...(meta.color?.name ? { color: meta.color.name } : {}),
+              ...(fullVarImg ? { image: fullVarImg } : {}),
+            };
+          });
 
           // Total stock across actual sellable items/variants
           const totalStock = variantsList.reduce((acc, v) => acc + Math.max(0, v.stock), 0);
@@ -922,7 +935,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
     const allConsolidatedProducts = Array.from(consolidatedMap.values());
     const inStockProducts = allConsolidatedProducts.filter((p) => (p.stockCount ?? 0) > 0);
     const visibleProducts = filterVisibleProducts(inStockProducts);
-    let finalProducts = applyBlingImageOverrides(visibleProducts)
+    let finalProducts = unifyProductsByColor(applyBlingImageOverrides(visibleProducts))
       .sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0))
       .map((p, idx) => ({
         ...p,

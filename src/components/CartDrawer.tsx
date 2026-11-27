@@ -41,6 +41,7 @@ import {
 } from '../services/shipping';
 import { CustomerProfile } from '../services/auth';
 import { ProductImage } from './ProductImage';
+import { getImagesForColor } from '../lib/catalogVariants';
 
 interface CartDrawerProps {
   isOpen: boolean;
@@ -1138,15 +1139,17 @@ export function CartDrawer({
             // 4. STEP 1: REVIEW CART ITEMS
             ) : step === 'cart' ? (
               <div className="space-y-3">
-                {items.map((item) => (
+                {items.map((item) => {
+                  const colorImgs = getImagesForColor(item.product, item.selectedColor);
+                  return (
                   <div
                     key={item.id}
                     className="flex gap-3 p-3 bg-zinc-900/60 rounded-xl border border-zinc-800/80"
                   >
                     <div className="w-16 h-16 rounded-lg bg-zinc-950 border border-zinc-800 overflow-hidden shrink-0">
                       <ProductImage
-                        src={item.product.images[0]}
-                        candidates={item.product.images}
+                        src={colorImgs[0] || item.product.images[0]}
+                        candidates={colorImgs.length > 0 ? colorImgs : item.product.images}
                         alt={item.product.name}
                         className="w-full h-full object-cover"
                       />
@@ -1206,7 +1209,8 @@ export function CartDrawer({
                       </div>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
 
                 {/* Melhor Envio Live Shipping Calculator in Cart */}
                 <div className="p-3.5 bg-zinc-900/70 border border-zinc-800 rounded-xl space-y-2.5 mt-2">

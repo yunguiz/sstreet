@@ -1,26 +1,32 @@
 import { useState, useEffect, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { 
-  X, 
-  ShoppingBag, 
-  Truck, 
-  Ruler, 
-  Check, 
-  ShieldCheck, 
+import {
+  X,
+  ShoppingBag,
+  Truck,
+  Ruler,
+  Check,
+  ShieldCheck,
   Database,
   ArrowRight,
   Crown,
-  AlertCircle
+  AlertCircle,
+  ZoomIn,
+  ZoomOut,
+  ChevronLeft,
+  ChevronRight,
+  Maximize2
 } from 'lucide-react';
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
-import { sortSizes } from '../lib/catalogVariants';
+import { getImagesForColor, sortSizes } from '../lib/catalogVariants';
 import { calculateShippingQuotes, ShippingOption } from '../services/shipping';
 import { ProductImage } from './ProductImage';
 
 interface ProductModalProps {
   product: Product | null;
   isOpen: boolean;
+  initialColor?: string;
   isFavorited?: boolean;
   onToggleFavorite?: (productId: string) => void;
   onClose: () => void;
@@ -31,6 +37,7 @@ interface ProductModalProps {
 export function ProductModal({
   product,
   isOpen,
+  initialColor,
   isFavorited = false,
   onToggleFavorite,
   onClose,
@@ -40,12 +47,19 @@ export function ProductModal({
   // Declare all hooks unconditionally at the top of the component (Rules of Hooks)
   const [selectedImage, setSelectedImage] = useState(0);
   const [selectedSize, setSelectedSize] = useState(product?.sizes?.[0] || 'Tamanho Único');
-  const [selectedColor, setSelectedColor] = useState(product?.colors?.[0]?.name || 'Cor Única');
+  const [selectedColor, setSelectedColor] = useState(initialColor || product?.colors?.[0]?.name || 'Cor Única');
   const [quantity, setQuantity] = useState(1);
   const [showSizeGuide, setShowSizeGuide] = useState(false);
   const [showIntegrationDetails, setShowIntegrationDetails] = useState(false);
 
-  // CEP simulator state (Melhor Envio live calculation)
+  // Hover zoom & Fullscreen Lightbox state
+  const [isHoverZooming, setIsHoverZooming] = useState(false);
+  const [zoomOrigin, setZoomOrigin] = useState({ x: 50, y: 50 });
+  const [isLightboxOpen, setIsLightboxOpen] = useState(false);
+  const [isLightboxZoomed, setIsLightboxZoomed] = useState(false);
+  const [lightboxZoomOrigin, setLightboxZoomOrigin] = useState({ x: 50, y: 50 });
+
+  // CEP simulator state
   const [cep, setCep] = useState('');
   const [shippingCalculated, setShippingCalculated] = useState(false);
   const [shippingLoading, setShippingLoading] = useState(false);
@@ -65,6 +79,31 @@ export function ProductModal({
     const filtered = baseColors.filter((c) => activeColorSet.has(c.name.toLowerCase()));
     return filtered.length > 0 ? filtered : baseColors;
   }, [product, inStockVariants]);
+
+  const galleryImages = useMemo(() => {
+    if (!product) return [];
+    const pool: string[] = [];
+    const pushUrl = (u?: string) => {
+      const clean = typeof u === 'string' ? u.trim() : '';
+      if (!clean || pool.includes(clean)) return;
+      pool.push(clean);
+    };
+
+    for (const img of product.images || []) pushUrl(img);
+    if (product.colorImages && typeof product.colorImages === 'object') {
+      for (const urls of Object.values(product.colorImages)) {
+        if (Array.isArray(urls)) {
+          for (const img of urls) pushUrl(img);
+        }
+      }
+    }
+    for (const v of product.variantsList || []) {
+      if (v.image) pushUrl(v.image);
+    }
+
+    const real = pool.filter((u) => !u.includes('streetstore-fallback'));
+    return real.length > 0 ? real : pool;
+  }, [product]);
 
   const selectableSizes = useMemo(() => {
     if (!product) return [];
@@ -97,16 +136,33 @@ export function ProductModal({
     return product.stockCount ?? 0;
   }, [product, inStockVariants, selectedSize, selectedColor]);
 
-  // Synchronize selection whenever the active product changes
+  const resolveImageIndexForColor = (colorName: string): number => {
+    if (!product || galleryImages.length === 0) return 0;
+    const colorImgs = getImagesForColor(product, colorName);
+    for (const url of colorImgs) {
+      const idx = galleryImages.indexOf(url);
+      if (idx >= 0) return idx;
+    }
+    return 0;
+  };
+
+  // Synchronize selection whenever active product or initialColor changes
   useEffect(() => {
     if (product) {
-      setSelectedColor(selectableColors[0]?.name || product.colors?.[0]?.name || 'Cor Única');
+      const matchedInitial =
+        initialColor &&
+        selectableColors.find((c) => c.name.toLowerCase() === initialColor.toLowerCase())?.name;
+      const nextColor = matchedInitial || selectableColors[0]?.name || product.colors?.[0]?.name || 'Cor Única';
+      setSelectedColor(nextColor);
       setSelectedSize(selectableSizes[0] || product.sizes?.[0] || 'Tamanho Único');
-      setSelectedImage(0);
+      setSelectedImage(resolveImageIndexForColor(nextColor));
       setShowSizeGuide(false);
       setQuantity(1);
+      setIsLightboxOpen(false);
+      setIsLightboxZoomed(false);
+      setIsHoverZooming(false);
     }
-  }, [product?.id]);
+  }, [product?.id, initialColor]);
 
   // Keep selectedSize and quantity valid when color or available sizes update
   useEffect(() => {
@@ -121,6 +177,31 @@ export function ProductModal({
     }
   }, [selectedVariantStock, quantity]);
 
+  // Keyboard navigation for Lightbox and modal close
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        if (isLightboxOpen) {
+          setIsLightboxOpen(false);
+          setIsLightboxZoomed(false);
+        } else {
+          onClose();
+        }
+      } else if (isLightboxOpen && galleryImages.length > 1) {
+        if (e.key === 'ArrowRight') {
+          setSelectedImage((prev) => (prev + 1) % galleryImages.length);
+          setIsLightboxZoomed(false);
+        } else if (e.key === 'ArrowLeft') {
+          setSelectedImage((prev) => (prev - 1 + galleryImages.length) % galleryImages.length);
+          setIsLightboxZoomed(false);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, isLightboxOpen, galleryImages.length, onClose]);
+
   // Early return only AFTER all hooks are declared
   if (!product || !isOpen) return null;
 
@@ -133,6 +214,28 @@ export function ProductModal({
 
   const isSingleColor = selectableColors.length <= 1;
   const isOutOfStock = (product.stockCount ?? 0) <= 0 || selectableSizes.length === 0;
+  const activeImageSrc = galleryImages[selectedImage] || galleryImages[0] || product.images[0];
+
+  const handleSelectColor = (colorName: string) => {
+    setSelectedColor(colorName);
+    const matchingIdx = resolveImageIndexForColor(colorName);
+    setSelectedImage(matchingIdx);
+  };
+
+  const handleMainImageMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+    setZoomOrigin({ x, y });
+  };
+
+  const handleLightboxMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!isLightboxZoomed) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = Math.max(0, Math.min(100, ((e.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((e.clientY - rect.top) / rect.height) * 100));
+    setLightboxZoomOrigin({ x, y });
+  };
 
   const handleSimulateShipping = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -162,10 +265,13 @@ export function ProductModal({
   };
 
   const installments = (product.price / 6).toFixed(2).replace('.', ',');
+  const cleanedDescription = cleanDescription(product.description);
 
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-6">
-      
+    <div
+      className="fixed inset-0 z-50 overflow-y-auto bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-6"
+      onClick={onClose}
+    >
       {/* Modal Dialog Card */}
       <motion.div
         initial={{ opacity: 0, scale: 0.95, y: 15 }}
@@ -201,43 +307,86 @@ export function ProductModal({
         </button>
 
         <div className="grid grid-cols-1 md:grid-cols-2">
-          
-          {/* Left Column: Gallery */}
+          {/* Left Column: Gallery with Hover Loupe Zoom & Click Lightbox */}
           <div className="p-4 sm:p-6 bg-zinc-950 flex flex-col justify-between border-b md:border-b-0 md:border-r border-[#262626]">
-            {/* Main Active Image */}
-            <div className="relative aspect-square w-full rounded-xl overflow-hidden bg-[#181818] border border-zinc-800">
-              <ProductImage
-                src={product.images[selectedImage] || product.images[0]}
-                candidates={product.images}
-                alt={product.name}
-                loading="eager"
-                className="w-full h-full object-cover object-center"
-              />
-              {product.tag && (
-                <span className="absolute top-3 left-3 bg-[#E50914] text-white text-[10px] font-black uppercase tracking-wider px-2.5 py-1 rounded">
-                  {product.tag}
+            <div>
+              {/* Main Active Image with Hover Zoom + Click to Enlarge */}
+              <div
+                onMouseEnter={(e) => {
+                  if (window.matchMedia('(pointer: fine)').matches) {
+                    handleMainImageMouseMove(e);
+                    setIsHoverZooming(true);
+                  }
+                }}
+                onMouseMove={(e) => {
+                  if (isHoverZooming) handleMainImageMouseMove(e);
+                }}
+                onMouseLeave={() => setIsHoverZooming(false)}
+                onClick={() => {
+                  setIsLightboxZoomed(false);
+                  setIsLightboxOpen(true);
+                }}
+                role="button"
+                tabIndex={0}
+                aria-label="Ampliar imagem do produto"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    setIsLightboxZoomed(false);
+                    setIsLightboxOpen(true);
+                  }
+                }}
+                className="group/img relative aspect-square w-full rounded-xl overflow-hidden bg-[#181818] border border-zinc-800 cursor-zoom-in select-none"
+              >
+                <div
+                  className="w-full h-full transition-transform duration-150 ease-out will-change-transform"
+                  style={{
+                    transform: isHoverZooming ? 'scale(2.05)' : 'scale(1)',
+                    transformOrigin: `${zoomOrigin.x}% ${zoomOrigin.y}%`,
+                  }}
+                >
+                  <ProductImage
+                    src={activeImageSrc}
+                    candidates={galleryImages}
+                    alt={`${product.name}${selectedColor && selectedColor !== 'Cor Única' ? ` - ${selectedColor}` : ''}`}
+                    loading="eager"
+                    className="w-full h-full object-cover object-center"
+                  />
+                </div>
+
+                {product.tag && (
+                  <span className="absolute top-3 left-3 z-10 bg-[#E50914] text-white text-[10px] font-black uppercase tracking-wider px-2.5 py-1 rounded pointer-events-none">
+                    {product.tag}
+                  </span>
+                )}
+
+                {/* Subtle Zoom / Lightbox Affordance Hint */}
+                <span className="absolute bottom-3 right-3 z-10 inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-black/75 border border-zinc-700/80 text-[10px] font-bold text-zinc-200 backdrop-blur-sm opacity-90 group-hover/img:opacity-100 transition-opacity pointer-events-none">
+                  <Maximize2 className="w-3 h-3 text-[#E50914]" />
+                  <span>Ampliar</span>
                 </span>
+              </div>
+
+              {/* Thumbnails Row */}
+              {galleryImages.length > 1 && (
+                <div className="flex items-center gap-3 mt-4 overflow-x-auto no-scrollbar">
+                  {galleryImages.map((img, idx) => (
+                    <button
+                      key={`${img}-${idx}`}
+                      type="button"
+                      onClick={() => setSelectedImage(idx)}
+                      className={`relative w-16 h-16 rounded-lg overflow-hidden border-2 transition-all shrink-0 cursor-pointer ${
+                        selectedImage === idx
+                          ? 'border-[#E50914] scale-105'
+                          : 'border-zinc-800 opacity-60 hover:opacity-100'
+                      }`}
+                    >
+                      <ProductImage src={img} alt="" className="w-full h-full object-cover" />
+                    </button>
+                  ))}
+                </div>
               )}
             </div>
-
-            {/* Thumbnails Row */}
-            {product.images.length > 1 && (
-              <div className="flex items-center gap-3 mt-4 overflow-x-auto no-scrollbar">
-                {product.images.map((img, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => setSelectedImage(idx)}
-                    className={`relative w-16 h-16 rounded-lg overflow-hidden border-2 transition-all shrink-0 ${
-                      selectedImage === idx
-                        ? 'border-[#E50914] scale-105'
-                        : 'border-zinc-800 opacity-60 hover:opacity-100'
-                    }`}
-                  >
-                    <ProductImage src={img} alt="" className="w-full h-full object-cover" />
-                  </button>
-                ))}
-              </div>
-            )}
 
             {/* Model & Origin Notice */}
             <div className="mt-4 pt-4 border-t border-zinc-800/80 text-xs text-zinc-400 space-y-1">
@@ -246,10 +395,9 @@ export function ProductModal({
             </div>
           </div>
 
-          {/* Right Column: Information, Variant Pickers & Actions */}
-          <div className="p-6 flex flex-col justify-between space-y-6 max-h-[85vh] overflow-y-auto">
-            
-            {/* Header info */}
+          {/* Right Column: Purchase Options on TOP -> Description at BOTTOM */}
+          <div className="p-6 flex flex-col justify-between space-y-5 max-h-[85vh] overflow-y-auto">
+            {/* 1. Header info & Price */}
             <div>
               <div className="flex items-center gap-2 text-xs uppercase tracking-wider text-zinc-400 font-bold mb-1">
                 <span className="text-[#E50914]">{product.category}</span>
@@ -281,7 +429,7 @@ export function ProductModal({
                 ou em até <strong className="text-zinc-200">6x de R$ {installments}</strong> sem juros no cartão
               </p>
 
-              {/* Stock Indicator & Out of Stock Automatic Renewal Notice */}
+              {/* Stock Indicator */}
               <div className="mt-3">
                 {isOutOfStock ? (
                   <div className="p-3.5 rounded-xl bg-red-950/40 border border-red-800/60 text-xs space-y-1.5 shadow-md">
@@ -308,12 +456,57 @@ export function ProductModal({
               </div>
             </div>
 
-            {/* Description (100% clean of <p>, <br> and HTML tags) */}
-            <div className="text-xs sm:text-sm text-zinc-300 leading-relaxed border-t border-zinc-800/80 pt-3 whitespace-pre-line">
-              {cleanDescription(product.description)}
-            </div>
+            {/* 2. Color Selector (switches image immediately on click) */}
+            {isSingleColor ? (
+              <div className="space-y-1.5 border-t border-zinc-800/80 pt-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">
+                    Cor:
+                  </span>
+                  <span className="text-[10px] font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded tracking-wide uppercase">
+                    {(selectableColors[0]?.name || 'Cor Única') === 'Cor Única' ? 'Modelo Exclusivo' : 'Cor Única'}
+                  </span>
+                </div>
+                <div className="inline-flex items-center gap-2.5 px-3.5 py-2 rounded-lg bg-zinc-900/90 border border-zinc-700/80 text-xs font-medium text-white shadow-xs">
+                  <span
+                    className="w-3.5 h-3.5 rounded-full border border-zinc-600 shrink-0"
+                    style={{ backgroundColor: selectableColors[0]?.hex || '#1C1C1C' }}
+                  />
+                  <span className="font-semibold">{selectableColors[0]?.name || 'Cor Única'}</span>
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-2 border-t border-zinc-800/80 pt-3">
+                <span className="text-xs font-bold uppercase tracking-wider text-zinc-200 block">
+                  Cor: <strong className="text-white">{selectedColor}</strong>
+                </span>
+                <div className="flex flex-wrap items-center gap-2.5">
+                  {selectableColors.map((c) => (
+                    <button
+                      key={c.name}
+                      type="button"
+                      onClick={() => handleSelectColor(c.name)}
+                      title={c.name}
+                      className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer ${
+                        selectedColor === c.name
+                          ? 'border-[#E50914] bg-zinc-800 text-white shadow-sm shadow-red-950/40'
+                          : 'border-zinc-800 bg-[#161616] text-zinc-400 hover:text-white hover:border-zinc-700'
+                      }`}
+                    >
+                      <span
+                        className="w-3.5 h-3.5 rounded-full border border-zinc-600 shrink-0"
+                        style={{ backgroundColor: c.hex }}
+                      />
+                      <span>{c.name}</span>
+                      {selectedColor === c.name && <Check className="w-3.5 h-3.5 text-[#E50914]" />}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
 
-            {/* Size Selector: Smart handling for unique sizes (accessories, sunglasses, etc.) vs clothing/shoes */}
+            {/* 3. Size Selector */}
             {isUniqueSize ? (
               <div className="space-y-1.5 border-t border-zinc-800/80 pt-3">
                 <div className="flex items-center justify-between">
@@ -352,6 +545,7 @@ export function ProductModal({
                   {selectableSizes.map((sz) => (
                     <button
                       key={sz}
+                      type="button"
                       onClick={() => setSelectedSize(sz)}
                       className={`px-3.5 py-2 text-xs font-bold rounded-lg border transition-all cursor-pointer ${
                         selectedSize === sz
@@ -393,65 +587,17 @@ export function ProductModal({
               </div>
             )}
 
-            {/* Color Selector: Smart handling for single color vs multi-color pieces */}
-            {isSingleColor ? (
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">
-                    Cor:
-                  </span>
-                  <span className="text-[10px] font-bold text-zinc-400 bg-zinc-900 border border-zinc-800 px-2 py-0.5 rounded tracking-wide uppercase">
-                    {(selectableColors[0]?.name || 'Cor Única') === 'Cor Única' ? 'Modelo Exclusivo' : 'Cor Única'}
-                  </span>
-                </div>
-                <div className="inline-flex items-center gap-2.5 px-3.5 py-2 rounded-lg bg-zinc-900/90 border border-zinc-700/80 text-xs font-medium text-white shadow-xs">
-                  <span
-                    className="w-3.5 h-3.5 rounded-full border border-zinc-600 shrink-0"
-                    style={{ backgroundColor: selectableColors[0]?.hex || '#1C1C1C' }}
-                  />
-                  <span className="font-semibold">{selectableColors[0]?.name || 'Cor Única'}</span>
-                  <Check className="w-3.5 h-3.5 text-emerald-400" />
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-2">
-                <span className="text-xs font-bold uppercase tracking-wider text-zinc-200 block">
-                  Cor: <strong className="text-white">{selectedColor}</strong>
-                </span>
-                <div className="flex flex-wrap items-center gap-2.5">
-                  {selectableColors.map((c) => (
-                    <button
-                      key={c.name}
-                      onClick={() => setSelectedColor(c.name)}
-                      title={c.name}
-                      className={`flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer ${
-                        selectedColor === c.name
-                          ? 'border-[#E50914] bg-zinc-800 text-white shadow-sm shadow-red-950/40'
-                          : 'border-zinc-800 bg-[#161616] text-zinc-400 hover:text-white hover:border-zinc-700'
-                      }`}
-                    >
-                      <span
-                        className="w-3.5 h-3.5 rounded-full border border-zinc-600 shrink-0"
-                        style={{ backgroundColor: c.hex }}
-                      />
-                      <span>{c.name}</span>
-                      {selectedColor === c.name && <Check className="w-3.5 h-3.5 text-[#E50914]" />}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Quantity Selector */}
+            {/* 4. Quantity Selector */}
             <div className="flex items-center gap-4">
               <span className="text-xs font-bold uppercase tracking-wider text-zinc-200">
                 Quantidade:
               </span>
               <div className={`flex items-center bg-[#181818] border border-zinc-700 rounded-lg overflow-hidden ${isOutOfStock ? 'opacity-40 cursor-not-allowed' : ''}`}>
                 <button
+                  type="button"
                   disabled={isOutOfStock}
                   onClick={() => setQuantity(Math.max(1, quantity - 1))}
-                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed"
+                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed cursor-pointer"
                 >
                   -
                 </button>
@@ -459,9 +605,10 @@ export function ProductModal({
                   {isOutOfStock ? 0 : quantity}
                 </span>
                 <button
+                  type="button"
                   disabled={isOutOfStock || quantity >= selectedVariantStock}
                   onClick={() => setQuantity(Math.min(Math.max(1, selectedVariantStock), quantity + 1))}
-                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="px-3 py-1.5 text-zinc-400 hover:text-white hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40 cursor-pointer"
                 >
                   +
                 </button>
@@ -473,7 +620,44 @@ export function ProductModal({
               )}
             </div>
 
-            {/* Frete Simulator */}
+            {/* 5. Primary Action Buttons */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+              <button
+                type="button"
+                disabled={isOutOfStock}
+                onClick={() => {
+                  if (isOutOfStock) return;
+                  onAddToCart(product, selectedSize, selectedColor, quantity);
+                }}
+                className={`py-3 px-4 rounded-xl border font-bold text-xs uppercase tracking-wider transition-all duration-150 flex items-center justify-center gap-2 ${
+                  isOutOfStock
+                    ? 'bg-zinc-900/60 border-zinc-800 text-zinc-500 cursor-not-allowed opacity-60'
+                    : 'bg-zinc-900 hover:bg-zinc-800 text-white border-zinc-700 active:scale-95 cursor-pointer'
+                }`}
+              >
+                <ShoppingBag className="w-4 h-4" />
+                <span>{isOutOfStock ? 'Sem Estoque' : 'Adicionar ao Carrinho'}</span>
+              </button>
+
+              <button
+                type="button"
+                disabled={isOutOfStock}
+                onClick={() => {
+                  if (isOutOfStock) return;
+                  onBuyNow(product, selectedSize, selectedColor, quantity);
+                }}
+                className={`py-3 px-4 rounded-xl font-black text-xs uppercase tracking-wider transition-all duration-150 flex items-center justify-center gap-2 ${
+                  isOutOfStock
+                    ? 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-60'
+                    : 'bg-[#E50914] hover:bg-[#c90812] text-white active:scale-95 shadow-lg shadow-red-950/60 cursor-pointer'
+                }`}
+              >
+                <span>{isOutOfStock ? 'Esgotado no Momento' : 'Comprar Agora'}</span>
+                {!isOutOfStock && <ArrowRight className="w-4 h-4" />}
+              </button>
+            </div>
+
+            {/* 6. Frete Simulator */}
             <div className="p-3 rounded-xl bg-[#161616] border border-zinc-800 space-y-2">
               <div className="flex items-center justify-between">
                 <span className="text-xs font-bold text-zinc-200 flex items-center gap-1.5 uppercase">
@@ -535,42 +719,19 @@ export function ProductModal({
               )}
             </div>
 
-            {/* Primary Action Buttons (Disabled when Out of Stock) */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-              <button
-                disabled={isOutOfStock}
-                onClick={() => {
-                  if (isOutOfStock) return;
-                  onAddToCart(product, selectedSize, selectedColor, quantity);
-                }}
-                className={`py-3 px-4 rounded-xl border font-bold text-xs uppercase tracking-wider transition-all duration-150 flex items-center justify-center gap-2 ${
-                  isOutOfStock
-                    ? 'bg-zinc-900/60 border-zinc-800 text-zinc-500 cursor-not-allowed opacity-60'
-                    : 'bg-zinc-900 hover:bg-zinc-800 text-white border-zinc-700 active:scale-95 cursor-pointer'
-                }`}
-              >
-                <ShoppingBag className="w-4 h-4" />
-                <span>{isOutOfStock ? 'Sem Estoque' : 'Adicionar ao Carrinho'}</span>
-              </button>
+            {/* 7. Product Description (Moved to the bottom, below purchase & shipping controls) */}
+            {cleanedDescription && (
+              <div className="border-t border-zinc-800/80 pt-4 space-y-1.5">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-200">
+                  Descrição do Produto
+                </h3>
+                <div className="text-xs sm:text-sm text-zinc-300 leading-relaxed whitespace-pre-line">
+                  {cleanedDescription}
+                </div>
+              </div>
+            )}
 
-              <button
-                disabled={isOutOfStock}
-                onClick={() => {
-                  if (isOutOfStock) return;
-                  onBuyNow(product, selectedSize, selectedColor, quantity);
-                }}
-                className={`py-3 px-4 rounded-xl font-black text-xs uppercase tracking-wider transition-all duration-150 flex items-center justify-center gap-2 ${
-                  isOutOfStock
-                    ? 'bg-zinc-800 text-zinc-500 border border-zinc-700 cursor-not-allowed opacity-60'
-                    : 'bg-[#E50914] hover:bg-[#c90812] text-white active:scale-95 shadow-lg shadow-red-950/60 cursor-pointer'
-                }`}
-              >
-                <span>{isOutOfStock ? 'Esgotado no Momento' : 'Comprar Agora'}</span>
-                {!isOutOfStock && <ArrowRight className="w-4 h-4" />}
-              </button>
-            </div>
-
-            {/* Technical Specifications Accordion */}
+            {/* 8. Technical Specifications Accordion */}
             <div className="pt-2 border-t border-zinc-800/80">
               <button
                 type="button"
@@ -606,13 +767,143 @@ export function ProductModal({
               </span>
               <span>Troca grátis em 7 dias</span>
             </div>
-
           </div>
-
         </div>
-
       </motion.div>
 
+      {/* Fullscreen Lightbox Modal (Click image to enlarge) */}
+      <AnimatePresence>
+        {isLightboxOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.16 }}
+            onClick={(e) => {
+              e.stopPropagation();
+              setIsLightboxOpen(false);
+              setIsLightboxZoomed(false);
+            }}
+            className="fixed inset-0 z-[70] bg-black/95 backdrop-blur-md flex flex-col items-center justify-center p-4 sm:p-8"
+          >
+            {/* Lightbox Top Controls */}
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-5xl flex items-center justify-between mb-3 px-1"
+            >
+              <span className="text-xs sm:text-sm font-bold text-zinc-200 truncate pr-4">
+                {product.name}
+                {selectedColor && selectedColor !== 'Cor Única' ? ` · ${selectedColor}` : ''}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setIsLightboxZoomed((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-xs font-bold text-white transition-colors cursor-pointer"
+                >
+                  {isLightboxZoomed ? <ZoomOut className="w-4 h-4" /> : <ZoomIn className="w-4 h-4" />}
+                  <span>{isLightboxZoomed ? 'Reduzir' : 'Zoom 2x'}</span>
+                </button>
+                <button
+                  type="button"
+                  aria-label="Fechar visualização ampliada"
+                  onClick={() => {
+                    setIsLightboxOpen(false);
+                    setIsLightboxZoomed(false);
+                  }}
+                  className="p-2 rounded-full bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-200 hover:text-white transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Lightbox Image Stage */}
+            <div
+              onClick={(e) => {
+                e.stopPropagation();
+                setIsLightboxZoomed((prev) => !prev);
+              }}
+              onMouseMove={handleLightboxMouseMove}
+              className={`relative max-w-5xl max-h-[76vh] w-full flex items-center justify-center overflow-hidden rounded-2xl bg-[#0D0D0D] border border-zinc-800 ${
+                isLightboxZoomed ? 'cursor-zoom-out' : 'cursor-zoom-in'
+              }`}
+            >
+              {galleryImages.length > 1 && (
+                <button
+                  type="button"
+                  aria-label="Imagem anterior"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedImage((prev) => (prev - 1 + galleryImages.length) % galleryImages.length);
+                    setIsLightboxZoomed(false);
+                  }}
+                  className="absolute left-3 z-20 p-2.5 rounded-full bg-black/75 hover:bg-black border border-zinc-700 text-white transition-colors cursor-pointer"
+                >
+                  <ChevronLeft className="w-5 h-5" />
+                </button>
+              )}
+
+              <div
+                className="flex items-center justify-center transition-transform duration-200 ease-out"
+                style={{
+                  transform: isLightboxZoomed ? 'scale(2)' : 'scale(1)',
+                  transformOrigin: `${lightboxZoomOrigin.x}% ${lightboxZoomOrigin.y}%`,
+                }}
+              >
+                <ProductImage
+                  src={activeImageSrc}
+                  candidates={galleryImages}
+                  alt={product.name}
+                  loading="eager"
+                  className="max-h-[74vh] max-w-full w-auto object-contain select-none"
+                />
+              </div>
+
+              {galleryImages.length > 1 && (
+                <button
+                  type="button"
+                  aria-label="Próxima imagem"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setSelectedImage((prev) => (prev + 1) % galleryImages.length);
+                    setIsLightboxZoomed(false);
+                  }}
+                  className="absolute right-3 z-20 p-2.5 rounded-full bg-black/75 hover:bg-black border border-zinc-700 text-white transition-colors cursor-pointer"
+                >
+                  <ChevronRight className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+
+            {/* Lightbox Bottom Thumbnails */}
+            {galleryImages.length > 1 && (
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="flex items-center gap-2.5 mt-4 overflow-x-auto max-w-full px-2"
+              >
+                {galleryImages.map((img, idx) => (
+                  <button
+                    key={`lb-${img}-${idx}`}
+                    type="button"
+                    onClick={() => {
+                      setSelectedImage(idx);
+                      setIsLightboxZoomed(false);
+                    }}
+                    className={`w-14 h-14 rounded-lg overflow-hidden border-2 transition-all shrink-0 cursor-pointer ${
+                      selectedImage === idx
+                        ? 'border-[#E50914] scale-105'
+                        : 'border-zinc-800 opacity-60 hover:opacity-100'
+                    }`}
+                  >
+                    <ProductImage src={img} alt="" className="w-full h-full object-cover" />
+                  </button>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

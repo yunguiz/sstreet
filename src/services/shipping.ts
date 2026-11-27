@@ -1,6 +1,7 @@
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
 import { filterVisibleProducts } from '../lib/hiddenProducts';
+import { unifyProductsByColor } from '../lib/catalogVariants';
 
 export interface ShippingCompany {
   id: number;
@@ -196,7 +197,7 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
         ...p,
         description: cleanDescription(p.description),
       }));
-      const sanitizedProducts = filterVisibleProducts<Product>(rawList);
+      const sanitizedProducts = unifyProductsByColor(filterVisibleProducts<Product>(rawList));
       return {
         products: sanitizedProducts,
         isLive: true,

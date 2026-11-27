@@ -116,9 +116,7 @@ export function Footer({ onOpenTracking, onSelectCategory, onOpenPolicies }: Foo
                 { label: 'Calças Cargo & Baggy', cat: 'roupas' as const, subcat: 'calcas' },
                 { label: 'Shorts & Bermudas', cat: 'roupas' as const, subcat: 'shorts' },
                 { label: 'Tênis & Sneakers Skate', cat: 'calcados' as const, subcat: 'sneakers' },
-                { label: 'Bonés & Toucas Beanie', cat: 'acessorios' as const, subcat: 'bones' },
-                { label: 'Óculos Radar & Juliet', cat: 'acessorios' as const, subcat: 'acessorios-metal' },
-                { label: 'Shoulder Bags & Mochilas', cat: 'acessorios' as const, subcat: 'bags' },
+                { label: 'Bonés New Era & Toucas', cat: 'acessorios' as const, subcat: 'bones' },
               ].map((item) => (
                 <li key={item.label}>
                   <a
