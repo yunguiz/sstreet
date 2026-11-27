@@ -25,6 +25,11 @@ import {
   isBlingTokenExpiringOrExpired,
   acquireBlingRateLimitSlot,
   reportBlingRateLimit,
+  isBlingDailyLimitPayload,
+  isBlingRateLimitError,
+  isBlingDailyQuotaExceeded,
+  reportBlingDailyLimit,
+  clearBlingDailyLimit,
 } from './lib/blingToken.js';
 import {
   syncAllBlingProdutosToFirestore,
@@ -211,6 +216,7 @@ export async function exchangeCodeForTokens(code: string, redirectUri?: string):
   };
 
   saveBlingTokens(tokenData);
+  clearBlingDailyLimit();
 
   if (hasFirebaseAdminEnv()) {
     await saveBlingTokensToFirestore({
@@ -448,26 +454,44 @@ export async function ensureBlingAuthorized(options?: { verifyLive?: boolean }):
     const token = await getValidBlingToken();
     if (!token) return false;
 
+    if (isBlingDailyQuotaExceeded()) {
+      lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
+      return true;
+    }
+
     if (options?.verifyLive) {
       if (
         lastVerifiedAuth &&
         lastVerifiedAuth.token === token &&
-        Date.now() - lastVerifiedAuth.checkedAt < 30 * 1000
+        Date.now() - lastVerifiedAuth.checkedAt < 120 * 1000
       ) {
         return lastVerifiedAuth.valid;
       }
-      await fetchFromBling('/produtos?pagina=1&limite=1');
+      try {
+        await fetchFromBling('/produtos?pagina=1&limite=1');
+      } catch (liveErr: any) {
+        if (isBlingRateLimitError(liveErr)) {
+          lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
+          console.warn('[Bling Auto-Auth] Sessão OAuth válida, mas Bling retornou 429 Rate Limit. Usando cache/Firestore.');
+          return true;
+        }
+        throw liveErr;
+      }
     } else if (
       lastVerifiedAuth &&
       lastVerifiedAuth.token === token &&
       !lastVerifiedAuth.valid &&
-      Date.now() - lastVerifiedAuth.checkedAt < 30 * 1000
+      Date.now() - lastVerifiedAuth.checkedAt < 60 * 1000
     ) {
       return false;
     }
 
     return true;
   } catch (err: any) {
+    if (isBlingRateLimitError(err)) {
+      console.warn('[Bling Auto-Auth] Bling temporariamente em 429 Rate Limit:', err?.message || err);
+      return true;
+    }
     console.warn('[Bling Auto-Auth] Sessão do Bling indisponível ou expirada:', err?.message || err);
     return false;
   }
@@ -489,10 +513,18 @@ export function clearBlingAuthCache(): void {
  * Fetch authenticated resource from Bling v3 API (com interceptor pré-requisição + retry pós-401)
  */
 export async function fetchFromBling(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
+  if (isBlingDailyQuotaExceeded()) {
+    throw new Error('Bling API [429 Daily Limit]: Limite diário de requisições do Bling atingido. Aguardando renovação da cota.');
+  }
+
   const token = await getValidAccessToken();
   const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
 
   await acquireBlingRateLimitSlot();
+
+  if (isBlingDailyQuotaExceeded()) {
+    throw new Error('Bling API [429 Daily Limit]: Limite diário de requisições do Bling atingido. Aguardando renovação da cota.');
+  }
 
   const res = await fetch(url, {
     ...options,
@@ -505,17 +537,27 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
     }
   });
 
-  if (res.status === 429 && retryCount < 6) {
-    const retryAfterSec = Number(res.headers.get('retry-after') || '0');
-    const jitter = 200 + Math.floor(Math.random() * 450);
-    const waitMs =
-      Number.isFinite(retryAfterSec) && retryAfterSec > 0
-        ? Math.min(15000, retryAfterSec * 1000 + jitter)
-        : Math.min(15000, 1500 * (retryCount + 1) + jitter);
-    reportBlingRateLimit(waitMs);
-    console.warn(`[Bling] 429 Rate Limit em ${endpoint} (tentativa ${retryCount + 1}/6). Aguardando ${waitMs}ms...`);
-    await new Promise(resolve => setTimeout(resolve, waitMs));
-    return fetchFromBling(endpoint, options, retryCount + 1);
+  if (res.status === 429) {
+    const rateLimitBody = await res.text().catch(() => '');
+    if (isBlingDailyLimitPayload(rateLimitBody)) {
+      reportBlingDailyLimit(rateLimitBody);
+      lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
+      throw new Error(`Bling API [429 Daily Limit]: ${rateLimitBody.replace(/\s+/g, ' ').trim()}`);
+    }
+    if (retryCount < 6) {
+      const retryAfterSec = Number(res.headers.get('retry-after') || '0');
+      const jitter = 200 + Math.floor(Math.random() * 450);
+      const waitMs =
+        Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.min(20000, retryAfterSec * 1000 + jitter)
+          : Math.min(20000, 1500 * (retryCount + 1) + jitter);
+      reportBlingRateLimit(waitMs);
+      console.warn(`[Bling] 429 Rate Limit em ${endpoint} (tentativa ${retryCount + 1}/6). Aguardando ${waitMs}ms...`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      return fetchFromBling(endpoint, options, retryCount + 1);
+    }
+    const compact429 = rateLimitBody.replace(/\s+/g, ' ').trim();
+    throw new Error(`Bling API [429]: ${compact429}`);
   }
 
   if (!res.ok) {
@@ -538,11 +580,20 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
               ...(options.headers || {})
             }
           });
-          if (retryRes.status === 429 && retryCount < 6) {
-            const waitMs = 2000 + Math.floor(Math.random() * 500);
-            reportBlingRateLimit(waitMs);
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-            return fetchFromBling(endpoint, options, retryCount + 1);
+          if (retryRes.status === 429) {
+            const retry429Body = await retryRes.text().catch(() => '');
+            if (isBlingDailyLimitPayload(retry429Body)) {
+              reportBlingDailyLimit(retry429Body);
+              lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
+              throw new Error(`Bling API [429 Daily Limit]: ${retry429Body.replace(/\s+/g, ' ').trim()}`);
+            }
+            if (retryCount < 6) {
+              const waitMs = 2000 + Math.floor(Math.random() * 500);
+              reportBlingRateLimit(waitMs);
+              await new Promise(resolve => setTimeout(resolve, waitMs));
+              return fetchFromBling(endpoint, options, retryCount + 1);
+            }
+            throw new Error(`Bling API [429]: ${retry429Body.replace(/\s+/g, ' ').trim()}`);
           }
           if (retryRes.ok) {
             lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
@@ -555,6 +606,9 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
             throw new Error(msg);
           }
         } catch (refreshErr: any) {
+          if (isBlingRateLimitError(refreshErr)) {
+            throw refreshErr;
+          }
           const errDetail = refreshErr?.message || String(refreshErr);
           const msg = 'Sessão do Bling expirada ou inválida (401). Por favor, reconecte via OAuth.';
           console.warn('[Bling] Tentativa de renovação pós-401 falhou:', errDetail);
@@ -958,7 +1012,7 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
       !forceVerify &&
       lastVerifiedAuth &&
       lastVerifiedAuth.token === tokens.access_token &&
-      Date.now() - lastVerifiedAuth.checkedAt < 25 * 1000;
+      Date.now() - lastVerifiedAuth.checkedAt < 120 * 1000;
 
     if (cacheRecent && !lastVerifiedAuth!.valid) {
       return res.json({
@@ -971,20 +1025,27 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
       });
     }
 
-    if (!cacheRecent) {
+    let rateLimitedWarning: string | undefined;
+    if (!cacheRecent && !isBlingDailyQuotaExceeded()) {
       try {
         await fetchFromBling('/produtos?pagina=1&limite=1');
         tokens = loadBlingTokens() || tokens;
       } catch (verifyErr: any) {
-        return res.json({
-          connected: false,
-          tokenInvalid: true,
-          error: verifyErr?.message || 'Token do Bling expirado ou inválido. Reconecte via OAuth.',
-          clientId,
-          redirectUri,
-          authorizeUrl
-        });
+        if (isBlingRateLimitError(verifyErr)) {
+          rateLimitedWarning = verifyErr?.message || 'Limite de requisições da API do Bling atingido.';
+        } else {
+          return res.json({
+            connected: false,
+            tokenInvalid: true,
+            error: verifyErr?.message || 'Token do Bling expirado ou inválido. Reconecte via OAuth.',
+            clientId,
+            redirectUri,
+            authorizeUrl
+          });
+        }
       }
+    } else if (isBlingDailyQuotaExceeded()) {
+      rateLimitedWarning = 'Limite diário de requisições da API do Bling atingido. Catálogo operando via Firestore/cache.';
     }
 
     const latestFs = hasFirebaseAdminEnv() ? await getBlingTokenStatusFromFirestore() : null;
@@ -1022,6 +1083,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
       scope: activeTokenData.scope,
       hasRefreshToken: Boolean(activeTokenData.refresh_token),
       isExpired,
+      rateLimited: Boolean(rateLimitedWarning),
+      dailyLimitReached: isBlingDailyQuotaExceeded(),
+      ...(rateLimitedWarning ? { warning: rateLimitedWarning } : {}),
       expiresAt: new Date(expiresAt).toISOString(),
       obtainedAt: new Date(activeTokenData.obtained_at).toISOString()
     });
@@ -1156,6 +1220,7 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
 
         // Paginate all active products (criterio=2: Ativos) until the end (up to 10,000 items)
         for (let p = 1; p <= 100 && rawProducts.length < maxProducts; p++) {
+          if (isBlingDailyQuotaExceeded()) break;
           try {
             const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
             const items = pageData?.data || [];
@@ -1177,6 +1242,7 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
       let stockApiSucceeded = false;
       const allIds = rawProducts.map((p: any) => p.id).filter(Boolean);
       for (let i = 0; i < allIds.length; i += 50) {
+        if (isBlingDailyQuotaExceeded()) break;
         const chunk = allIds.slice(i, i + 50);
         try {
           const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
@@ -1192,6 +1258,7 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
           }
         } catch (stockErr) {
           console.warn('[Bling] Could not fetch stock balances chunk:', stockErr);
+          if (isBlingRateLimitError(stockErr)) break;
         }
       }
 

@@ -367,7 +367,7 @@ function StorefrontApp() {
           setIsPoliciesOpen(true);
         }}
         activeCategory={activeCategory}
-        onSelectCategory={(cat, subcat) => {
+        onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
           setActiveCategory(cat);
           setActiveSubcategory(subcat);
           scrollToCatalog();
@@ -407,11 +407,11 @@ function StorefrontApp() {
         onClearBrandFilter={() => setBrandFilter(undefined)}
         favorites={favorites}
         onToggleFavorite={handleToggleFavorite}
-        onSelectCategory={(cat, subcat) => {
+        onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
           setActiveCategory(cat);
           setActiveSubcategory(subcat);
         }}
-        onOpenProduct={(prod) => setSelectedProduct(prod)}
+        onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
         onQuickAdd={handleQuickAdd}
       />
 
@@ -422,7 +422,7 @@ function StorefrontApp() {
       <div id="arara-virtual">
         <StreetwearRailSection
           products={products}
-          onOpenProduct={(prod) => setSelectedProduct(prod)}
+          onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
           onQuickAdd={handleQuickAdd}
           onExploreCatalog={scrollToCatalog}
         />
@@ -455,7 +455,7 @@ function StorefrontApp() {
           setPoliciesInitialTab(tab);
           setIsPoliciesOpen(true);
         }}
-        onSelectCategory={(cat, subcat) => {
+        onSelectCategory={(cat: ProductCategory | 'all', subcat?: string) => {
           setActiveCategory(cat);
           setActiveSubcategory(subcat);
           setBrandFilter(undefined);
@@ -526,7 +526,7 @@ function StorefrontApp() {
         onClose={() => setIsFavoritesOpen(false)}
         favoriteProducts={products.filter((p) => favorites.includes(p.id))}
         onRemoveFavorite={handleToggleFavorite}
-        onOpenProduct={(prod) => setSelectedProduct(prod)}
+        onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
         onQuickAdd={handleQuickAdd}
       />
 
@@ -535,7 +535,7 @@ function StorefrontApp() {
         isOpen={isSearchOpen}
         onClose={() => setIsSearchOpen(false)}
         products={products}
-        onSelectProduct={(prod) => setSelectedProduct(prod)}
+        onSelectProduct={(prod: Product) => setSelectedProduct(prod)}
       />
 
       {/* Order Tracking & Returns Modal */}

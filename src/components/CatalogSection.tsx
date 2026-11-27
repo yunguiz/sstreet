@@ -540,3 +540,5 @@ export function CatalogSection({
     </section>
   );
 }
+
+export default CatalogSection;

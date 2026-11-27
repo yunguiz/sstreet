@@ -391,10 +391,58 @@ export const interceptBlingTokenBeforeSync = getValidBlingToken;
 let blingRateLimitTail: Promise<void> = Promise.resolve();
 let lastBlingRequestAt = 0;
 let globalBlingCooldownUntil = 0;
+let globalBlingDailyBlockedUntil = 0;
+let lastDailyLimitLogAt = 0;
 const MIN_BLING_REQUEST_INTERVAL_MS = 450;
+const DAILY_LIMIT_COOLDOWN_MS = 15 * 60 * 1000;
 
-export function reportBlingRateLimit(waitMs: number = 2000): void {
-  const targetUntil = Date.now() + Math.max(800, Math.min(15000, waitMs));
+export function isBlingDailyLimitPayload(rawText?: string): boolean {
+  const txt = (rawText || '').toLowerCase();
+  if (!txt) return false;
+  return (
+    /"period"\s*:\s*"day"/.test(txt) ||
+    txt.includes('por dia foi atingido') ||
+    txt.includes('requisições por dia') ||
+    txt.includes('daily limit')
+  );
+}
+
+export function isBlingRateLimitError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return (
+    msg.includes('429') ||
+    msg.includes('too_many_requests') ||
+    msg.includes('rate limit') ||
+    msg.includes('limite de requisições') ||
+    msg.includes('daily limit')
+  );
+}
+
+export function reportBlingDailyLimit(detail?: string): void {
+  const now = Date.now();
+  globalBlingDailyBlockedUntil = Math.max(globalBlingDailyBlockedUntil, now + DAILY_LIMIT_COOLDOWN_MS);
+  if (now - lastDailyLimitLogAt > 60 * 1000) {
+    lastDailyLimitLogAt = now;
+    console.warn(
+      `[Bling Circuit Breaker] Limite diário da API do Bling atingido (429/day). Pausando chamadas ao Bling por 15 min e mantendo cache/Firestore ativos.${detail ? ` Detalhe: ${detail.slice(0, 160)}` : ''}`
+    );
+  }
+}
+
+export function clearBlingDailyLimit(): void {
+  globalBlingDailyBlockedUntil = 0;
+}
+
+export function isBlingDailyQuotaExceeded(): boolean {
+  return Date.now() < globalBlingDailyBlockedUntil;
+}
+
+export function getBlingDailyQuotaRemainingMs(): number {
+  return Math.max(0, globalBlingDailyBlockedUntil - Date.now());
+}
+
+export function reportBlingRateLimit(waitMs: number = 2500): void {
+  const targetUntil = Date.now() + Math.max(800, Math.min(30000, waitMs));
   if (targetUntil > globalBlingCooldownUntil) {
     globalBlingCooldownUntil = targetUntil;
   }
@@ -437,10 +485,18 @@ export async function blingApiRequest<T = unknown>(
   init: RequestInit = {},
   rateLimitAttempt: number = 0
 ): Promise<T> {
+  if (isBlingDailyQuotaExceeded()) {
+    throw new Error('Bling API [429 Daily Limit]: Limite diário de requisições do Bling atingido. Aguardando renovação da cota.');
+  }
+
   const token = await getValidBlingToken();
   const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
 
   await acquireBlingRateLimitSlot();
+
+  if (isBlingDailyQuotaExceeded()) {
+    throw new Error('Bling API [429 Daily Limit]: Limite diário de requisições do Bling atingido. Aguardando renovação da cota.');
+  }
 
   const response = await fetch(url, {
     ...init,
@@ -453,17 +509,25 @@ export async function blingApiRequest<T = unknown>(
     },
   });
 
-  if (response.status === 429 && rateLimitAttempt < 6) {
-    const retryAfterSec = Number(response.headers.get('retry-after') || '0');
-    const jitter = 200 + Math.floor(Math.random() * 450);
-    const waitMs =
-      Number.isFinite(retryAfterSec) && retryAfterSec > 0
-        ? Math.min(15000, retryAfterSec * 1000 + jitter)
-        : Math.min(15000, 1500 * (rateLimitAttempt + 1) + jitter);
-    reportBlingRateLimit(waitMs);
-    console.warn(`[Bling API] 429 Rate Limit em ${endpoint} (tentativa ${rateLimitAttempt + 1}/6). Aguardando ${waitMs}ms...`);
-    await new Promise((r) => setTimeout(r, waitMs));
-    return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
+  if (response.status === 429) {
+    const rateLimitBody = await response.text().catch(() => '');
+    if (isBlingDailyLimitPayload(rateLimitBody)) {
+      reportBlingDailyLimit(rateLimitBody);
+      throw new Error(`Bling API [429 Daily Limit]: ${rateLimitBody.slice(0, 300)}`);
+    }
+    if (rateLimitAttempt < 6) {
+      const retryAfterSec = Number(response.headers.get('retry-after') || '0');
+      const jitter = 200 + Math.floor(Math.random() * 450);
+      const waitMs =
+        Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.min(20000, retryAfterSec * 1000 + jitter)
+          : Math.min(20000, 1500 * (rateLimitAttempt + 1) + jitter);
+      reportBlingRateLimit(waitMs);
+      console.warn(`[Bling API] 429 Rate Limit em ${endpoint} (tentativa ${rateLimitAttempt + 1}/6). Aguardando ${waitMs}ms...`);
+      await new Promise((r) => setTimeout(r, waitMs));
+      return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
+    }
+    throw new Error(`Bling API [429]: ${rateLimitBody.slice(0, 300)}`);
   }
 
   if (response.status === 401) {
@@ -485,11 +549,19 @@ export async function blingApiRequest<T = unknown>(
           ...(init.headers || {}),
         },
       });
-      if (retryRes.status === 429 && rateLimitAttempt < 6) {
-        const waitMs = 2000 + Math.floor(Math.random() * 500);
-        reportBlingRateLimit(waitMs);
-        await new Promise((r) => setTimeout(r, waitMs));
-        return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
+      if (retryRes.status === 429) {
+        const retry429Body = await retryRes.text().catch(() => '');
+        if (isBlingDailyLimitPayload(retry429Body)) {
+          reportBlingDailyLimit(retry429Body);
+          throw new Error(`Bling API [429 Daily Limit]: ${retry429Body.slice(0, 300)}`);
+        }
+        if (rateLimitAttempt < 6) {
+          const waitMs = 2000 + Math.floor(Math.random() * 500);
+          reportBlingRateLimit(waitMs);
+          await new Promise((r) => setTimeout(r, waitMs));
+          return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
+        }
+        throw new Error(`Bling API [429]: ${retry429Body.slice(0, 300)}`);
       }
       if (!retryRes.ok) {
         throw new Error(`Bling API [${retryRes.status}]: ${(await retryRes.text()).slice(0, 300)}`);

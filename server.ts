@@ -8,7 +8,13 @@ import crypto from 'crypto';
 import { getAdminAuth, getAdminFirestore } from './lib/firebaseAdmin.js';
 import { registerBlingRoutes, blingRouter, blingAuthInterceptorMiddleware, fetchFromBling, loadBlingTokens, ensureBlingAuthorized, refreshBlingToken } from './server-bling.js';
 import { registerMelhorEnvioRoutes, startMelhorEnvioAutoSync } from './server-melhor-envio.js';
-import { hasFirebaseAdminEnv, hasFirestoreBlingToken, getValidBlingToken as getFirestoreValidToken } from './lib/blingToken.js';
+import {
+  hasFirebaseAdminEnv,
+  hasFirestoreBlingToken,
+  getValidBlingToken as getFirestoreValidToken,
+  isBlingDailyQuotaExceeded,
+  isBlingRateLimitError,
+} from './lib/blingToken.js';
 import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
 import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
 import {
@@ -72,7 +78,7 @@ let catalogCache: {
   totalUnitsInStock?: number;
   timestamp: number;
 } | null = null;
-const CATALOG_CACHE_TTL_MS = 4 * 60 * 1000; // 4 minutes fresh TTL with silent stale-while-revalidate
+const CATALOG_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes fresh TTL with silent stale-while-revalidate
 
 export function invalidateCatalogCache() {
   catalogCache = null;
@@ -156,7 +162,149 @@ let activeCatalogBuildPromise: Promise<{
   syncedAt: string;
 }> | null = null;
 
-async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
+async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
+  if (!hasFirebaseAdminEnv()) return [];
+  try {
+    const db = getAdminFirestore();
+    const snap = await db.collection('products').where('ativo', '==', true).get();
+    if (snap.empty) return [];
+
+    const fallbackProducts: any[] = [];
+    snap.forEach((docSnap) => {
+      const d = (docSnap.data() || {}) as Record<string, any>;
+      const blingId = String(d.blingId || docSnap.id).trim();
+      const rawName = String(d.nome || '').trim();
+      if (!blingId || !rawName) return;
+
+      const parsedParent = parseBlingVariantMeta({ nome: rawName, isParentContainer: true });
+      const baseName = parsedParent.baseName || rawName;
+      const inferred = mapCategoryAndSubcategory(baseName, d.categoria ? [{ name: String(d.categoria) }] : undefined);
+      const category = (d.categoriaStore as 'roupas' | 'calcados' | 'acessorios') || inferred.category;
+      const subcategory = d.subcategoriaStore || inferred.subcategory;
+      const groupSku = String(d.codigo || `BLING-${blingId}`).trim();
+      const basePrice = Number(d.preco || 0);
+      const priceVal = Number.isFinite(basePrice) && basePrice > 0 ? basePrice : 119.9;
+
+      const rawVars = d.variacoes && typeof d.variacoes === 'object' ? Object.values(d.variacoes as Record<string, any>) : [];
+      const variantsList = rawVars.length > 0
+        ? rawVars.map((v: any) => {
+            const vMeta = parseBlingVariantMeta({ nome: String(v.nome || ''), isParentContainer: false });
+            const vStock = Math.max(0, Number(v.estoque || 0) || 0);
+            const vPrice = Number(v.preco || priceVal);
+            return {
+              id: Number(v.blingId || blingId),
+              sku: String(v.codigo || `${groupSku}-${vMeta.size}`),
+              price: Number.isFinite(vPrice) && vPrice > 0 ? vPrice : priceVal,
+              stock: vStock,
+              size: String(v.tamanho || vMeta.size || 'Tamanho Único'),
+              ...(v.cor || vMeta.color?.name ? { color: String(v.cor || vMeta.color?.name) } : {}),
+            };
+          })
+        : [
+            {
+              id: Number(blingId),
+              sku: groupSku,
+              price: priceVal,
+              stock: Math.max(0, Number(d.estoque || 0) || 0),
+              size: Array.isArray(d.tamanhos) && d.tamanhos.length > 0 ? String(d.tamanhos[0]) : 'Tamanho Único',
+            },
+          ];
+
+      const totalStock = variantsList.reduce((acc, v) => acc + Math.max(0, Number(v.stock || 0)), 0);
+      if (totalStock <= 0) return;
+
+      const inStockVariants = variantsList.filter((v) => v.stock > 0);
+      const rawSizes = inStockVariants.map((v) => v.size).filter(Boolean);
+      const hasExplicit = rawSizes.some((s) => s !== 'Tamanho Único' && s !== 'Único');
+      const activeSizes = hasExplicit
+        ? sortSizes(rawSizes.filter((s) => s !== 'Tamanho Único' && s !== 'Único'))
+        : ['Tamanho Único'];
+
+      if (hasExplicit && activeSizes.length === 0) return;
+
+      const rawColors = inStockVariants
+        .map((v) => (v.color ? detectColorFromName(v.color) || { name: v.color, hex: '#1a1a1a' } : null))
+        .filter((c): c is { name: string; hex: string } => Boolean(c));
+      const fallbackColor = rawColors.length === 0 ? detectColorFromName(baseName) : null;
+      const finalColors = normalizeColorOptions(
+        rawColors.length > 0 ? rawColors : fallbackColor ? [fallbackColor] : []
+      );
+
+      const storedImgs: string[] = [];
+      if (Array.isArray(d.imagens)) {
+        for (const u of d.imagens) {
+          if (typeof u === 'string' && u.trim() && !isPlaceholderImageUrl(u)) storedImgs.push(u.trim());
+        }
+      }
+      if (typeof d.imagemURL === 'string' && d.imagemURL.trim() && !isPlaceholderImageUrl(d.imagemURL)) {
+        if (!storedImgs.includes(d.imagemURL.trim())) storedImgs.unshift(d.imagemURL.trim());
+      }
+      const nonThumb = storedImgs.filter((u) => !isThumbnailLikeUrl(u));
+      const cachedImgs = getBlingImagesForProduct({
+        name: baseName,
+        integration: { sku: groupSku, blingId },
+        variantsList,
+      }) || [];
+      const cachedFull = cachedImgs.filter((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+      const finalImages = Array.from(new Set([...nonThumb, ...cachedFull, ...storedImgs, ...cachedImgs])).filter(
+        (u) => !isPlaceholderImageUrl(u)
+      );
+
+      const numericId = Number(blingId) || 0;
+      fallbackProducts.push({
+        id: `bling-${blingId}`,
+        name: baseName,
+        category,
+        subcategory,
+        price: priceVal,
+        originalPrice: Math.round(priceVal * 1.3),
+        tag: totalStock <= 3 ? 'POUCAS UNIDADES' : null,
+        rating: 4.8 + ((numericId % 3) / 10),
+        reviewsCount: 15 + (numericId % 40),
+        images: finalImages.length > 0 ? finalImages : ['/assets/streetstore-fallback.svg'],
+        sizes: activeSizes,
+        colors: finalColors,
+        description:
+          cleanDescription(d.descricao) ||
+          `${baseName} - Produto autêntico da Street Store. Acabamento reforçado, resistência e caimento streetwear impecável para compor seu kit no dia a dia.`,
+        stockCount: totalStock,
+        details: {
+          composition:
+            category === 'calcados'
+              ? 'Solado em borracha vulcanizada de alta durabilidade'
+              : category === 'acessorios'
+              ? 'Material premium de alta durabilidade'
+              : '100% Algodão Premium Heavyweight',
+          weight: category === 'calcados' ? '900g o par' : category === 'acessorios' ? '120g' : '380g/m² Heavyweight',
+          modelInfo: category === 'acessorios' ? 'Tamanho e formato ergonômico' : 'Modelagem autêntica da marca',
+          origin: 'Itabira - MG // Fabricado no Brasil',
+        },
+        integration: {
+          sku: groupSku,
+          barcode: groupSku || `789${blingId}`,
+          blingId,
+          weightGrams: 450,
+          dimensionsCm: { width: 28, height: 12, depth: 32 },
+        },
+        canonicalUrl: 'https://www.streetstore.com.br',
+        variantsList,
+      });
+    });
+
+    const filtered = applyBlingImageOverrides(filterVisibleProducts(fallbackProducts))
+      .sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0))
+      .map((p, idx) => ({
+        ...p,
+        tag: (p.stockCount ?? 0) <= 3 ? 'POUCAS UNIDADES' : idx < 16 ? 'NOVO DROP' : null,
+      }));
+    return filtered;
+  } catch (err: any) {
+    console.warn('[Catalog Fallback] Notice reading Firestore products:', err?.message || err);
+    return [];
+  }
+}
+
+async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
   if (activeCatalogBuildPromise) {
     return activeCatalogBuildPromise;
   }
@@ -167,15 +315,21 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
     let blingCount = 0;
     let blingRawCount = 0;
     let blingError: string | null = null;
+    let hasAnyBlingSession = false;
     const zeroStockFromBlingKeys = new Set<string>();
 
     // Merge all live products from Bling ERP seamlessly when connected (supports all 1411+ items & variations)
     try {
       const blingTokens = loadBlingTokens();
       const hasRemoteBling = hasFirebaseAdminEnv() ? await hasFirestoreBlingToken() : false;
-      if (blingTokens?.access_token || blingTokens?.refresh_token || hasRemoteBling) {
-        // Interceptor pré-sincronização: verifica validade/expiração e renova via refresh_token antes da paginação
-        const tokenReady = await ensureBlingAuthorized({ verifyLive: true });
+      hasAnyBlingSession = Boolean(blingTokens?.access_token || blingTokens?.refresh_token || hasRemoteBling);
+
+      if (hasAnyBlingSession && isBlingDailyQuotaExceeded()) {
+        blingConnected = true;
+        blingError = 'Limite diário de requisições do Bling atingido (429/day). Exibindo catálogo em cache/Firestore.';
+      } else if (hasAnyBlingSession) {
+        // Interceptor pré-sincronização: valida expiração sem ping extra em /produtos
+        const tokenReady = await ensureBlingAuthorized({ verifyLive: false });
         if (!tokenReady) {
           throw new Error('Token do Bling expirado ou inválido; renovação automática pendente de nova autorização OAuth.');
         }
@@ -195,6 +349,10 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
 
         // 1. Fetch ALL active pages (criterio=2: Ativos) until Bling returns < 100 items
         for (let p = 1; p <= 100 && blingRaw.length < MAX_BLING_PRODUCTS; p++) {
+          if (isBlingDailyQuotaExceeded()) {
+            blingError = 'Limite diário de requisições do Bling atingido (429/day).';
+            break;
+          }
           try {
             const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
             const items = pageData?.data || [];
@@ -204,14 +362,20 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             if (items.length < 100) break;
             await new Promise(resolve => setTimeout(resolve, 140));
           } catch (pageErr: any) {
-            console.warn(`[Bling Sync] Stopped pagination at page ${p}:`, pageErr?.message || pageErr);
+            const msg = pageErr?.message || String(pageErr);
+            console.warn(`[Bling Sync] Stopped pagination at page ${p}:`, msg);
+            if (isBlingRateLimitError(pageErr) || isBlingDailyQuotaExceeded()) {
+              blingError = msg;
+            }
             break;
           }
         }
 
         blingConnected = true;
         blingRawCount = blingRaw.length;
-        console.log(`[Bling Sync] Fetched ${blingRaw.length} total raw active items (limit ${MAX_BLING_PRODUCTS}) from Bling ERP.`);
+        if (blingRaw.length > 0) {
+          console.log(`[Bling Sync] Fetched ${blingRaw.length} total raw active items (limit ${MAX_BLING_PRODUCTS}) from Bling ERP.`);
+        }
 
         // 2. Fetch REAL stock balances via /estoques/saldos in sequential chunks of 50 (rate-limiter enforces safe Bling pace)
         const realStockMap = new Map<number, number>();
@@ -223,6 +387,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
         }
 
         for (const chunk of stockChunks) {
+          if (isBlingDailyQuotaExceeded()) break;
           try {
             const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
             const stockRes = await fetchFromBling(`/estoques/saldos?${qs}`);
@@ -237,14 +402,10 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             }
           } catch (stockChunkErr: any) {
             console.warn(`[Bling Stock] Chunk fetch notice:`, stockChunkErr?.message || stockChunkErr);
+            if (isBlingRateLimitError(stockChunkErr) || isBlingDailyQuotaExceeded()) {
+              break;
+            }
           }
-        }
-
-        // When explicitly requested, ensure high-res internal Bling images sync without racing catalog build
-        if (options?.forceImageSync && Date.now() - getLastBlingImageSyncTime() > 3 * 60 * 1000) {
-          syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-            .then(() => reapplyImagesToCachedCatalog())
-            .catch(() => {});
         }
 
         // Index by Bling ID so parent products (formato === 'V') & their child variations (idProdutoPai) always stay unified
@@ -560,12 +721,13 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           addedFromBlingCount++;
         }
 
-        // If background image sync isn't already running, fetch up to 12 missing high-res items inline (including variations) & queue full background sync
-        if (groupsNeedingDetailFetch.length > 0) {
+        // If background image sync isn't already running, fetch up to 5 missing high-res items inline without spawning heavy full-catalog crawls
+        if (groupsNeedingDetailFetch.length > 0 && !isBlingDailyQuotaExceeded()) {
           if (!isImageSyncRunning()) {
-            const inlineBatch = groupsNeedingDetailFetch.slice(0, 12);
+            const inlineBatch = groupsNeedingDetailFetch.slice(0, 5);
             console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} products lacked full-res images in /produtos summary. Fetching detail media for ${inlineBatch.length}...`);
             for (const target of inlineBatch) {
+              if (isBlingDailyQuotaExceeded()) break;
               try {
                 const detail = await fetchFromBling(`/produtos/${target.id}`);
                 const fullData = detail?.data || detail;
@@ -574,7 +736,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
 
                 if (!hasTrueFull && Array.isArray(fullData?.variacoes) && fullData.variacoes.length > 0) {
                   for (const v of fullData.variacoes.slice(0, 2)) {
-                    if (!v?.id) continue;
+                    if (!v?.id || isBlingDailyQuotaExceeded()) continue;
                     try {
                       const vDetail = await fetchFromBling(`/produtos/${v.id}`);
                       const vImgs = extractImagesFromBlingItem(vDetail?.data || vDetail);
@@ -584,8 +746,8 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                         hasTrueFull = true;
                         break;
                       }
-                    } catch {
-                      // continue
+                    } catch (vErr: any) {
+                      if (isBlingRateLimitError(vErr) || isBlingDailyQuotaExceeded()) break;
                     }
                   }
                 }
@@ -618,20 +780,9 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                     imageStoreDirty = true;
                   }
                 }
-              } catch {
-                // continue gracefully
+              } catch (detailErr: any) {
+                if (isBlingRateLimitError(detailErr) || isBlingDailyQuotaExceeded()) break;
               }
-            }
-
-            if (groupsNeedingDetailFetch.length > inlineBatch.length) {
-              syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-                .then(() => {
-                  reapplyImagesToCachedCatalog();
-                  if (hasFirebaseAdminEnv()) {
-                    syncImageStoreToFirestore().catch(() => {});
-                  }
-                })
-                .catch(() => {});
             }
           } else {
             console.log(`[Bling Sync] Background high-res image sync already active (${groupsNeedingDetailFetch.length} products awaiting detail media).`);
@@ -647,7 +798,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
       }
     } catch (blingErr: any) {
       blingError = blingErr?.message || String(blingErr);
-      blingConnected = Boolean(loadBlingTokens()?.access_token);
+      blingConnected = Boolean(hasAnyBlingSession || loadBlingTokens()?.access_token);
       console.warn('[Catalog] Notice during Bling merge:', blingError);
     } finally {
       setCatalogFetchInProgress(false);
@@ -729,16 +880,52 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
     const allConsolidatedProducts = Array.from(consolidatedMap.values());
     const inStockProducts = allConsolidatedProducts.filter((p) => (p.stockCount ?? 0) > 0);
     const visibleProducts = filterVisibleProducts(inStockProducts);
-    const finalProducts = applyBlingImageOverrides(visibleProducts)
+    let finalProducts = applyBlingImageOverrides(visibleProducts)
       .sort((a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0))
       .map((p, idx) => ({
         ...p,
         tag: (p.stockCount ?? 0) <= 3 ? 'POUCAS UNIDADES' : (idx < 16 ? 'NOVO DROP' : null),
       }));
 
+    if (finalProducts.length === 0) {
+      if (catalogCache && catalogCache.products.length > 0) {
+        const nowKeep = Date.now();
+        catalogCache = {
+          ...catalogCache,
+          blingConnected: blingConnected || catalogCache.blingConnected,
+          blingError: blingError || catalogCache.blingError,
+          timestamp: nowKeep,
+        };
+        console.warn(`[Catalog Engine] Bling retornou 0 itens (${blingError || 'sem dados'}). Mantendo ${catalogCache.products.length} produtos em cache.`);
+        return {
+          success: true,
+          count: catalogCache.count,
+          products: catalogCache.products,
+          blingConnected: catalogCache.blingConnected,
+          blingCount: catalogCache.blingCount,
+          blingRawCount: catalogCache.blingRawCount,
+          blingError: catalogCache.blingError,
+          hiddenCount: catalogCache.hiddenCount ?? 0,
+          totalRegisteredItems: catalogCache.totalRegisteredItems ?? 0,
+          blingRegisteredSKUs: catalogCache.totalRegisteredItems ?? 0,
+          uniqueModels: catalogCache.uniqueModels ?? catalogCache.count,
+          totalUnitsInStock: catalogCache.totalUnitsInStock ?? 0,
+          syncedAt: new Date(nowKeep).toISOString(),
+        };
+      }
+
+      const firestoreFallback = await loadCatalogFromFirestoreFallback();
+      if (firestoreFallback.length > 0) {
+        finalProducts = firestoreFallback;
+        blingCount = firestoreFallback.length;
+        blingRawCount = Math.max(blingRawCount, firestoreFallback.length);
+        console.log(`[Catalog Fallback] Carregados ${firestoreFallback.length} produtos do Firestore enquanto Bling está indisponível/limitado.`);
+      }
+    }
+
     console.log(`[Catalog Engine] Processed inventory: ${finalProducts.length} in-stock visible models (${allConsolidatedProducts.length - inStockProducts.length} out-of-stock auto-hidden, ${inStockProducts.length - visibleProducts.length} hidden per store rules).`);
 
-    const hiddenCount = allConsolidatedProducts.length - finalProducts.length;
+    const hiddenCount = Math.max(0, allConsolidatedProducts.length - finalProducts.length);
     const totalRegisteredItems = blingRawCount;
     const uniqueModels = finalProducts.length;
     const totalUnitsInStock = finalProducts.reduce((sum, p) => sum + (p.stockCount || 0), 0);
@@ -1616,8 +1803,8 @@ function calculateCRC16(payload: string): string {
 }
 
 function resolveStorePixKey(): string {
-  const raw = (process.env.PIX_KEY || '+5531984806556').trim();
-  if (!raw) return '+5531984806556';
+  const raw = (process.env.PIX_KEY || 'streetstore364@gmail.com').trim();
+  if (!raw) return 'streetstore364@gmail.com';
   if (raw.includes('@') || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(raw)) {
     return raw;
   }
@@ -2955,7 +3142,8 @@ registerBlingRoutes(app, {
     buildAndCacheCatalog({ forceImageSync: false })
       .catch(() => {})
       .finally(() => {
-        syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
+        if (isBlingDailyQuotaExceeded()) return;
+        syncImagesFromBling({ maxDetailFetches: 35, onBatchSaved: () => reapplyImagesToCachedCatalog() })
           .then(async () => {
             reapplyImagesToCachedCatalog();
             if (hasFirebaseAdminEnv()) {
@@ -3005,45 +3193,70 @@ async function setupViteOrStatic() {
       // 1. Automatically keep Melhor Envio connected, tokens refreshed, & shipments synced on startup + periodically
       startMelhorEnvioAutoSync();
 
-      // 2. Automatically validate/refresh Bling token & sync ALL products (1411+) + high-res images + Firestore sequentially
-      ensureBlingAuthorized({ verifyLive: true })
-        .then(async (authorized) => {
-          if (!authorized) {
-            console.log('[Startup Bling Auth] Sessão Bling ausente ou pendente de autorização OAuth.');
-            return;
+      // 2. Pre-warm catalog from Firestore instantly (0 Bling API calls), then gently sync Bling without double-crawling
+      (async () => {
+        let firestoreSeedCount = 0;
+        if (hasFirebaseAdminEnv()) {
+          const fsProducts = await loadCatalogFromFirestoreFallback();
+          firestoreSeedCount = fsProducts.length;
+          if (fsProducts.length > 0 && !catalogCache) {
+            const nowSeed = Date.now();
+            catalogCache = {
+              products: fsProducts,
+              count: fsProducts.length,
+              blingConnected: true,
+              blingCount: fsProducts.length,
+              blingRawCount: fsProducts.length,
+              blingError: null,
+              hiddenCount: 0,
+              totalRegisteredItems: fsProducts.length,
+              uniqueModels: fsProducts.length,
+              totalUnitsInStock: fsProducts.reduce((sum, p) => sum + (p.stockCount || 0), 0),
+              timestamp: nowSeed - Math.floor(CATALOG_CACHE_TTL_MS / 2),
+            };
+            console.log(`[Startup Firestore Cache] ${fsProducts.length} produtos pré-carregados do Firestore sem custo de API Bling.`);
           }
-          try {
-            const catResult = await buildAndCacheCatalog({ forceImageSync: false });
-            console.log(`[Startup Bling Catalog] ${catResult.count} produtos em estoque pré-carregados (Bling bruto: ${catResult.blingRawCount}).`);
-          } catch (err: any) {
-            console.warn('[Startup Bling Catalog] Notice:', err?.message || err);
-          }
+        }
 
-          if (await ensureBlingAuthorized()) {
-            if (!isImageSyncRunning()) {
-              try {
-                const syncRes = await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() });
-                reapplyImagesToCachedCatalog();
-                console.log(`[Startup Bling Sync] ${syncRes.message}`);
-                if (hasFirebaseAdminEnv()) {
-                  await syncImageStoreToFirestore().catch(() => {});
-                }
-              } catch (err: any) {
-                console.warn('[Startup Bling Sync] Notice:', err?.message || err);
-              }
+        const authorized = await ensureBlingAuthorized({ verifyLive: false });
+        if (!authorized) {
+          console.log('[Startup Bling Auth] Sessão Bling ausente ou pendente de autorização OAuth.');
+          return;
+        }
+        if (isBlingDailyQuotaExceeded()) {
+          console.warn('[Startup Bling Auth] Limite diário do Bling ativo — mantendo catálogo em cache/Firestore.');
+          return;
+        }
+
+        try {
+          const catResult = await buildAndCacheCatalog({ forceImageSync: false });
+          console.log(`[Startup Bling Catalog] ${catResult.count} produtos em estoque pré-carregados (Bling bruto: ${catResult.blingRawCount}).`);
+        } catch (err: any) {
+          console.warn('[Startup Bling Catalog] Notice:', err?.message || err);
+        }
+
+        // Só executa crawl completo de imagens + Firestore no startup se a base ainda estiver vazia/pequena (< 10 docs)
+        if (firestoreSeedCount < 10 && !isBlingDailyQuotaExceeded()) {
+          if (await ensureBlingAuthorized() && !isImageSyncRunning()) {
+            try {
+              const syncRes = await syncImagesFromBling({ maxDetailFetches: 35, onBatchSaved: () => reapplyImagesToCachedCatalog() });
+              reapplyImagesToCachedCatalog();
+              console.log(`[Startup Bling Sync] ${syncRes.message}`);
+            } catch (err: any) {
+              console.warn('[Startup Bling Sync] Notice:', err?.message || err);
             }
           }
 
-          if (hasFirebaseAdminEnv()) {
+          if (hasFirebaseAdminEnv() && !isBlingDailyQuotaExceeded()) {
             try {
-              const syncFs = await syncAllBlingProdutosToFirestore({ enrichHighResImages: true });
+              const syncFs = await syncAllBlingProdutosToFirestore({ enrichHighResImages: false });
               console.log(`[Startup Bling Firestore] ${syncFs.totalImportado} itens sincronizados em ${syncFs.documentosGravados} docs.`);
             } catch (err: any) {
               console.warn('[Startup Bling Firestore] Notice:', err?.message || err);
             }
           }
-        })
-        .catch(() => {});
+        }
+      })().catch(() => {});
 
       // 3. Proactive Bling OAuth keepalive every 3 hours (renews automatically via Firestore & SQLite)
       const tokenKeepaliveTimer = setInterval(async () => {
@@ -3062,36 +3275,39 @@ async function setupViteOrStatic() {
       }, 3 * 60 * 60 * 1000);
       if (typeof tokenKeepaliveTimer.unref === 'function') tokenKeepaliveTimer.unref();
 
-      // 4. Periodic background auto-sync: refresh Bling catalog every 5 min, retry pending Bling orders, and Firestore/images every 15 min
+      // 4. Periodic background auto-sync: refresh Bling catalog every 15 min, retry pending Bling orders
       const catalogSyncTimer = setInterval(async () => {
         try {
-          if (isImageSyncRunning() || activeCatalogBuildPromise) return;
+          if (isImageSyncRunning() || activeCatalogBuildPromise || isBlingDailyQuotaExceeded()) return;
           if (await ensureBlingAuthorized()) {
             await buildAndCacheCatalog({ forceImageSync: false });
-            await retryPendingBlingOrders({ limit: 5 }).catch(() => {});
-          }
-        } catch {
-          // ignore
-        }
-      }, 5 * 60 * 1000);
-      if (typeof catalogSyncTimer.unref === 'function') catalogSyncTimer.unref();
-
-      const imageSyncTimer = setInterval(async () => {
-        try {
-          if (activeCatalogBuildPromise || isImageSyncRunning()) return;
-          if (await ensureBlingAuthorized()) {
-            await syncImagesFromBling({ onBatchSaved: () => reapplyImagesToCachedCatalog() })
-              .then(() => reapplyImagesToCachedCatalog())
-              .catch(() => {});
-            if (hasFirebaseAdminEnv()) {
-              await syncImageStoreToFirestore().catch(() => {});
-              await syncAllBlingProdutosToFirestore({ enrichHighResImages: true }).catch(() => {});
+            if (!isBlingDailyQuotaExceeded()) {
+              await retryPendingBlingOrders({ limit: 5 }).catch(() => {});
             }
           }
         } catch {
           // ignore
         }
       }, 15 * 60 * 1000);
+      if (typeof catalogSyncTimer.unref === 'function') catalogSyncTimer.unref();
+
+      // 5. Gentle high-res media + Firestore sync every 2 hours (avoiding Bling 120k/day quota burn)
+      const imageSyncTimer = setInterval(async () => {
+        try {
+          if (activeCatalogBuildPromise || isImageSyncRunning() || isBlingDailyQuotaExceeded()) return;
+          if (await ensureBlingAuthorized()) {
+            await syncImagesFromBling({ maxDetailFetches: 35, onBatchSaved: () => reapplyImagesToCachedCatalog() })
+              .then(() => reapplyImagesToCachedCatalog())
+              .catch(() => {});
+            if (hasFirebaseAdminEnv() && !isBlingDailyQuotaExceeded()) {
+              await syncImageStoreToFirestore().catch(() => {});
+              await syncAllBlingProdutosToFirestore({ enrichHighResImages: false }).catch(() => {});
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 2 * 60 * 60 * 1000);
       if (typeof imageSyncTimer.unref === 'function') imageSyncTimer.unref();
     });
   }

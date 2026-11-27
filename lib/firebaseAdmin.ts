@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { App, cert, getApps, initializeApp, ServiceAccount } from 'firebase-admin/app';
+import { Auth, getAuth } from 'firebase-admin/auth';
 import { Firestore, getFirestore } from 'firebase-admin/firestore';
 
 type ParsedServiceAccount = ServiceAccount & {
@@ -153,4 +154,8 @@ export function getAdminFirestore(): Firestore {
   }
 
   return getFirestore(app);
+}
+
+export function getAdminAuth(): Auth {
+  return getAuth(getFirebaseAdminApp());
 }

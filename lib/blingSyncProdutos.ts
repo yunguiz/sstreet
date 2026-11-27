@@ -6,6 +6,8 @@ import { getAdminFirestore } from './firebaseAdmin.js';
 import {
   blingApiRequest,
   interceptBlingTokenBeforeSync,
+  isBlingDailyQuotaExceeded,
+  isBlingRateLimitError,
   BLING_OFFICIAL_API_BASE,
   BLING_API_BASE,
 } from './blingToken.js';
@@ -427,6 +429,7 @@ async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, Stoc
   } | null> = [];
 
   for (const chunk of chunks) {
+    if (isBlingDailyQuotaExceeded()) break;
     const qs = chunk.map((id) => `idsProdutos[]=${encodeURIComponent(id)}`).join('&');
     try {
       const res = await fetchBlingJson<{
@@ -438,8 +441,9 @@ async function fetchStockBalancesForIds(ids: string[]): Promise<Map<string, Stoc
         }>;
       }>(`/estoques/saldos?${qs}`);
       results.push(res);
-    } catch {
+    } catch (err) {
       results.push(null);
+      if (isBlingRateLimitError(err) || isBlingDailyQuotaExceeded()) break;
     }
   }
 
@@ -469,6 +473,13 @@ export async function syncBlingProdutosPageToFirestore(
   paginaInput: number,
   options?: { enrichHighResImages?: boolean; maxDetailMs?: number }
 ): Promise<SyncProdutosPageResult> {
+  if (isBlingDailyQuotaExceeded()) {
+    return {
+      success: true,
+      finalizado: true,
+      totalImportado: 0,
+    };
+  }
   const pagina = Number.isFinite(paginaInput) && paginaInput >= 1 ? Math.floor(paginaInput) : 1;
   // Interceptor de pré-sincronização: valida expiração e renova via refresh_token se necessário
   await interceptBlingTokenBeforeSync();
@@ -670,14 +681,21 @@ export async function syncBlingProdutosPageToFirestore(
     });
   }
 
+  const detailCheckedAtMap = new Map<string, number>();
+
   // Busca detalhe GET /produtos/{id} no Bling v3 quando a listagem vier sem mídia,
   // apenas com miniatura (/t/), sem pai na página ou sem imagem salva em alta resolução no Firestore.
-  if (options?.enrichHighResImages !== false) {
+  if (options?.enrichHighResImages !== false && !isBlingDailyQuotaExceeded()) {
     const detailBudgetMs = options?.maxDetailMs ?? (process.env.VERCEL ? 2800 : 25000);
     const detailStart = Date.now();
+    const DETAIL_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 
     const candidates = entries.filter((g) => {
       const existingData = existingByDocId.get(g.docId);
+      const lastChecked = Number(existingData?.detailCheckedAt || 0);
+      if (lastChecked > 0 && Date.now() - lastChecked < DETAIL_COOLDOWN_MS) {
+        return false;
+      }
       const existingImgs = Array.isArray(existingData?.imagens)
         ? (existingData.imagens as string[]).filter((u) => getImageQualityTier(u) >= 2)
         : [];
@@ -689,17 +707,18 @@ export async function syncBlingProdutosPageToFirestore(
       return needsHighResPhoto || needsOrphanParent;
     });
 
-    const maxToEnrich = process.env.VERCEL ? 18 : 100;
+    const maxToEnrich = process.env.VERCEL ? 18 : 30;
     const targets = candidates.slice(0, maxToEnrich);
     const CONCURRENCY = 1;
 
     for (let i = 0; i < targets.length; i += CONCURRENCY) {
-      if (Date.now() - detailStart >= detailBudgetMs) break;
+      if (Date.now() - detailStart >= detailBudgetMs || isBlingDailyQuotaExceeded()) break;
       const chunk = targets.slice(i, i + CONCURRENCY);
       await Promise.all(
         chunk.map(async (group) => {
           try {
             const detail = await fetchBlingJson<{ data?: BlingProdutoRaw }>(`/produtos/${group.docId}`);
+            detailCheckedAtMap.set(group.docId, Date.now());
             const fullItem = detail?.data;
             if (!fullItem) return;
 
@@ -748,7 +767,7 @@ export async function syncBlingProdutosPageToFirestore(
             const varCandidates = Array.from(new Set([...Object.keys(group.variacoes), ...detailVarIds])).slice(0, 2);
             for (const varId of varCandidates) {
               const stillLowRes = group.imagens.every((u) => getImageQualityTier(u) < 2);
-              if (!stillLowRes || Date.now() - detailStart >= detailBudgetMs) break;
+              if (!stillLowRes || Date.now() - detailStart >= detailBudgetMs || isBlingDailyQuotaExceeded()) break;
               const varDetail = await fetchBlingJson<{ data?: BlingProdutoRaw }>(`/produtos/${varId}`).catch(
                 () => null
               );
@@ -883,11 +902,13 @@ export async function syncBlingProdutosPageToFirestore(
         )
       );
 
+      const checkedAtTs = detailCheckedAtMap.get(group.docId);
       const payload: Record<string, unknown> = {
         blingId: group.blingId,
         ativo: true,
         updatedAt: FieldValue.serverTimestamp(),
         syncedAtIso: nowIso,
+        ...(checkedAtTs ? { detailCheckedAt: checkedAtTs } : {}),
       };
 
       if (group.hasParentRecord) {
@@ -991,6 +1012,10 @@ export async function syncAllBlingProdutosToFirestore(options?: {
     let paradoPorTempoLimite = false;
 
     while (paginasProcessadas < maxPages) {
+      if (isBlingDailyQuotaExceeded()) {
+        paradoPorTempoLimite = true;
+        break;
+      }
       const elapsed = Date.now() - startedAt;
       if (paginasProcessadas > 0 && elapsed >= maxExecutionMs) {
         paradoPorTempoLimite = true;
