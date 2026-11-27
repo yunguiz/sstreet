@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Ticket,
   ArrowLeft,
+  ArrowRight,
   ShoppingBag,
   ShieldCheck,
   CalendarClock,
@@ -35,6 +36,7 @@ interface Ps5RaffleSectionProps {
   isDedicatedPage?: boolean;
   onBackToStore?: () => void;
   onExploreCatalog?: () => void;
+  onOpenRafflePage?: () => void;
 }
 
 export function Ps5RaffleSection({
@@ -42,6 +44,7 @@ export function Ps5RaffleSection({
   isDedicatedPage = false,
   onBackToStore,
   onExploreCatalog,
+  onOpenRafflePage,
 }: Ps5RaffleSectionProps) {
   const shouldReduceMotion = useReducedMotion();
   const [status, setStatus] = useState<RaffleStatus | null>(null);
@@ -93,18 +96,136 @@ export function Ps5RaffleSection({
 
   if (!status || !status.active) return null;
 
+  if (!isDedicatedPage) {
+    return (
+      <section
+        id={id}
+        className="bg-[#09090b] border-b border-zinc-800/80 py-6 sm:py-8 px-4 sm:px-6 lg:px-8"
+      >
+        <div className="max-w-6xl mx-auto space-y-4">
+          {/* Compact How-It-Works Bar */}
+          <div className="rounded-xl bg-[#121216] border border-zinc-800 p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+            <div className="space-y-1.5 max-w-2xl">
+              <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-zinc-400">
+                <span className="text-[#FF8E53] font-bold uppercase tracking-wider">Sorteio Oficial</span>
+                <span aria-hidden="true">·</span>
+                <span className="text-[#22D3EE]">PS5 + GTA VI</span>
+                <span aria-hidden="true">·</span>
+                <span>Como funciona a participação</span>
+              </div>
+              <h2 className="text-xl sm:text-2xl font-oswald font-bold text-white uppercase tracking-wide leading-tight">
+                Ganhe 1 bilhete automático em compras a partir de R$ 150,00
+              </h2>
+              <p className="text-xs sm:text-sm text-zinc-300 leading-relaxed">
+                Ao aprovar seu Pix ou Cartão na hora, o sistema gera seu código exclusivo{' '}
+                <span className="font-mono text-white">PS5-XXXX</span> automaticamente. Acompanhe seus bilhetes na sua conta ou na página oficial do sorteio até atingir {status.goal} participações.
+              </p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row lg:flex-col xl:flex-row items-stretch sm:items-center gap-3.5 lg:shrink-0">
+              <div className="min-w-[200px] space-y-1.5">
+                <div className="flex items-center justify-between gap-3 text-xs tabular-nums">
+                  <span className="text-white font-bold">
+                    {status.total} / {status.goal} bilhetes
+                  </span>
+                  <span className="text-[#22D3EE] font-semibold">
+                    {status.percentage}%
+                  </span>
+                </div>
+                <div className="w-full h-2 bg-zinc-950 rounded-full overflow-hidden border border-zinc-800">
+                  <div
+                    className="h-full bg-gradient-to-r from-[#FF6B4A] via-[#EC4899] to-[#22D3EE] rounded-full transition-all duration-500"
+                    style={{ width: `${Math.max(3, status.percentage)}%` }}
+                  />
+                </div>
+                <p className="text-[11px] text-zinc-400 tabular-nums">
+                  Faltam {status.remaining} {status.remaining === 1 ? 'bilhete' : 'bilhetes'} para o sorteio
+                </p>
+              </div>
+
+              <button
+                type="button"
+                onClick={onOpenRafflePage || onExploreCatalog}
+                className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-[#FF6B4A] via-[#E11D48] to-[#DB2777] hover:brightness-110 text-white font-bold text-xs uppercase tracking-wider transition-all cursor-pointer inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0 active:scale-95"
+              >
+                <Gamepad2 className="w-4 h-4 shrink-0" />
+                <span>Abrir Página do Sorteio</span>
+                <ArrowRight className="w-3.5 h-3.5 shrink-0" />
+              </button>
+            </div>
+          </div>
+
+          {/* Recent Participants Table (kept compact right underneath) */}
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-sm sm:text-base font-black text-white uppercase tracking-wide font-oswald flex items-center gap-2">
+                <Ticket className="w-4 h-4 text-[#FF8E53]" />
+                <span>Últimos Bilhetes Gerados na Loja</span>
+              </h3>
+              <span className="text-xs text-zinc-400">
+                Placar oficial sincronizado com os pedidos pagos
+              </span>
+            </div>
+
+            <div className="bg-[#121216] border border-zinc-800 rounded-xl overflow-hidden">
+              {status.recentEntries.length === 0 ? (
+                <div className="p-5 text-center text-zinc-400 text-xs sm:text-sm">
+                  Nenhum bilhete gerado ainda. Seja o primeiro a comprar e garantir o seu!
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-zinc-800 bg-zinc-900/70 text-zinc-400 text-xs uppercase tracking-wider font-oswald">
+                        <th className="py-2.5 px-4">Código do Bilhete</th>
+                        <th className="py-2.5 px-4">Participante</th>
+                        <th className="py-2.5 px-4">Localidade</th>
+                        <th className="py-2.5 px-4 text-right">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-800/60 text-xs sm:text-sm">
+                      {status.recentEntries.map((entry, idx) => (
+                        <tr key={idx} className="hover:bg-zinc-900/40 transition-colors">
+                          <td className="py-2.5 px-4 font-mono font-bold text-[#FF8E53] tracking-wider tabular-nums">
+                            {entry.ticketCode}
+                          </td>
+                          <td className="py-2.5 px-4 text-white font-medium">
+                            {entry.customerName}
+                          </td>
+                          <td className="py-2.5 px-4 text-zinc-400 text-xs">
+                            {entry.cityState}
+                          </td>
+                          <td className="py-2.5 px-4 text-right">
+                            <span className="inline-flex items-center justify-end gap-1.5 text-emerald-400 text-xs font-semibold">
+                              <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                              <span>{entry.status}</span>
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </section>
+    );
+  }
+
   return (
     <section
       id={id}
-      className={`relative px-4 sm:px-6 lg:px-8 bg-[#09090b] border-y border-zinc-800/80 overflow-hidden ${
-        isDedicatedPage ? 'py-10 sm:py-14 min-h-[80vh]' : 'py-14 sm:py-20'
-      }`}
+      className="relative px-4 sm:px-6 lg:px-8 bg-[#09090b] border-y border-zinc-800/80 overflow-hidden py-10 sm:py-14 min-h-[80vh]"
     >
       {/* Miami Twilight Scenic Backdrop with Measured Contrast Scrim */}
       <div className="absolute inset-0 pointer-events-none select-none">
         <img
           src={miamiSunsetSkylineImg}
           alt="Horizonte Miami ao entardecer"
+          loading={isDedicatedPage ? 'eager' : 'lazy'}
+          decoding="async"
           referrerPolicy="no-referrer"
           className="w-full h-full object-cover object-top opacity-20"
         />
@@ -179,6 +300,8 @@ export function Ps5RaffleSection({
                 transition={{ duration: 4.8, repeat: Infinity, ease: 'easeInOut' }}
                 src={ps5MiamiConsoleImg}
                 alt="Console PlayStation 5 e controle DualSense sob iluminação Miami"
+                loading={isDedicatedPage ? 'eager' : 'lazy'}
+                decoding="async"
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
               />
@@ -235,6 +358,8 @@ export function Ps5RaffleSection({
                 transition={{ duration: 5.4, repeat: Infinity, ease: 'easeInOut' }}
                 src={gta6MiamiPosterImg}
                 alt="Cenário estilo Miami sunset inspirado em GTA VI"
+                loading={isDedicatedPage ? 'eager' : 'lazy'}
+                decoding="async"
                 referrerPolicy="no-referrer"
                 className="w-full h-full object-cover"
               />

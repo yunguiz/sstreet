@@ -14,6 +14,9 @@ import {
   getValidBlingToken as getFirestoreValidToken,
   isBlingDailyQuotaExceeded,
   isBlingRateLimitError,
+  tryAcquireHeavyBlingLock,
+  releaseHeavyBlingLock,
+  isAnyHeavyBlingLockActive,
 } from './lib/blingToken.js';
 import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
 import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
@@ -342,6 +345,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
     let blingRawCount = 0;
     let blingError: string | null = null;
     let hasAnyBlingSession = false;
+    let catalogLockAcquired = false;
     const zeroStockFromBlingKeys = new Set<string>();
 
     // Merge all live products from Bling ERP seamlessly when connected (supports all 1411+ items & variations)
@@ -354,6 +358,15 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
         blingConnected = true;
         blingError = 'Limite diário de requisições do Bling atingido (429/day). Exibindo catálogo em cache/Firestore.';
       } else if (hasAnyBlingSession) {
+        catalogLockAcquired = tryAcquireHeavyBlingLock('catalog-build', 5 * 60 * 1000);
+        if (!catalogLockAcquired) {
+          blingConnected = true;
+          blingError = 'Outra sincronização pesada do Bling já está em execução; usando catálogo em cache/Firestore.';
+          console.log('[Catalog Lock] Skipping overlapping Bling catalog build while another heavy Bling sync is active.');
+        }
+      }
+
+      if (hasAnyBlingSession && catalogLockAcquired && !isBlingDailyQuotaExceeded()) {
         // Interceptor pré-sincronização: valida expiração sem ping extra em /produtos
         const tokenReady = await ensureBlingAuthorized({ verifyLive: false });
         if (!tokenReady) {
@@ -828,6 +841,9 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
       console.warn('[Catalog] Notice during Bling merge:', blingError);
     } finally {
       setCatalogFetchInProgress(false);
+      if (catalogLockAcquired) {
+        releaseHeavyBlingLock('catalog-build');
+      }
     }
 
     // Helper to extract base product name (strips variation labels, sizes, colors)
@@ -3348,7 +3364,7 @@ registerBlingRoutes(app, {
     buildAndCacheCatalog({ forceImageSync: false })
       .catch(() => {})
       .finally(() => {
-        if (isBlingDailyQuotaExceeded()) return;
+        if (isBlingDailyQuotaExceeded() || isAnyHeavyBlingLockActive()) return;
         syncImagesFromBling({ maxDetailFetches: 35, onBatchSaved: () => reapplyImagesToCachedCatalog() })
           .then(async () => {
             reapplyImagesToCachedCatalog();
@@ -3484,7 +3500,7 @@ async function setupViteOrStatic() {
       // 4. Periodic background auto-sync: refresh Bling catalog every 15 min, retry pending Bling orders
       const catalogSyncTimer = setInterval(async () => {
         try {
-          if (isImageSyncRunning() || activeCatalogBuildPromise || isBlingDailyQuotaExceeded()) return;
+          if (isImageSyncRunning() || activeCatalogBuildPromise || isAnyHeavyBlingLockActive() || isBlingDailyQuotaExceeded()) return;
           if (await ensureBlingAuthorized()) {
             await buildAndCacheCatalog({ forceImageSync: false });
             if (!isBlingDailyQuotaExceeded()) {
@@ -3500,7 +3516,7 @@ async function setupViteOrStatic() {
       // 5. Gentle high-res media + Firestore sync every 2 hours (avoiding Bling 120k/day quota burn)
       const imageSyncTimer = setInterval(async () => {
         try {
-          if (activeCatalogBuildPromise || isImageSyncRunning() || isBlingDailyQuotaExceeded()) return;
+          if (activeCatalogBuildPromise || isImageSyncRunning() || isAnyHeavyBlingLockActive() || isBlingDailyQuotaExceeded()) return;
           if (await ensureBlingAuthorized()) {
             await syncImagesFromBling({ maxDetailFetches: 35, onBatchSaved: () => reapplyImagesToCachedCatalog() })
               .then(() => reapplyImagesToCachedCatalog())

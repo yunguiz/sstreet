@@ -418,6 +418,45 @@ export function isBlingRateLimitError(err: unknown): boolean {
   );
 }
 
+export function isBlingConflictError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err || '')).toLowerCase();
+  return (
+    msg.includes('[409') ||
+    msg.includes('409 conflict') ||
+    msg.includes('status 409') ||
+    msg.includes('já existe') ||
+    msg.includes('duplicad')
+  );
+}
+
+const activeHeavyBlingLocks = new Map<string, number>();
+
+export function tryAcquireHeavyBlingLock(lockName: string, ttlMs: number = 5 * 60 * 1000): boolean {
+  const now = Date.now();
+  const existingUntil = activeHeavyBlingLocks.get(lockName);
+  if (existingUntil && existingUntil > now) {
+    return false;
+  }
+  activeHeavyBlingLocks.set(lockName, now + Math.max(5000, ttlMs));
+  return true;
+}
+
+export function releaseHeavyBlingLock(lockName: string): void {
+  activeHeavyBlingLocks.delete(lockName);
+}
+
+export function isAnyHeavyBlingLockActive(): boolean {
+  const now = Date.now();
+  for (const [key, until] of activeHeavyBlingLocks.entries()) {
+    if (until <= now) {
+      activeHeavyBlingLocks.delete(key);
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function reportBlingDailyLimit(detail?: string): void {
   const now = Date.now();
   globalBlingDailyBlockedUntil = Math.max(globalBlingDailyBlockedUntil, now + DAILY_LIMIT_COOLDOWN_MS);
@@ -515,15 +554,15 @@ export async function blingApiRequest<T = unknown>(
       reportBlingDailyLimit(rateLimitBody);
       throw new Error(`Bling API [429 Daily Limit]: ${rateLimitBody.slice(0, 300)}`);
     }
-    if (rateLimitAttempt < 6) {
+    if (rateLimitAttempt < 3) {
       const retryAfterSec = Number(response.headers.get('retry-after') || '0');
-      const jitter = 200 + Math.floor(Math.random() * 450);
+      const jitter = 150 + Math.floor(Math.random() * 350);
       const waitMs =
         Number.isFinite(retryAfterSec) && retryAfterSec > 0
-          ? Math.min(20000, retryAfterSec * 1000 + jitter)
-          : Math.min(20000, 1500 * (rateLimitAttempt + 1) + jitter);
+          ? Math.min(6000, retryAfterSec * 1000 + jitter)
+          : Math.min(5500, 1100 * (rateLimitAttempt + 1) + jitter);
       reportBlingRateLimit(waitMs);
-      console.warn(`[Bling API] 429 Rate Limit em ${endpoint} (tentativa ${rateLimitAttempt + 1}/6). Aguardando ${waitMs}ms...`);
+      console.warn(`[Bling API] 429 Rate Limit em ${endpoint} (tentativa ${rateLimitAttempt + 1}/3). Aguardando ${waitMs}ms...`);
       await new Promise((r) => setTimeout(r, waitMs));
       return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);
     }
@@ -555,8 +594,8 @@ export async function blingApiRequest<T = unknown>(
           reportBlingDailyLimit(retry429Body);
           throw new Error(`Bling API [429 Daily Limit]: ${retry429Body.slice(0, 300)}`);
         }
-        if (rateLimitAttempt < 6) {
-          const waitMs = 2000 + Math.floor(Math.random() * 500);
+        if (rateLimitAttempt < 3) {
+          const waitMs = 1500 + Math.floor(Math.random() * 400);
           reportBlingRateLimit(waitMs);
           await new Promise((r) => setTimeout(r, waitMs));
           return blingApiRequest<T>(endpoint, init, rateLimitAttempt + 1);

@@ -507,7 +507,7 @@ export function ProductModal({
                       <div key={opt.id} className="flex items-center justify-between text-zinc-300 py-0.5">
                         <div className="flex items-center gap-1.5">
                           {opt.company?.picture && (
-                            <img src={opt.company.picture} alt={opt.company.name} className="w-3.5 h-3.5 object-contain" />
+                            <img src={opt.company.picture} alt={opt.company.name} loading="lazy" decoding="async" className="w-3.5 h-3.5 object-contain" />
                           )}
                           <span className="font-medium text-white">{opt.company?.name} {opt.name}</span>
                           <span className="text-[10px] text-zinc-500">({opt.deliveryText})</span>

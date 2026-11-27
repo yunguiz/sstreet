@@ -1,7 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 import { ensureBlingAuthorized, fetchFromBling } from './server-bling.js';
-import { isBlingDailyQuotaExceeded, isBlingRateLimitError } from './lib/blingToken.js';
+import {
+  isBlingDailyQuotaExceeded,
+  isBlingRateLimitError,
+  tryAcquireHeavyBlingLock,
+  releaseHeavyBlingLock,
+} from './lib/blingToken.js';
 import type { Product } from './src/types/index.js';
 
 const BUNDLED_IMAGES_STORE_FILE = path.resolve(process.cwd(), '.bling_product_images.json');
@@ -667,6 +672,8 @@ export function setCatalogFetchInProgress(val: boolean): void {
  * Queries /produtos to list all products and calls GET /produtos/{id} on each unique product
  * to extract data.midia.imagens.internas (.link / .linkMiniatura), data.midia.imagens.externas (.link), and imagemURL.
  */
+const MIN_IMAGE_SYNC_COOLDOWN_MS = 2 * 60 * 1000;
+
 export async function syncImagesFromBling(options?: {
   maxDetailFetches?: number;
   clearCache?: boolean;
@@ -683,6 +690,34 @@ export async function syncImagesFromBling(options?: {
 }> {
   if (activeSyncPromise) {
     return activeSyncPromise;
+  }
+
+  if (!options?.clearCache && lastSyncCompletedAt > 0 && Date.now() - lastSyncCompletedAt < MIN_IMAGE_SYNC_COOLDOWN_MS) {
+    const store = loadImageStore();
+    const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
+    return {
+      success: true,
+      updatedCount: 0,
+      detailedFetched: 0,
+      totalWithImages,
+      sources: { bling: 0 },
+      connected: true,
+      message: `Sincronização de imagens recente em cache (${totalWithImages} mapeamentos).`,
+    };
+  }
+
+  if (!tryAcquireHeavyBlingLock('bling-image-sync', 10 * 60 * 1000)) {
+    const store = loadImageStore();
+    const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
+    return {
+      success: true,
+      updatedCount: 0,
+      detailedFetched: 0,
+      totalWithImages,
+      sources: { bling: 0 },
+      connected: true,
+      message: `Sincronização de imagens já possui trava ativa (${totalWithImages} mapeamentos).`,
+    };
   }
 
   activeSyncPromise = (async () => {
@@ -1001,6 +1036,7 @@ export async function syncImagesFromBling(options?: {
       };
     }
   })().finally(() => {
+    releaseHeavyBlingLock('bling-image-sync');
     activeSyncPromise = null;
   });
 

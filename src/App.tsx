@@ -1,30 +1,57 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, lazy, Suspense } from 'react';
 import { TickerBar } from './components/TickerBar';
 import { Header } from './components/Header';
 import { Hero } from './components/Hero';
 import { CatalogSection } from './components/CatalogSection';
-import { OfficialPartnersSection } from './components/OfficialPartnersSection';
-import { SocialProofSection } from './components/SocialProofSection';
 import { VipBanner } from './components/VipBanner';
 import { Footer } from './components/Footer';
-import { ProductModal } from './components/ProductModal';
-import { CartDrawer } from './components/CartDrawer';
-import { FavoritesDrawer } from './components/FavoritesDrawer';
-import { SearchBar } from './components/SearchBar';
-import { OrderTrackingModal } from './components/OrderTrackingModal';
-import { PoliciesAndFaqModal, PolicyTab } from './components/PoliciesAndFaqModal';
-import { StreetwearRailSection } from './components/StreetwearRailSection';
+import type { PolicyTab } from './components/PoliciesAndFaqModal';
+import type { AuthModalMode } from './components/CustomerAuthModal';
 import { Product, ProductCategory, CartItem } from './types';
 import { getLiveCatalog } from './services/catalog';
-import { AdminBlingSyncPage } from './components/AdminBlingSyncPage';
-import { Ps5RaffleSection } from './components/Ps5RaffleSection';
 import { MiamiRaffleHeroBanner } from './components/MiamiRaffleHeroBanner';
-import { CustomerAuthModal, AuthModalMode } from './components/CustomerAuthModal';
 import {
   CustomerProfile,
   logoutCustomer,
   subscribeToCustomerAuth,
 } from './services/auth';
+
+const OfficialPartnersSection = lazy(() =>
+  import('./components/OfficialPartnersSection').then((m) => ({ default: m.OfficialPartnersSection }))
+);
+const SocialProofSection = lazy(() =>
+  import('./components/SocialProofSection').then((m) => ({ default: m.SocialProofSection }))
+);
+const StreetwearRailSection = lazy(() =>
+  import('./components/StreetwearRailSection').then((m) => ({ default: m.StreetwearRailSection }))
+);
+const Ps5RaffleSection = lazy(() =>
+  import('./components/Ps5RaffleSection').then((m) => ({ default: m.Ps5RaffleSection }))
+);
+const ProductModal = lazy(() =>
+  import('./components/ProductModal').then((m) => ({ default: m.ProductModal }))
+);
+const CartDrawer = lazy(() =>
+  import('./components/CartDrawer').then((m) => ({ default: m.CartDrawer }))
+);
+const FavoritesDrawer = lazy(() =>
+  import('./components/FavoritesDrawer').then((m) => ({ default: m.FavoritesDrawer }))
+);
+const SearchBar = lazy(() =>
+  import('./components/SearchBar').then((m) => ({ default: m.SearchBar }))
+);
+const OrderTrackingModal = lazy(() =>
+  import('./components/OrderTrackingModal').then((m) => ({ default: m.OrderTrackingModal }))
+);
+const PoliciesAndFaqModal = lazy(() =>
+  import('./components/PoliciesAndFaqModal').then((m) => ({ default: m.PoliciesAndFaqModal }))
+);
+const CustomerAuthModal = lazy(() =>
+  import('./components/CustomerAuthModal').then((m) => ({ default: m.CustomerAuthModal }))
+);
+const AdminBlingSyncPage = lazy(() =>
+  import('./components/AdminBlingSyncPage').then((m) => ({ default: m.AdminBlingSyncPage }))
+);
 
 function StorefrontApp() {
   // Cart state persisted to localStorage
@@ -428,12 +455,14 @@ function StorefrontApp() {
 
       {isRafflePage ? (
         <main className="flex-1">
-          <Ps5RaffleSection
-            id="sorteio-ps5"
-            isDedicatedPage
-            onBackToStore={() => navigateToHomeSection()}
-            onExploreCatalog={scrollToCatalog}
-          />
+          <Suspense fallback={null}>
+            <Ps5RaffleSection
+              id="sorteio-ps5"
+              isDedicatedPage
+              onBackToStore={() => navigateToHomeSection()}
+              onExploreCatalog={scrollToCatalog}
+            />
+          </Suspense>
         </main>
       ) : (
         <>
@@ -465,38 +494,47 @@ function StorefrontApp() {
             onQuickAdd={handleQuickAdd}
           />
 
-          {/* 4.5 Decorated PS5 + GTA VI Raffle Section */}
-          <Ps5RaffleSection
-            id="sorteio-ps5"
-            onExploreCatalog={scrollToCatalog}
-          />
+          {/* 4.5 Compact PS5 + GTA VI Raffle Strip */}
+          <Suspense fallback={null}>
+            <Ps5RaffleSection
+              id="sorteio-ps5"
+              onExploreCatalog={scrollToCatalog}
+              onOpenRafflePage={openRafflePage}
+            />
+          </Suspense>
 
           {/* 4.8 Interactive 3D Clothing Rail Gallery Section */}
           <div id="arara-virtual">
-            <StreetwearRailSection
-              products={products}
-              onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
-              onQuickAdd={handleQuickAdd}
-              onExploreCatalog={scrollToCatalog}
-            />
+            <Suspense fallback={null}>
+              <StreetwearRailSection
+                products={products}
+                onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+                onQuickAdd={handleQuickAdd}
+                onExploreCatalog={scrollToCatalog}
+              />
+            </Suspense>
           </div>
 
           {/* 5. Official Partner Brands Slider & Showcase */}
-          <OfficialPartnersSection
-            products={products}
-            onSelectBrandSearch={(query) => {
-              setActiveCategory('all');
-              setActiveSubcategory(undefined);
-              setBrandFilter(query);
-              scrollToCatalog();
-            }}
-          />
+          <Suspense fallback={null}>
+            <OfficialPartnersSection
+              products={products}
+              onSelectBrandSearch={(query) => {
+                setActiveCategory('all');
+                setActiveSubcategory(undefined);
+                setBrandFilter(query);
+                scrollToCatalog();
+              }}
+            />
+          </Suspense>
 
           {/* 6. VIP WhatsApp Club Section */}
           <VipBanner />
 
           {/* 7. Instagram Feed (@streetstoreitabira) & Customer Social Proof */}
-          <SocialProofSection products={products} />
+          <Suspense fallback={null}>
+            <SocialProofSection products={products} />
+          </Suspense>
         </>
       )}
 
@@ -519,99 +557,115 @@ function StorefrontApp() {
       />
 
       {/* Modal: Product Details Drawer */}
-      <ProductModal
-        product={selectedProduct}
-        isOpen={Boolean(selectedProduct)}
-        isFavorited={selectedProduct ? favorites.includes(selectedProduct.id) : false}
-        onToggleFavorite={handleToggleFavorite}
-        onClose={() => setSelectedProduct(null)}
-        onAddToCart={handleAddToCart}
-        onBuyNow={handleBuyNow}
-      />
+      <Suspense fallback={null}>
+        {selectedProduct && (
+          <ProductModal
+            product={selectedProduct}
+            isOpen={Boolean(selectedProduct)}
+            isFavorited={favorites.includes(selectedProduct.id)}
+            onToggleFavorite={handleToggleFavorite}
+            onClose={() => setSelectedProduct(null)}
+            onAddToCart={handleAddToCart}
+            onBuyNow={handleBuyNow}
+          />
+        )}
 
-      {/* Slide-over Cart Drawer */}
-      <CartDrawer
-        isOpen={isCartOpen}
-        onClose={() => setIsCartOpen(false)}
-        items={cartItems}
-        onUpdateQuantity={handleUpdateQuantity}
-        onRemoveItem={handleRemoveItem}
-        onClearCart={handleClearCart}
-        initialStep={cartInitialStep}
-        currentUser={currentUser}
-        onRequireAuth={() => {
-          setIsCartOpen(false);
-          openCustomerAuth(
-            'register',
-            'Para concluir o pagamento, entre ou crie seu cadastro rápido.',
-            true
-          );
-        }}
-        onOpenTracking={(orderNum) => {
-          setTrackingInitialQuery(orderNum || '');
-          setIsTrackingOpen(true);
-        }}
-      />
+        {/* Slide-over Cart Drawer */}
+        {isCartOpen && (
+          <CartDrawer
+            isOpen={isCartOpen}
+            onClose={() => setIsCartOpen(false)}
+            items={cartItems}
+            onUpdateQuantity={handleUpdateQuantity}
+            onRemoveItem={handleRemoveItem}
+            onClearCart={handleClearCart}
+            initialStep={cartInitialStep}
+            currentUser={currentUser}
+            onRequireAuth={() => {
+              setIsCartOpen(false);
+              openCustomerAuth(
+                'register',
+                'Para concluir o pagamento, entre ou crie seu cadastro rápido.',
+                true
+              );
+            }}
+            onOpenTracking={(orderNum) => {
+              setTrackingInitialQuery(orderNum || '');
+              setIsTrackingOpen(true);
+            }}
+          />
+        )}
 
-      {/* Customer Registration & Login Modal */}
-      <CustomerAuthModal
-        isOpen={isAuthModalOpen}
-        initialMode={authModalMode}
-        reasonMessage={authModalReason}
-        onClose={() => {
-          setIsAuthModalOpen(false);
-          setAuthModalReason(null);
-          setPendingCheckoutAfterAuth(false);
-        }}
-        onSuccess={(profile) => {
-          setCurrentUser(profile);
-          setIsAuthModalOpen(false);
-          setAuthModalReason(null);
-          if (pendingCheckoutAfterAuth) {
-            setPendingCheckoutAfterAuth(false);
-            setCartInitialStep('checkout');
-            setIsCartOpen(true);
-          }
-        }}
-      />
+        {/* Customer Registration & Login Modal */}
+        {isAuthModalOpen && (
+          <CustomerAuthModal
+            isOpen={isAuthModalOpen}
+            initialMode={authModalMode}
+            reasonMessage={authModalReason}
+            onClose={() => {
+              setIsAuthModalOpen(false);
+              setAuthModalReason(null);
+              setPendingCheckoutAfterAuth(false);
+            }}
+            onSuccess={(profile) => {
+              setCurrentUser(profile);
+              setIsAuthModalOpen(false);
+              setAuthModalReason(null);
+              if (pendingCheckoutAfterAuth) {
+                setPendingCheckoutAfterAuth(false);
+                setCartInitialStep('checkout');
+                setIsCartOpen(true);
+              }
+            }}
+          />
+        )}
 
-      {/* Slide-over Favorites Wishlist Drawer */}
-      <FavoritesDrawer
-        isOpen={isFavoritesOpen}
-        onClose={() => setIsFavoritesOpen(false)}
-        favoriteProducts={products.filter((p) => favorites.includes(p.id))}
-        onRemoveFavorite={handleToggleFavorite}
-        onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
-        onQuickAdd={handleQuickAdd}
-      />
+        {/* Slide-over Favorites Wishlist Drawer */}
+        {isFavoritesOpen && (
+          <FavoritesDrawer
+            isOpen={isFavoritesOpen}
+            onClose={() => setIsFavoritesOpen(false)}
+            favoriteProducts={products.filter((p) => favorites.includes(p.id))}
+            onRemoveFavorite={handleToggleFavorite}
+            onOpenProduct={(prod: Product) => setSelectedProduct(prod)}
+            onQuickAdd={handleQuickAdd}
+          />
+        )}
 
-      {/* Instant Product Search Modal with Autocomplete */}
-      <SearchBar
-        isOpen={isSearchOpen}
-        onClose={() => setIsSearchOpen(false)}
-        products={products}
-        onSelectProduct={(prod: Product) => setSelectedProduct(prod)}
-      />
+        {/* Instant Product Search Modal with Autocomplete */}
+        {isSearchOpen && (
+          <SearchBar
+            isOpen={isSearchOpen}
+            onClose={() => setIsSearchOpen(false)}
+            products={products}
+            onSelectProduct={(prod: Product) => setSelectedProduct(prod)}
+          />
+        )}
 
-      {/* Order Tracking & Returns Modal */}
-      <OrderTrackingModal
-        isOpen={isTrackingOpen}
-        onClose={() => setIsTrackingOpen(false)}
-        initialQuery={trackingInitialQuery}
-        currentUser={currentUser}
-      />
+        {/* Order Tracking & Returns Modal */}
+        {isTrackingOpen && (
+          <OrderTrackingModal
+            isOpen={isTrackingOpen}
+            onClose={() => setIsTrackingOpen(false)}
+            initialQuery={trackingInitialQuery}
+            currentUser={currentUser}
+          />
+        )}
 
-      {/* Policies & FAQ Modal (Entregas, Trocas e Devoluções, Perguntas Frequentes) */}
-      <PoliciesAndFaqModal
-        isOpen={isPoliciesOpen}
-        initialTab={policiesInitialTab}
-        onClose={() => setIsPoliciesOpen(false)}
-        onOpenTracking={(orderNum) => {
-          setIsPoliciesOpen(false);
-          setTrackingInitialQuery(orderNum || '');
-          setIsTrackingOpen(true);
-        }}
-      />
+        {/* Policies & FAQ Modal (Entregas, Trocas e Devoluções, Perguntas Frequentes) */}
+        {isPoliciesOpen && (
+          <PoliciesAndFaqModal
+            isOpen={isPoliciesOpen}
+            initialTab={policiesInitialTab}
+            onClose={() => setIsPoliciesOpen(false)}
+            onOpenTracking={(orderNum) => {
+              setIsPoliciesOpen(false);
+              setTrackingInitialQuery(orderNum || '');
+              setIsTrackingOpen(true);
+            }}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }
@@ -621,7 +675,11 @@ export default function App() {
     typeof window !== 'undefined' ? window.location.pathname.replace(/\/+$/, '') : '';
 
   if (pathname === '/admin/bling') {
-    return <AdminBlingSyncPage />;
+    return (
+      <Suspense fallback={null}>
+        <AdminBlingSyncPage />
+      </Suspense>
+    );
   }
 
   return <StorefrontApp />;

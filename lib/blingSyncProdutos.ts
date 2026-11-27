@@ -8,6 +8,8 @@ import {
   interceptBlingTokenBeforeSync,
   isBlingDailyQuotaExceeded,
   isBlingRateLimitError,
+  tryAcquireHeavyBlingLock,
+  releaseHeavyBlingLock,
   BLING_OFFICIAL_API_BASE,
   BLING_API_BASE,
 } from './blingToken.js';
@@ -997,9 +999,22 @@ export async function syncAllBlingProdutosToFirestore(options?: {
     return activeSyncAllPromise;
   }
 
+  const startPage = Math.max(1, Math.floor(options?.startPage || 1));
+  if (!tryAcquireHeavyBlingLock('bling-firestore-sync', 10 * 60 * 1000)) {
+    return {
+      success: true,
+      finalizado: true,
+      paginaInicial: startPage,
+      ultimaPagina: startPage,
+      paginasProcessadas: 0,
+      totalImportado: 0,
+      documentosGravados: 0,
+      duracaoMs: 0,
+    };
+  }
+
   activeSyncAllPromise = (async () => {
     const startedAt = Date.now();
-    const startPage = Math.max(1, Math.floor(options?.startPage || 1));
     const maxExecutionMs = Math.max(2000, options?.maxExecutionMs ?? (process.env.VERCEL ? 8200 : 180000));
     const maxPages = Math.max(1, options?.maxPages ?? 100);
 
@@ -1057,6 +1072,7 @@ export async function syncAllBlingProdutosToFirestore(options?: {
       ...(paradoPorTempoLimite ? { paradoPorTempoLimite: true } : {}),
     };
   })().finally(() => {
+    releaseHeavyBlingLock('bling-firestore-sync');
     activeSyncAllPromise = null;
   });
 

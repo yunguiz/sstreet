@@ -8,6 +8,9 @@ import {
   getBlingTokenFromDb,
   upsertBlingTokenInDb,
   clearBlingTokenFromDb,
+  getBlingCachedResponse,
+  setBlingCachedResponse,
+  invalidateBlingCachedResponse,
   BLING_ACCESS_TTL_MS
 } from './server-bling-db.js';
 import {
@@ -27,6 +30,7 @@ import {
   reportBlingRateLimit,
   isBlingDailyLimitPayload,
   isBlingRateLimitError,
+  isBlingConflictError,
   isBlingDailyQuotaExceeded,
   reportBlingDailyLimit,
   clearBlingDailyLimit,
@@ -509,10 +513,34 @@ export function clearBlingAuthCache(): void {
   lastVerifiedAuth = null;
 }
 
-/**
- * Fetch authenticated resource from Bling v3 API (com interceptor pré-requisição + retry pós-401)
- */
-export async function fetchFromBling(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
+const inFlightBlingGets = new Map<string, Promise<any>>();
+
+function getBlingCacheTtlMs(urlOrEndpoint: string): number {
+  const lower = urlOrEndpoint.toLowerCase();
+  if (lower.includes('/formas-pagamentos')) return 60 * 60 * 1000;
+  if (/\/produtos\/\d+/.test(lower)) return 10 * 60 * 1000;
+  if (lower.includes('/estoques/saldos')) return 45 * 1000;
+  if (lower.includes('/pedidos/vendas')) return 45 * 1000;
+  if (lower.includes('/contatos')) return 60 * 1000;
+  if (lower.includes('/produtos')) return 60 * 1000;
+  return 30 * 1000;
+}
+
+function invalidateCacheForMutation(urlOrEndpoint: string): void {
+  const lower = urlOrEndpoint.toLowerCase();
+  if (lower.includes('/pedidos/vendas')) {
+    invalidateBlingCachedResponse('/pedidos/vendas');
+    invalidateBlingCachedResponse('/estoques/saldos');
+  } else if (lower.includes('/contatos')) {
+    invalidateBlingCachedResponse('/contatos');
+  } else if (lower.includes('/produtos')) {
+    invalidateBlingCachedResponse('/produtos');
+  } else if (lower.includes('/estoques')) {
+    invalidateBlingCachedResponse('/estoques');
+  }
+}
+
+async function executeBlingHttpRequest(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
   if (isBlingDailyQuotaExceeded()) {
     throw new Error('Bling API [429 Daily Limit]: Limite diário de requisições do Bling atingido. Aguardando renovação da cota.');
   }
@@ -544,20 +572,26 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
       lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
       throw new Error(`Bling API [429 Daily Limit]: ${rateLimitBody.replace(/\s+/g, ' ').trim()}`);
     }
-    if (retryCount < 6) {
+    if (retryCount < 3) {
       const retryAfterSec = Number(res.headers.get('retry-after') || '0');
-      const jitter = 200 + Math.floor(Math.random() * 450);
+      const jitter = 150 + Math.floor(Math.random() * 350);
       const waitMs =
         Number.isFinite(retryAfterSec) && retryAfterSec > 0
-          ? Math.min(20000, retryAfterSec * 1000 + jitter)
-          : Math.min(20000, 1500 * (retryCount + 1) + jitter);
+          ? Math.min(6000, retryAfterSec * 1000 + jitter)
+          : Math.min(5500, 1100 * (retryCount + 1) + jitter);
       reportBlingRateLimit(waitMs);
-      console.warn(`[Bling] 429 Rate Limit em ${endpoint} (tentativa ${retryCount + 1}/6). Aguardando ${waitMs}ms...`);
+      console.warn(`[Bling] 429 Rate Limit em ${endpoint} (tentativa ${retryCount + 1}/3). Aguardando ${waitMs}ms...`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
-      return fetchFromBling(endpoint, options, retryCount + 1);
+      return executeBlingHttpRequest(endpoint, options, retryCount + 1);
     }
     const compact429 = rateLimitBody.replace(/\s+/g, ' ').trim();
     throw new Error(`Bling API [429]: ${compact429}`);
+  }
+
+  if (res.status === 409) {
+    const conflictText = await res.text().catch(() => '');
+    const compactConflict = conflictText.replace(/\s+/g, ' ').trim();
+    throw new Error(`Bling API [409 Conflict]: ${compactConflict}`);
   }
 
   if (!res.ok) {
@@ -587,13 +621,17 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
               lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
               throw new Error(`Bling API [429 Daily Limit]: ${retry429Body.replace(/\s+/g, ' ').trim()}`);
             }
-            if (retryCount < 6) {
-              const waitMs = 2000 + Math.floor(Math.random() * 500);
+            if (retryCount < 3) {
+              const waitMs = 1500 + Math.floor(Math.random() * 400);
               reportBlingRateLimit(waitMs);
               await new Promise(resolve => setTimeout(resolve, waitMs));
-              return fetchFromBling(endpoint, options, retryCount + 1);
+              return executeBlingHttpRequest(endpoint, options, retryCount + 1);
             }
             throw new Error(`Bling API [429]: ${retry429Body.replace(/\s+/g, ' ').trim()}`);
+          }
+          if (retryRes.status === 409) {
+            const conflictBody = await retryRes.text().catch(() => '');
+            throw new Error(`Bling API [409 Conflict]: ${conflictBody.replace(/\s+/g, ' ').trim()}`);
           }
           if (retryRes.ok) {
             lastVerifiedAuth = { token: refreshed.access_token, valid: true, checkedAt: Date.now() };
@@ -606,7 +644,7 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
             throw new Error(msg);
           }
         } catch (refreshErr: any) {
-          if (isBlingRateLimitError(refreshErr)) {
+          if (isBlingRateLimitError(refreshErr) || isBlingConflictError(refreshErr)) {
             throw refreshErr;
           }
           const errDetail = refreshErr?.message || String(refreshErr);
@@ -630,6 +668,55 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
 
   lastVerifiedAuth = { token, valid: true, checkedAt: Date.now() };
   return res.json();
+}
+
+/**
+ * Fetch authenticated resource from Bling v3 API com:
+ * - Cache TTL persistente para GETs repetidos
+ * - Deduplicação de chamadas concorrentes (single-flight)
+ * - Fallback para cache stale em caso de 429 / cota diária
+ * - Tratamento claro de 409 Conflict e backoff não-bloqueante em 429
+ */
+export async function fetchFromBling(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
+  const method = String(options.method || 'GET').toUpperCase();
+  const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
+
+  if (method !== 'GET') {
+    const result = await executeBlingHttpRequest(endpoint, options, retryCount);
+    invalidateCacheForMutation(url);
+    return result;
+  }
+
+  const cachedFresh = getBlingCachedResponse(url, { allowStale: false });
+  if (cachedFresh) {
+    return cachedFresh.data;
+  }
+
+  const existingInFlight = inFlightBlingGets.get(url);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const run = (async () => {
+    try {
+      const payload = await executeBlingHttpRequest(endpoint, options, retryCount);
+      setBlingCachedResponse(url, payload, getBlingCacheTtlMs(url));
+      return payload;
+    } catch (err: any) {
+      if (isBlingRateLimitError(err) || isBlingDailyQuotaExceeded()) {
+        const stale = getBlingCachedResponse(url, { allowStale: true });
+        if (stale) {
+          return stale.data;
+        }
+      }
+      throw err;
+    } finally {
+      inFlightBlingGets.delete(url);
+    }
+  })();
+
+  inFlightBlingGets.set(url, run);
+  return run;
 }
 
 /**
@@ -1196,116 +1283,143 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
 
   app.use('/api/bling', blingRouter);
 
-  // 6. Fetch Products from Bling API v3 (Interceptado por blingAuthInterceptorMiddleware)
-  app.get('/api/bling/products', blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
-    try {
-      const pagina = req.query.pagina ? String(req.query.pagina) : '1';
-      const limiteParam = parseInt(String(req.query.limite || '100'), 10);
-      const maxProducts = Math.min(10000, parseInt(String(req.query.max || '10000'), 10) || 10000);
-      const includeZeroStock = req.query.includeZeroStock === 'true';
-      const fetchAll = req.query.all === 'true' || req.query.todos === 'true' || limiteParam > 100 || (!req.query.pagina && !req.query.limite);
+  const cachedProductsRoute = new Map<string, { payload: any; fetchedAt: number }>();
+  const inFlightProductsRoute = new Map<string, Promise<any>>();
 
-      let rawProducts: any[] = [];
-      if (fetchAll) {
-        const seenIds = new Set<number>();
-        const pushUnique = (items: any[]) => {
-          for (const it of items) {
-            if (it?.situacao === 'I' || it?.situacao === 'E') continue;
-            if (it?.id && !seenIds.has(it.id) && rawProducts.length < maxProducts) {
-              seenIds.add(it.id);
-              rawProducts.push(it);
+  // 6. Fetch Products from Bling API v3 (Interceptado por blingAuthInterceptorMiddleware + cache TTL 60s + single-flight)
+  app.get('/api/bling/products', blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
+    const pagina = req.query.pagina ? String(req.query.pagina) : '1';
+    const limiteParam = parseInt(String(req.query.limite || '100'), 10);
+    const maxProducts = Math.min(10000, parseInt(String(req.query.max || '10000'), 10) || 10000);
+    const includeZeroStock = req.query.includeZeroStock === 'true';
+    const fetchAll = req.query.all === 'true' || req.query.todos === 'true' || limiteParam > 100 || (!req.query.pagina && !req.query.limite);
+    const forceRefresh = req.query.refresh === 'true';
+    const routeKey = `${pagina}:${limiteParam}:${maxProducts}:${includeZeroStock}:${fetchAll}`;
+
+    const cached = !forceRefresh ? cachedProductsRoute.get(routeKey) : undefined;
+    if (cached && Date.now() - cached.fetchedAt < 60 * 1000) {
+      return res.json({ ...cached.payload, cached: true });
+    }
+
+    try {
+      let runner = inFlightProductsRoute.get(routeKey);
+      if (!runner) {
+        runner = (async () => {
+          let rawProducts: any[] = [];
+          if (fetchAll) {
+            const seenIds = new Set<number>();
+            const pushUnique = (items: any[]) => {
+              for (const it of items) {
+                if (it?.situacao === 'I' || it?.situacao === 'E') continue;
+                if (it?.id && !seenIds.has(it.id) && rawProducts.length < maxProducts) {
+                  seenIds.add(it.id);
+                  rawProducts.push(it);
+                }
+              }
+            };
+
+            // Paginate all active products (criterio=2: Ativos) until the end (up to 10,000 items)
+            for (let p = 1; p <= 100 && rawProducts.length < maxProducts; p++) {
+              if (isBlingDailyQuotaExceeded()) break;
+              try {
+                const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
+                const items = pageData?.data || [];
+                if (items.length > 0) pushUnique(items);
+                if (items.length < 100) break;
+                await new Promise(resolve => setTimeout(resolve, 140));
+              } catch (pageErr: any) {
+                console.warn(`[Bling Products] Stopped pagination at page ${p}:`, pageErr?.message || pageErr);
+                break;
+              }
+            }
+          } else {
+            const data = await fetchFromBling(`/produtos?pagina=${pagina}&limite=${limiteParam}&criterio=2`);
+            rawProducts = (data?.data || []).slice(0, maxProducts);
+          }
+
+          // Fetch real stock balances in chunks of 50 product IDs
+          const stockMap: Record<number, number> = {};
+          let stockApiSucceeded = false;
+          const allIds = rawProducts.map((p: any) => p.id).filter(Boolean);
+          for (let i = 0; i < allIds.length; i += 50) {
+            if (isBlingDailyQuotaExceeded()) break;
+            const chunk = allIds.slice(i, i + 50);
+            try {
+              const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
+              const stockData = await fetchFromBling(`/estoques/saldos?${qs}`);
+              stockApiSucceeded = true;
+              (stockData.data || []).forEach((item: any) => {
+                const pId = item.produto?.id;
+                const balance = item.saldoVirtualTotal ?? item.saldoFisicoTotal ?? item.saldoFisico ?? 0;
+                if (pId) stockMap[pId] = Number(balance) || 0;
+              });
+              if (i + 50 < allIds.length) {
+                await new Promise(resolve => setTimeout(resolve, 120));
+              }
+            } catch (stockErr) {
+              console.warn('[Bling] Could not fetch stock balances chunk:', stockErr);
+              if (isBlingRateLimitError(stockErr)) break;
             }
           }
-        };
 
-        // Paginate all active products (criterio=2: Ativos) until the end (up to 10,000 items)
-        for (let p = 1; p <= 100 && rawProducts.length < maxProducts; p++) {
-          if (isBlingDailyQuotaExceeded()) break;
-          try {
-            const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
-            const items = pageData?.data || [];
-            if (items.length > 0) pushUnique(items);
-            if (items.length < 100) break;
-            await new Promise(resolve => setTimeout(resolve, 140));
-          } catch (pageErr: any) {
-            console.warn(`[Bling Products] Stopped pagination at page ${p}:`, pageErr?.message || pageErr);
-            break;
-          }
-        }
-      } else {
-        const data = await fetchFromBling(`/produtos?pagina=${pagina}&limite=${limiteParam}&criterio=2`);
-        rawProducts = (data?.data || []).slice(0, maxProducts);
-      }
-
-      // Fetch real stock balances in chunks of 50 product IDs
-      const stockMap: Record<number, number> = {};
-      let stockApiSucceeded = false;
-      const allIds = rawProducts.map((p: any) => p.id).filter(Boolean);
-      for (let i = 0; i < allIds.length; i += 50) {
-        if (isBlingDailyQuotaExceeded()) break;
-        const chunk = allIds.slice(i, i + 50);
-        try {
-          const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
-          const stockData = await fetchFromBling(`/estoques/saldos?${qs}`);
-          stockApiSucceeded = true;
-          (stockData.data || []).forEach((item: any) => {
-            const pId = item.produto?.id;
-            const balance = item.saldoVirtualTotal ?? item.saldoFisicoTotal ?? item.saldoFisico ?? 0;
-            if (pId) stockMap[pId] = Number(balance) || 0;
+          // Map to consistent format extracting all Bling image fields & real stock
+          const formatted = rawProducts.map((p: any) => {
+            const directImages = extractImagesFromBlingItem(p);
+            const directFullRes = directImages.filter(u => !isThumbnailLikeUrl(u));
+            const cachedImgs = getBlingImagesForProduct({ name: p.nome, sku: p.codigo, blingId: String(p.id) }) || [];
+            const cachedFullRes = cachedImgs.filter(u => !isThumbnailLikeUrl(u));
+            const combinedFullRes = Array.from(new Set([...directFullRes, ...cachedFullRes]));
+            const storedImages = combinedFullRes.length > 0
+              ? combinedFullRes
+              : (cachedImgs.length > 0 ? cachedImgs : directImages);
+            const realStock = stockMap[p.id] !== undefined
+              ? stockMap[p.id]
+              : (p.estoque?.saldoVirtualTotal ?? p.estoque?.saldoFisicoTotal ?? p.estoque?.saldoFisico ?? (stockApiSucceeded ? 0 : 0));
+            return {
+              id: `bling-${p.id}`,
+              blingId: p.id,
+              idProdutoPai: p.idProdutoPai || null,
+              name: p.nome,
+              code: p.codigo,
+              sku: p.codigo,
+              price: p.preco || 0,
+              stock: Math.max(0, Number(realStock) || 0),
+              stockCount: Math.max(0, Number(realStock) || 0),
+              status: p.situacao,
+              format: p.formato,
+              type: p.tipo,
+              shortDescription: p.descricaoCurta || '',
+              imageUrl: storedImages[0] || '',
+              images: storedImages,
+            };
           });
-          if (i + 50 < allIds.length) {
-            await new Promise(resolve => setTimeout(resolve, 120));
-          }
-        } catch (stockErr) {
-          console.warn('[Bling] Could not fetch stock balances chunk:', stockErr);
-          if (isBlingRateLimitError(stockErr)) break;
-        }
+
+          const visible = formatted
+            .filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0))
+            .sort((a: any, b: any) => Number(b.blingId || 0) - Number(a.blingId || 0));
+
+          const payload = {
+            success: true,
+            count: visible.length,
+            products: visible,
+            rawCount: rawProducts.length
+          };
+          cachedProductsRoute.set(routeKey, { payload, fetchedAt: Date.now() });
+          return payload;
+        })().finally(() => {
+          inFlightProductsRoute.delete(routeKey);
+        });
+        inFlightProductsRoute.set(routeKey, runner);
       }
 
-      // Map to consistent format extracting all Bling image fields & real stock
-      const formatted = rawProducts.map((p: any) => {
-        const directImages = extractImagesFromBlingItem(p);
-        const directFullRes = directImages.filter(u => !isThumbnailLikeUrl(u));
-        const cachedImgs = getBlingImagesForProduct({ name: p.nome, sku: p.codigo, blingId: String(p.id) }) || [];
-        const cachedFullRes = cachedImgs.filter(u => !isThumbnailLikeUrl(u));
-        const combinedFullRes = Array.from(new Set([...directFullRes, ...cachedFullRes]));
-        const storedImages = combinedFullRes.length > 0
-          ? combinedFullRes
-          : (cachedImgs.length > 0 ? cachedImgs : directImages);
-        const realStock = stockMap[p.id] !== undefined
-          ? stockMap[p.id]
-          : (p.estoque?.saldoVirtualTotal ?? p.estoque?.saldoFisicoTotal ?? p.estoque?.saldoFisico ?? (stockApiSucceeded ? 0 : 0));
-        return {
-          id: `bling-${p.id}`,
-          blingId: p.id,
-          idProdutoPai: p.idProdutoPai || null,
-          name: p.nome,
-          code: p.codigo,
-          sku: p.codigo,
-          price: p.preco || 0,
-          stock: Math.max(0, Number(realStock) || 0),
-          stockCount: Math.max(0, Number(realStock) || 0),
-          status: p.situacao,
-          format: p.formato,
-          type: p.tipo,
-          shortDescription: p.descricaoCurta || '',
-          imageUrl: storedImages[0] || '',
-          images: storedImages,
-        };
-      });
-
-      const visible = formatted
-        .filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0))
-        .sort((a: any, b: any) => Number(b.blingId || 0) - Number(a.blingId || 0));
-
-      res.json({
-        success: true,
-        count: visible.length,
-        products: visible,
-        rawCount: rawProducts.length
-      });
+      const result = await runner;
+      res.json(result);
     } catch (err: any) {
       console.error('[Bling Products Error]:', err);
+      const stale = cachedProductsRoute.get(routeKey);
+      if (stale && isBlingRateLimitError(err)) {
+        return res.json({ ...stale.payload, cached: true, stale: true });
+      }
       const isAuthErr = String(err?.message || '').includes('401') || String(err?.message || '').includes('OAuth');
       res.status(isAuthErr ? 401 : 500).json({
         success: false,
@@ -1540,7 +1654,26 @@ export async function createBlingOrder(params: BlingOrderParams): Promise<{
       }
     }
   } catch (apiErr: any) {
-    console.warn('[Bling] Notice syncing order to remote Bling API (saved locally):', apiErr.message);
+    if (isBlingConflictError(apiErr)) {
+      try {
+        const numericOrder = parseInt(orderNumber.replace(/\D/g, ''), 10);
+        const existingList = await fetchFromBling('/pedidos/vendas?pagina=1&limite=25');
+        const matched = (existingList?.data || []).find(
+          (o: any) =>
+            String(o.numeroLoja || '') === orderNumber ||
+            (Number.isFinite(numericOrder) && Number(o.numero) === numericOrder)
+        );
+        if (matched?.id) {
+          remoteId = matched.id;
+        }
+        blingSynced = true;
+        console.log(`[Bling] 409 Conflict tratado de forma idempotente para pedido #${orderNumber} (ID: ${remoteId}).`);
+      } catch {
+        blingSynced = true;
+      }
+    } else {
+      console.warn('[Bling] Notice syncing order to remote Bling API (saved locally):', apiErr.message);
+    }
   }
 
   const storedOrder = {

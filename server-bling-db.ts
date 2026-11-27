@@ -64,6 +64,12 @@ function getDb(): SqliteDbLike | null {
         obtained_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS bling_response_cache (
+        cache_key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+      );
     `);
     dbInstance = db;
     return dbInstance;
@@ -232,5 +238,107 @@ export function clearBlingTokenFromDb(): void {
     }
   } catch (err) {
     console.warn('[Bling DB] Error clearing bling_tokens table:', err);
+  }
+}
+
+interface CachedResponseEntry {
+  data: unknown;
+  fetchedAt: number;
+  expiresAt: number;
+}
+
+const memoryResponseCache = new Map<string, CachedResponseEntry>();
+const MAX_MEMORY_CACHE_ENTRIES = 350;
+const MAX_STALE_AGE_MS = 24 * 60 * 60 * 1000;
+
+export function getBlingCachedResponse<T = unknown>(
+  cacheKey: string,
+  options?: { allowStale?: boolean }
+): { data: T; stale: boolean; fetchedAt: number } | null {
+  const now = Date.now();
+  const mem = memoryResponseCache.get(cacheKey);
+  if (mem) {
+    const isFresh = mem.expiresAt > now;
+    if (isFresh || (options?.allowStale && now - mem.fetchedAt <= MAX_STALE_AGE_MS)) {
+      return { data: mem.data as T, stale: !isFresh, fetchedAt: mem.fetchedAt };
+    }
+  }
+
+  try {
+    const db = getDb();
+    if (!db) return null;
+    const row = db
+      .prepare('SELECT payload, fetched_at, expires_at FROM bling_response_cache WHERE cache_key = ? LIMIT 1')
+      .get(cacheKey) as { payload?: string; fetched_at?: number; expires_at?: number } | undefined;
+
+    if (!row?.payload) return null;
+    const fetchedAt = Number(row.fetched_at || 0);
+    const expiresAt = Number(row.expires_at || 0);
+    const isFresh = expiresAt > now;
+
+    if (!isFresh && !(options?.allowStale && now - fetchedAt <= MAX_STALE_AGE_MS)) {
+      return null;
+    }
+
+    const parsed = JSON.parse(row.payload) as T;
+    if (memoryResponseCache.size >= MAX_MEMORY_CACHE_ENTRIES) {
+      const oldestKey = memoryResponseCache.keys().next().value;
+      if (oldestKey) memoryResponseCache.delete(oldestKey);
+    }
+    memoryResponseCache.set(cacheKey, { data: parsed, fetchedAt, expiresAt });
+    return { data: parsed, stale: !isFresh, fetchedAt };
+  } catch {
+    return null;
+  }
+}
+
+export function setBlingCachedResponse(cacheKey: string, data: unknown, ttlMs: number): void {
+  if (!cacheKey || ttlMs <= 0) return;
+  const now = Date.now();
+  const expiresAt = now + ttlMs;
+
+  if (memoryResponseCache.size >= MAX_MEMORY_CACHE_ENTRIES) {
+    const oldestKey = memoryResponseCache.keys().next().value;
+    if (oldestKey) memoryResponseCache.delete(oldestKey);
+  }
+  memoryResponseCache.set(cacheKey, { data, fetchedAt: now, expiresAt });
+
+  try {
+    const db = getDb();
+    if (!db) return;
+    const serialized = JSON.stringify(data);
+    if (serialized.length > 512 * 1024) return;
+    db.prepare(
+      `INSERT INTO bling_response_cache (cache_key, payload, fetched_at, expires_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(cache_key) DO UPDATE SET
+         payload = excluded.payload,
+         fetched_at = excluded.fetched_at,
+         expires_at = excluded.expires_at`
+    ).run(cacheKey, serialized, now, expiresAt);
+  } catch {
+    // ignore cache persistence failure
+  }
+}
+
+export function invalidateBlingCachedResponse(prefix?: string): void {
+  if (!prefix) {
+    memoryResponseCache.clear();
+  } else {
+    for (const key of Array.from(memoryResponseCache.keys())) {
+      if (key.includes(prefix)) memoryResponseCache.delete(key);
+    }
+  }
+
+  try {
+    const db = getDb();
+    if (!db) return;
+    if (!prefix) {
+      db.prepare('DELETE FROM bling_response_cache').run();
+    } else {
+      db.prepare('DELETE FROM bling_response_cache WHERE cache_key LIKE ?').run(`%${prefix}%`);
+    }
+  } catch {
+    // ignore
   }
 }

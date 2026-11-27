@@ -70,6 +70,7 @@ export function Header({
               <img
                 src="/assets/aistudio/nova-logo_0b1a92f5.png"
                 alt="Street Store Oficial"
+                decoding="async"
                 className="h-full w-full object-contain filter drop-shadow-[0_2px_12px_rgba(229,9,20,0.4)]"
               />
             </div>

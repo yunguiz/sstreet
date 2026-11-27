@@ -1,6 +1,7 @@
 import { useState, useRef } from 'react';
 import { Crown, ArrowDown, Volume2, VolumeX } from 'lucide-react';
 import { motion } from 'motion/react';
+import graffitiWallImg from '../assets/images/graffiti_wall_dark_1793276349106.jpg';
 
 interface HeroProps {
   onExploreCatalog: () => void;
@@ -36,8 +37,10 @@ export function Hero({ onExploreCatalog }: HeroProps) {
       {/* Background with visibly rich underground graffiti wall and dark radial focus */}
       <div className="absolute inset-0 z-0 overflow-hidden select-none pointer-events-none">
         <img
-          src="/src/assets/images/graffiti_wall_dark_1793276349106.jpg"
+          src={graffitiWallImg}
           alt="Graffiti Streetwear Background"
+          loading="lazy"
+          decoding="async"
           className="w-full h-full object-cover object-center filter blur-[1px] brightness-[0.45] contrast-125 scale-105"
         />
         {/* Street urban spray grunge texture overlay */}
@@ -140,6 +143,7 @@ export function Hero({ onExploreCatalog }: HeroProps) {
                 <img
                   src="/assets/aistudio/nova-logo_0b1a92f5.png"
                   alt="Street Store Logo"
+                  decoding="async"
                   className="w-full h-auto object-contain filter drop-shadow-[0_4px_25px_rgba(0,0,0,0.95)] drop-shadow-[0_0_35px_rgba(229,9,20,0.35)]"
                 />
               </div>

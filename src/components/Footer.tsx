@@ -79,6 +79,8 @@ export function Footer({ onOpenTracking, onSelectCategory, onOpenPolicies }: Foo
               <img
                 src="/assets/aistudio/nova-logo_0b1a92f5.png"
                 alt="Street Store Itabira"
+                loading="lazy"
+                decoding="async"
                 className="h-full w-full object-contain filter drop-shadow-[0_2px_8px_rgba(229,9,20,0.3)]"
               />
             </div>

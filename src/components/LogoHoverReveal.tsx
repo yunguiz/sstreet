@@ -1,6 +1,9 @@
 import { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Sparkles, MapPin, Instagram } from 'lucide-react';
+import heroStreetwearImg from '../assets/images/hero_streetwear_urban_1793275500555.jpg';
+import lookviewModelImg from '../assets/images/lookview_fullkit_model_1793275500631.jpg';
+import sneakerChunkyImg from '../assets/images/product_sneaker_chunky_1793275503077.jpg';
 
 export function LogoHoverReveal() {
   const [isHovered, setIsHovered] = useState(false);
@@ -21,6 +24,7 @@ export function LogoHoverReveal() {
           <img 
             src="/assets/aistudio/nova-logo_0b1a92f5.png" 
             alt="Street Store Logo Graffiti" 
+            decoding="async"
             className="h-full w-full object-contain filter drop-shadow-[0_2px_8px_rgba(229,9,20,0.35)] transition-all group-hover:drop-shadow-[0_4px_16px_rgba(229,9,20,0.6)]"
           />
         </div>
@@ -52,8 +56,10 @@ export function LogoHoverReveal() {
             <div className="grid grid-cols-3 gap-2 mb-3">
               <div className="relative aspect-square rounded-lg overflow-hidden border border-zinc-800 bg-zinc-900">
                 <img 
-                  src="/src/assets/images/hero_streetwear_urban_1793275500555.jpg" 
+                  src={heroStreetwearImg} 
                   alt="Streetwear Culture" 
+                  loading="lazy"
+                  decoding="async"
                   className="w-full h-full object-cover"
                 />
                 <div className="absolute inset-0 bg-black/20" />
@@ -63,8 +69,10 @@ export function LogoHoverReveal() {
               </div>
               <div className="relative aspect-square rounded-lg overflow-hidden border border-zinc-800 bg-zinc-900">
                 <img 
-                  src="/src/assets/images/lookview_fullkit_model_1793275500631.jpg" 
+                  src={lookviewModelImg} 
                   alt="Model Fit" 
+                  loading="lazy"
+                  decoding="async"
                   className="w-full h-full object-cover"
                 />
                 <div className="absolute inset-0 bg-black/20" />
@@ -74,8 +82,10 @@ export function LogoHoverReveal() {
               </div>
               <div className="relative aspect-square rounded-lg overflow-hidden border border-zinc-800 bg-zinc-900">
                 <img 
-                  src="/src/assets/images/product_sneaker_chunky_1793275503077.jpg" 
+                  src={sneakerChunkyImg} 
                   alt="Sneakers OG" 
+                  loading="lazy"
+                  decoding="async"
                   className="w-full h-full object-cover"
                 />
                 <div className="absolute inset-0 bg-black/20" />
