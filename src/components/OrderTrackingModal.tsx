@@ -16,16 +16,64 @@ import {
   MessageSquare,
   ShieldCheck,
   ChevronRight,
-  Loader2
+  Loader2,
+  QrCode
 } from 'lucide-react';
 import { TrackedOrder, trackOrder, getMyOrders, requestOrderReturn } from '../services/catalog';
 import { CustomerProfile } from '../services/auth';
+import { confirmPixPayment, getPaymentStatus } from '../services/mercadopago';
 
 interface OrderTrackingModalProps {
   isOpen: boolean;
   onClose: () => void;
   initialQuery?: string;
   currentUser?: CustomerProfile | null;
+}
+
+const PIX_WINDOW_MS = 15 * 60 * 1000;
+
+function getOrderPixExpiresAtMs(order: TrackedOrder): number {
+  if (typeof order.expiresAtMs === 'number' && Number.isFinite(order.expiresAtMs) && order.expiresAtMs > 0) {
+    return order.expiresAtMs;
+  }
+  if (order.expiresAt) {
+    const parsed = Date.parse(order.expiresAt);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  const createdMs = Date.parse(order.createdAt);
+  return Number.isFinite(createdMs) ? createdMs + PIX_WINDOW_MS : 0;
+}
+
+function isOrderUnpaidPix(order: TrackedOrder): boolean {
+  return (
+    order.paymentStatus === 'pending' &&
+    (Boolean(order.pendingPaymentId) || String(order.paymentMethod || '').toLowerCase().includes('pix'))
+  );
+}
+
+function isOrderActiveForDisplay(order: TrackedOrder, nowMs: number): boolean {
+  if (order.paymentStatus !== 'pending' || !isOrderUnpaidPix(order)) {
+    return true;
+  }
+  return getOrderPixExpiresAtMs(order) > nowMs;
+}
+
+function formatRemainingMmSs(remainingMs: number): string {
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatCustomerCarrier(carrier?: string): string {
+  const raw = String(carrier || '').trim();
+  if (!raw) return 'Correios / Transportadora';
+  const cleaned = raw
+    .replace(/melhor envio\s*\(([^)]+)\)/gi, '$1')
+    .replace(/melhor envio/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+  return cleaned || 'Correios / Transportadora';
 }
 
 export function OrderTrackingModal({
@@ -41,6 +89,12 @@ export function OrderTrackingModal({
   const [showingAccountOrders, setShowingAccountOrders] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedTracking, setCopiedTracking] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+  const [copiedPixCodeFor, setCopiedPixCodeFor] = useState<string | null>(null);
+  const [copiedPixKeyFor, setCopiedPixKeyFor] = useState<string | null>(null);
+  const [verifyingPixId, setVerifyingPixId] = useState<string | null>(null);
+  const [pixFeedbackMap, setPixFeedbackMap] = useState<Record<string, { type: 'info' | 'success' | 'error'; text: string }>>({});
+  const expiredSyncedIdsRef = React.useRef<Set<string>>(new Set());
 
   // Return / Exchange modal state
   const [selectedOrderForReturn, setSelectedOrderForReturn] = useState<TrackedOrder | null>(null);
@@ -64,7 +118,9 @@ export function OrderTrackingModal({
     try {
       const res = await getMyOrders();
       if (res.success && Array.isArray(res.orders)) {
-        setOrders(res.orders);
+        const now = Date.now();
+        setNowMs(now);
+        setOrders(res.orders.filter((o) => isOrderActiveForDisplay(o, now)));
       } else {
         setOrders([]);
         if (res.error) setErrorMessage(res.error);
@@ -99,6 +155,40 @@ export function OrderTrackingModal({
     return () => window.removeEventListener('streetstore:orders-updated', handleOrdersUpdated);
   }, [isOpen, currentUser?.uid]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    setNowMs(Date.now());
+    if (!orders.some(isOrderUnpaidPix)) return;
+    const timer = setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [isOpen, orders]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const newlyExpired = orders.filter(
+      (o) => isOrderUnpaidPix(o) && getOrderPixExpiresAtMs(o) <= nowMs
+    );
+    if (newlyExpired.length === 0) return;
+
+    let removedAny = false;
+    for (const ord of newlyExpired) {
+      const payKey = String(ord.pendingPaymentId || ord.paymentId || ord.orderId);
+      if (!expiredSyncedIdsRef.current.has(payKey)) {
+        expiredSyncedIdsRef.current.add(payKey);
+        removedAny = true;
+        const targetId = ord.pendingPaymentId || ord.paymentId;
+        if (targetId) {
+          void getPaymentStatus(targetId).catch(() => {});
+        }
+      }
+    }
+    if (removedAny) {
+      setOrders((prev) => prev.filter((o) => isOrderActiveForDisplay(o, nowMs)));
+    }
+  }, [isOpen, nowMs, orders]);
+
   const handleSearch = async (searchQuery?: string) => {
     const q = (searchQuery ?? query).trim();
     if (!q) {
@@ -119,8 +209,14 @@ export function OrderTrackingModal({
 
     try {
       const res = await trackOrder(q);
-      if (res.success && res.orders && res.orders.length > 0) {
-        setOrders(res.orders);
+      const now = Date.now();
+      setNowMs(now);
+      const activeOrders =
+        res.success && Array.isArray(res.orders)
+          ? res.orders.filter((o) => isOrderActiveForDisplay(o, now))
+          : [];
+      if (activeOrders.length > 0) {
+        setOrders(activeOrders);
       } else {
         setOrders([]);
         setErrorMessage(
@@ -134,6 +230,78 @@ export function OrderTrackingModal({
       setIsLoading(false);
     }
   };
+
+  const handleCopyOrderPixCode = (orderKey: string, code: string) => {
+    navigator.clipboard.writeText(code);
+    setCopiedPixCodeFor(orderKey);
+    setTimeout(() => setCopiedPixCodeFor(null), 2500);
+  };
+
+  const handleCopyOrderPixKey = (orderKey: string, keyText: string) => {
+    navigator.clipboard.writeText(keyText);
+    setCopiedPixKeyFor(orderKey);
+    setTimeout(() => setCopiedPixKeyFor(null), 2500);
+  };
+
+  const handleCheckOrderPixPayment = async (order: TrackedOrder) => {
+    const payId = order.pendingPaymentId || order.paymentId;
+    if (!payId) return;
+    const key = String(payId);
+    setVerifyingPixId(key);
+    setPixFeedbackMap((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+
+    try {
+      const res = await confirmPixPayment(payId);
+      if (res.approved === true && res.status === 'approved') {
+        setPixFeedbackMap((prev) => ({
+          ...prev,
+          [key]: {
+            type: 'success',
+            text: res.orderNumber
+              ? `Pagamento Pix aprovado! Pedido ${res.orderNumber} confirmado.`
+              : 'Pagamento Pix identificado e aprovado com sucesso!'
+          }
+        }));
+        window.dispatchEvent(new CustomEvent('streetstore:raffle-updated'));
+        window.dispatchEvent(new CustomEvent('streetstore:orders-updated'));
+        if (showingAccountOrders && currentUser) {
+          await loadMyOrders();
+        } else if (query.trim()) {
+          await handleSearch(query);
+        }
+      } else if (res.expired || res.status === 'expired') {
+        setOrders((prev) =>
+          prev.filter((o) => String(o.pendingPaymentId || o.paymentId || o.orderId) !== key)
+        );
+      } else {
+        setPixFeedbackMap((prev) => ({
+          ...prev,
+          [key]: {
+            type: 'info',
+            text:
+              res.message ||
+              'Pagamento ainda não compensado pelo banco. Finalize a transferência Pix no app do seu banco e clique novamente.'
+          }
+        }));
+      }
+    } catch {
+      setPixFeedbackMap((prev) => ({
+        ...prev,
+        [key]: {
+          type: 'error',
+          text: 'Erro ao consultar a compensação do Pix. Tente novamente em instantes.'
+        }
+      }));
+    } finally {
+      setVerifyingPixId(null);
+    }
+  };
+
+  const visibleOrders = orders.filter((order) => isOrderActiveForDisplay(order, nowMs));
 
   const handleCopyTracking = (code: string) => {
     navigator.clipboard.writeText(code);
@@ -217,11 +385,8 @@ export function OrderTrackingModal({
               <Truck className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-sm sm:text-base font-black text-white uppercase tracking-wider font-oswald flex items-center gap-2">
+              <h2 className="text-sm sm:text-base font-black text-white uppercase tracking-wider font-oswald">
                 {currentUser ? 'Meus Pedidos & Rastreio' : 'Acompanhar Pedido'}
-                <span className="text-[10px] font-sans font-bold px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700/50">
-                  Melhor Envio Oficial
-                </span>
               </h2>
               <p className="text-[11px] text-zinc-400">
                 {currentUser
@@ -301,7 +466,7 @@ export function OrderTrackingModal({
           )}
 
           {/* Friendly Empty State for Logged-in Customer */}
-          {hasSearched && showingAccountOrders && !isLoading && orders.length === 0 && !errorMessage && (
+          {hasSearched && showingAccountOrders && !isLoading && visibleOrders.length === 0 && !errorMessage && (
             <div className="p-6 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl text-center space-y-2.5">
               <Package className="w-10 h-10 text-zinc-600 mx-auto" />
               <p className="text-sm font-bold text-white">Nenhum pedido encontrado nesta conta ainda</p>
@@ -312,7 +477,7 @@ export function OrderTrackingModal({
           )}
 
           {/* If No search conducted yet */}
-          {!hasSearched && orders.length === 0 && (
+          {!hasSearched && visibleOrders.length === 0 && (
             <div className="p-6 bg-zinc-900/40 border border-zinc-800/80 rounded-2xl text-center space-y-3">
               <Package className="w-10 h-10 text-zinc-600 mx-auto" />
               <div>
@@ -328,7 +493,7 @@ export function OrderTrackingModal({
                   <p className="text-xs text-zinc-300 mt-0.5">Notificação enviada a cada movimentação</p>
                 </div>
                 <div className="p-2.5 bg-zinc-950 border border-zinc-800 rounded-lg">
-                  <span className="text-[10px] text-zinc-500 font-bold uppercase block">2. Melhor Envio</span>
+                  <span className="text-[10px] text-zinc-500 font-bold uppercase block">2. Envio Nacional</span>
                   <p className="text-xs text-zinc-300 mt-0.5">Correios, Jadlog ou Loggi</p>
                 </div>
                 <div className="p-2.5 bg-zinc-950 border border-zinc-800 rounded-lg">
@@ -541,14 +706,19 @@ export function OrderTrackingModal({
           </AnimatePresence>
 
           {/* LIST OF ORDERS */}
-          {orders.map((order) => {
+          {visibleOrders.map((order) => {
             const isDelivered = order.shippingStatus === 'delivered';
             const isShipped = order.shippingStatus === 'shipped' || Boolean(order.trackingNumber);
             const isPaid = order.paymentStatus === 'paid';
+            const isPendingPix = !isPaid && isOrderUnpaidPix(order);
+            const remainingMs = isPendingPix ? Math.max(0, getOrderPixExpiresAtMs(order) - nowMs) : 0;
+            const isLowTime = remainingMs <= 3 * 60 * 1000;
+            const payKey = String(order.pendingPaymentId || order.paymentId || order.orderId);
+            const pixFeedback = pixFeedbackMap[payKey];
 
             return (
               <div
-                key={order.orderId}
+                key={`${order.orderId}-${order.orderNumber}-${payKey}`}
                 className="p-4 sm:p-5 bg-zinc-900/80 border border-zinc-800 rounded-2xl space-y-4 shadow-lg"
               >
                 {/* Order Top Bar */}
@@ -567,9 +737,16 @@ export function OrderTrackingModal({
                       >
                         {isPaid ? 'Pagamento Aprovado' : 'Aguardando Pagamento'}
                       </span>
-                      {order.blingOrderId && (
-                        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-300 border border-zinc-700">
-                          Bling #{order.blingOrderId}
+                      {isPendingPix && (
+                        <span
+                          className={`text-[10px] font-black font-mono px-2 py-0.5 rounded-full border flex items-center gap-1 tabular-nums ${
+                            isLowTime
+                              ? 'bg-red-500/15 text-red-400 border-red-500/40 animate-pulse'
+                              : 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                          }`}
+                        >
+                          <Clock className="w-3 h-3" />
+                          <span>Expira em {formatRemainingMmSs(remainingMs)}</span>
                         </span>
                       )}
                     </div>
@@ -627,7 +804,7 @@ export function OrderTrackingModal({
                       <span className="text-[10px] font-bold text-zinc-300 mt-1 whitespace-nowrap">Pago</span>
                     </div>
 
-                    {/* Step 3: Enviado (Melhor Envio) */}
+                    {/* Step 3: Enviado */}
                     <div className="relative z-10 flex flex-col items-center">
                       <div
                         className={`w-7 h-7 rounded-full flex items-center justify-center transition-all ${
@@ -659,72 +836,210 @@ export function OrderTrackingModal({
                   </div>
                 </div>
 
-                {/* Melhor Envio Tracking Card */}
-                <div className="p-3.5 bg-zinc-950 border border-zinc-800 rounded-xl space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <Truck className="w-4 h-4 text-[#009EE3]" />
-                      Transportadora: <strong className="text-emerald-400">{order.shippingCarrier || 'Melhor Envio'}</strong>
-                    </span>
+                {/* Inline Resume Pix Panel while within 15-minute window */}
+                {isPendingPix && (() => {
+                  const pixCopyCode = order.pixCopyPaste || order.qrCode || '';
+                  const pixKeyValue = order.pixKey || 'streetstore364@gmail.com';
+                  const copyTargetCode = pixCopyCode || pixKeyValue;
 
-                    {order.trackingNumber ? (
-                      <span className="text-[10px] font-bold px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded">
-                        Etiqueta Gerada
-                      </span>
-                    ) : (
-                      <span className="text-[10px] font-bold px-2 py-0.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded">
-                        Etiqueta em Geração
-                      </span>
-                    )}
-                  </div>
-
-                  {order.trackingNumber ? (
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1 border-t border-zinc-800/80">
-                      <div>
-                        <span className="text-[10px] text-zinc-500 uppercase font-bold block">Código de Rastreio:</span>
-                        <span className="font-mono text-sm font-black text-white tracking-wider">
-                          {order.trackingNumber}
+                  return (
+                    <div className="p-4 bg-zinc-950 border border-amber-500/30 rounded-xl space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-800/90 pb-2.5">
+                        <div className="flex items-center gap-2">
+                          <QrCode className="w-4 h-4 text-[#009EE3]" />
+                          <span className="text-xs font-black text-white uppercase tracking-wider">
+                            Retomar Pagamento Pix
+                          </span>
+                        </div>
+                        <span
+                          className={`text-[11px] font-black font-mono tabular-nums ${
+                            isLowTime ? 'text-red-400' : 'text-amber-300'
+                          }`}
+                        >
+                          Tempo restante: {formatRemainingMmSs(remainingMs)}
                         </span>
                       </div>
 
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => handleCopyTracking(order.trackingNumber!)}
-                          className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer"
-                        >
-                          {copiedTracking === order.trackingNumber ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-400" />
-                              <span>Copiado</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>Copiar</span>
-                            </>
-                          )}
-                        </button>
-
-                        {order.trackingUrl && (
-                          <a
-                            href={order.trackingUrl}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="px-3 py-1.5 bg-[#009EE3] hover:bg-[#0089c7] text-white rounded-lg text-xs font-bold flex items-center gap-1 transition-colors shadow-sm cursor-pointer"
-                          >
-                            <span>Abrir Rastreio</span>
-                            <ExternalLink className="w-3.5 h-3.5" />
-                          </a>
+                      <div className="flex flex-col sm:flex-row gap-4 items-center sm:items-start">
+                        {order.qrCodeBase64 && (
+                          <div className="w-36 h-36 sm:w-40 sm:h-40 bg-white rounded-xl p-2 shrink-0 flex items-center justify-center border border-zinc-700 shadow-lg">
+                            <img
+                              src={`data:image/png;base64,${order.qrCodeBase64}`}
+                              alt={`QR Code Pix do Pedido ${order.orderNumber}`}
+                              loading="lazy"
+                              decoding="async"
+                              className="w-full h-full object-contain"
+                            />
+                          </div>
                         )}
+
+                        <div className="flex-1 w-full space-y-2.5">
+                          <p className="text-[11px] text-zinc-300 leading-relaxed">
+                            Escaneie o QR Code ou copie o código abaixo no app do seu banco dentro do prazo de <strong>15 minutos</strong> para confirmar o pedido automaticamente.
+                          </p>
+
+                          <div className="p-2 bg-zinc-900 border border-zinc-800 rounded-lg flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <span className="text-[10px] text-zinc-400 uppercase font-bold block">Chave Pix (E-mail):</span>
+                              <span className="font-mono text-[11px] text-emerald-400 font-bold select-all truncate block">
+                                {pixKeyValue}
+                              </span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => handleCopyOrderPixKey(payKey, pixKeyValue)}
+                              className="px-2.5 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-md text-[10px] font-bold uppercase tracking-wider flex items-center gap-1 shrink-0 transition-colors cursor-pointer"
+                            >
+                              {copiedPixKeyFor === payKey ? (
+                                <>
+                                  <Check className="w-3 h-3 text-emerald-400" />
+                                  <span className="text-emerald-400">Copiado!</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Copy className="w-3 h-3" />
+                                  <span>Copiar</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+
+                          {pixCopyCode && (
+                            <div className="p-2 bg-zinc-900 border border-zinc-800 rounded-lg">
+                              <span className="text-[10px] text-zinc-500 uppercase font-bold block mb-0.5">
+                                Código Pix Copia e Cola:
+                              </span>
+                              <p className="font-mono text-[10px] text-zinc-300 break-all select-all line-clamp-2">
+                                {pixCopyCode}
+                              </p>
+                            </div>
+                          )}
+
+                          <button
+                            type="button"
+                            onClick={() => handleCopyOrderPixCode(payKey, copyTargetCode)}
+                            className="w-full py-2.5 bg-[#009EE3] hover:bg-[#0089c7] text-white font-black text-xs uppercase tracking-wider rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                          >
+                            {copiedPixCodeFor === payKey ? (
+                              <>
+                                <Check className="w-3.5 h-3.5" />
+                                <span>Copiado!</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>COPIAR CÓDIGO PIX</span>
+                              </>
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => handleCheckOrderPixPayment(order)}
+                            disabled={verifyingPixId === payKey}
+                            className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-black text-xs uppercase tracking-wider rounded-lg flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+                          >
+                            {verifyingPixId === payKey ? (
+                              <>
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                                <span>Verificando pagamento no banco...</span>
+                              </>
+                            ) : (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                <span>Já realizei o pagamento Pix</span>
+                              </>
+                            )}
+                          </button>
+
+                          {pixFeedback && (
+                            <div
+                              className={`p-2.5 rounded-lg text-[11px] flex items-start gap-2 ${
+                                pixFeedback.type === 'success'
+                                  ? 'bg-emerald-950/60 border border-emerald-500/40 text-emerald-200'
+                                  : pixFeedback.type === 'error'
+                                  ? 'bg-red-950/60 border border-red-500/40 text-red-200'
+                                  : 'bg-amber-950/60 border border-amber-500/40 text-amber-200'
+                              }`}
+                            >
+                              <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                              <span>{pixFeedback.text}</span>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  ) : (
-                    <p className="text-[11px] text-zinc-400 leading-relaxed">
-                      Sua etiqueta de envio está sendo gerada via <strong>Melhor Envio</strong> pela nossa expedição. Assim que o pacote for postado nos Correios ou transportadora, o código de rastreio aparecerá aqui e será enviado automaticamente para o seu e-mail.
-                    </p>
-                  )}
-                </div>
+                  );
+                })()}
+
+                {/* Shipping & Tracking Card (Shown after payment confirmation) */}
+                {isPaid && (
+                  <div className="p-3.5 bg-zinc-950 border border-zinc-800 rounded-xl space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                        <Truck className="w-4 h-4 text-[#009EE3]" />
+                        Entrega: <strong className="text-emerald-400">{formatCustomerCarrier(order.shippingCarrier)}</strong>
+                      </span>
+
+                      {order.trackingNumber ? (
+                        <span className="text-[10px] font-bold px-2 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded">
+                          Postado
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-bold px-2 py-0.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded">
+                          Em Preparação
+                        </span>
+                      )}
+                    </div>
+
+                    {order.trackingNumber ? (
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1 border-t border-zinc-800/80">
+                        <div>
+                          <span className="text-[10px] text-zinc-500 uppercase font-bold block">Código de Rastreio:</span>
+                          <span className="font-mono text-sm font-black text-white tracking-wider">
+                            {order.trackingNumber}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleCopyTracking(order.trackingNumber!)}
+                            className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-200 rounded-lg text-xs font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                          >
+                            {copiedTracking === order.trackingNumber ? (
+                              <>
+                                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                <span>Copiado</span>
+                              </>
+                            ) : (
+                              <>
+                                <Copy className="w-3.5 h-3.5" />
+                                <span>Copiar</span>
+                              </>
+                            )}
+                          </button>
+
+                          {order.trackingUrl && (
+                            <a
+                              href={order.trackingUrl}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="px-3 py-1.5 bg-[#009EE3] hover:bg-[#0089c7] text-white rounded-lg text-xs font-bold flex items-center gap-1 transition-colors shadow-sm cursor-pointer"
+                            >
+                              <span>Abrir Rastreio</span>
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-[11px] text-zinc-400 leading-relaxed">
+                        Seu pedido está sendo separado pela equipe da Street Store. Assim que for postado ou liberado para retirada na loja, o status e o código de rastreio aparecerão aqui e serão enviados para o seu e-mail.
+                      </p>
+                    )}
+                  </div>
+                )}
 
                 {/* Products List */}
                 <div className="space-y-2">
@@ -773,8 +1088,8 @@ export function OrderTrackingModal({
                     <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
                     <span>
                       {isPaid
-                        ? 'Garantia de 7 dias com Logística Reversa Melhor Envio'
-                        : 'Pedido aguardando confirmação do pagamento para envio ao Bling e expedição'}
+                        ? 'Garantia Street Store de 7 dias para troca ou devolução'
+                        : 'Aguardando confirmação do pagamento para liberar o pedido'}
                     </span>
                   </div>
 

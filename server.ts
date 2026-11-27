@@ -1522,6 +1522,7 @@ interface LocalPayment {
   expiresAtMs?: number;
   expiredAt?: string;
   qrCode?: string;
+  pixCopyPaste?: string;
   qrCodeBase64?: string;
   pixKey?: string;
   dateApproved?: string;
@@ -2020,6 +2021,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         expiresAt: expiresAtIso,
         expiresAtMs,
         qrCode: officialQrCode,
+        pixCopyPaste: officialQrCode,
         qrCodeBase64: officialQrCodeBase64,
         pixKey: storePixKey,
         payer: {
@@ -2043,6 +2045,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
         statusDetail: data.status_detail,
         amount: data.transaction_amount,
         qrCode: officialQrCode,
+        pixCopyPaste: officialQrCode,
         qrCodeBase64: officialQrCodeBase64,
         ticketUrl: txData?.ticket_url || '',
         expiresAt: expiresAtIso,
@@ -2089,6 +2092,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       expiresAt: defaultExpiresAtIso,
       expiresAtMs: defaultExpiresAtMs,
       qrCode: emvString,
+      pixCopyPaste: emvString,
       qrCodeBase64,
       pixKey,
       payer: {
@@ -2112,6 +2116,7 @@ app.post('/api/mercadopago/create-pix', async (req: Request, res: Response) => {
       statusDetail: 'waiting_payment',
       amount: numericAmount,
       qrCode: emvString,
+      pixCopyPaste: emvString,
       qrCodeBase64,
       expiresAt: defaultExpiresAtIso,
       expiresAtMs: defaultExpiresAtMs,

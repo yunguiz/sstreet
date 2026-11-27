@@ -59,6 +59,7 @@ export interface TrackedOrder {
   expiresAt?: string;
   expiresAtMs?: number;
   qrCode?: string;
+  pixCopyPaste?: string;
   qrCodeBase64?: string;
   pixKey?: string;
 }

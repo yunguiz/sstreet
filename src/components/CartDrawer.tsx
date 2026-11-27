@@ -802,8 +802,9 @@ export function CartDrawer({
 
   // Copy Pix Copia e Cola
   const handleCopyPix = () => {
-    if (pixData?.qrCode) {
-      navigator.clipboard.writeText(pixData.qrCode);
+    const code = pixData?.pixCopyPaste || pixData?.qrCode;
+    if (code) {
+      navigator.clipboard.writeText(code);
       setPixCopied(true);
       setTimeout(() => setPixCopied(false), 2500);
     }
@@ -1042,7 +1043,7 @@ export function CartDrawer({
                     {pixData.qrCodeBase64 ? (
                       <img
                         src={`data:image/png;base64,${pixData.qrCodeBase64}`}
-                        alt="QR Code Pix Oficial"
+                        alt="QR Code Pix"
                         className="w-full h-full object-contain"
                       />
                     ) : (
@@ -1060,22 +1061,12 @@ export function CartDrawer({
 
                   {/* Copy Pix Copia e Cola */}
                   <div className="space-y-2 pt-1">
-                    {pixData.pixKey && (
-                      <div className="p-2 bg-zinc-900/80 border border-zinc-800 rounded-lg text-left flex items-center justify-between gap-2">
-                        <span className="text-[10px] text-zinc-400 uppercase tracking-wider font-bold">
-                          Chave Pix Oficial:
-                        </span>
-                        <span className="font-mono text-[11px] text-emerald-400 font-bold select-all">
-                          {pixData.pixKey}
-                        </span>
-                      </div>
-                    )}
                     <div className="p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg text-left">
                       <span className="text-[10px] text-zinc-500 uppercase tracking-wider block font-bold mb-1">
                         Código Pix Copia e Cola:
                       </span>
                       <p className="font-mono text-[10px] text-zinc-300 break-all select-all line-clamp-2">
-                        {pixData.qrCode}
+                        {pixData.pixCopyPaste || pixData.qrCode}
                       </p>
                     </div>
 

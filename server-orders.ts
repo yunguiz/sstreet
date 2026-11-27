@@ -82,6 +82,7 @@ export interface StoredOrder {
   expiresAt?: string;
   expiresAtMs?: number;
   qrCode?: string;
+  pixCopyPaste?: string;
   qrCodeBase64?: string;
   pixKey?: string;
   returnRequests?: Array<{
@@ -838,7 +839,7 @@ export async function createStoreOrder(params: {
     status: 'open',
     paymentStatus: 'paid',
     shippingStatus: 'unshipped',
-    shippingCarrier: params.shippingCarrier || 'Melhor Envio (Correios / Jadlog)',
+    shippingCarrier: params.shippingCarrier || 'Correios / Transportadora',
     trackingNumber: null,
     trackingUrl: null,
     paymentMethod: params.paymentMethod,
@@ -1171,12 +1172,12 @@ function mapBlingOrderToStoredOrder(bo: any): StoredOrder {
     status: 'open',
     paymentStatus: 'paid',
     shippingStatus: bo.transporte?.etiqueta ? 'shipped' : 'unshipped',
-    shippingCarrier: bo.transporte?.transportador?.nome || 'Melhor Envio',
+    shippingCarrier: bo.transporte?.transportador?.nome || 'Correios / Transportadora',
     trackingNumber: bo.transporte?.etiqueta?.codigoRastreamento || null,
     trackingUrl: bo.transporte?.etiqueta?.codigoRastreamento
       ? `https://melhorenvio.com.br/rastreio/${bo.transporte.etiqueta.codigoRastreamento}`
       : null,
-    paymentMethod: 'Mercado Pago / Bling ERP',
+    paymentMethod: 'Mercado Pago',
     paymentId: String(bo.id),
     blingOrderId: bo.id,
     blingOrderNumber: bo.numero ? Number(bo.numero) : undefined,
@@ -1252,13 +1253,15 @@ function mapPendingPaymentToStoredOrder(p: Record<string, any>, docId: string): 
   const expiresAtMs = resolvePendingExpiresAtMs(p) || createdMs + PIX_EXPIRATION_MS;
   const expiresAtIso = new Date(expiresAtMs).toISOString();
   const shortNumeric = idStr.replace(/\D/g, '').slice(-5) || '0';
+  const resolvedPixCode = String(p.pixCopyPaste || p.qrCode || p.qr_code || '').trim();
+  const resolvedQrBase64 = String(p.qrCodeBase64 || p.qr_code_base64 || '').trim();
   return {
     orderId: Number(shortNumeric) || 0,
     orderNumber: p.orderNumber || `PIX-${idStr.slice(-6).toUpperCase()}`,
     status: 'open',
     paymentStatus: p.status === 'approved' ? 'paid' : 'pending',
     shippingStatus: 'unshipped',
-    shippingCarrier: p.shippingCarrier || 'Melhor Envio (Correios / Jadlog)',
+    shippingCarrier: p.shippingCarrier || 'Correios / Transportadora',
     trackingNumber: null,
     trackingUrl: null,
     paymentMethod: p.paymentMethod || 'Pix Instantâneo Mercado Pago',
@@ -1266,8 +1269,8 @@ function mapPendingPaymentToStoredOrder(p: Record<string, any>, docId: string): 
     pendingPaymentId: idStr,
     expiresAt: expiresAtIso,
     expiresAtMs,
-    ...(p.qrCode ? { qrCode: String(p.qrCode) } : {}),
-    ...(p.qrCodeBase64 ? { qrCodeBase64: String(p.qrCodeBase64) } : {}),
+    ...(resolvedPixCode ? { qrCode: resolvedPixCode, pixCopyPaste: resolvedPixCode } : {}),
+    ...(resolvedQrBase64 ? { qrCodeBase64: resolvedQrBase64 } : {}),
     ...(p.pixKey ? { pixKey: String(p.pixKey) } : {}),
     ...(p.userId || p.payer?.uid ? { userId: String(p.userId || p.payer?.uid) } : {}),
     customer: {
@@ -1578,6 +1581,6 @@ export function requestStoreOrderReturn(params: {
   return {
     success: true,
     protocol,
-    message: 'Solicitação de devolução registrada com sucesso e vinculada à logística reversa Melhor Envio.',
+    message: 'Solicitação de devolução registrada com sucesso pela equipe Street Store.',
   };
 }

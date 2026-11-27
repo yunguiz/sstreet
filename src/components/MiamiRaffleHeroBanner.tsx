@@ -76,7 +76,6 @@ export function MiamiRaffleHeroBanner({ onOpenRafflePage }: MiamiRaffleHeroBanne
               <div className="flex flex-wrap items-center gap-2 text-xs font-semibold tracking-wide text-zinc-300">
                 <span className="text-[#FF8E53] font-bold uppercase tracking-wider">Sorteio Oficial</span>
                 <span aria-hidden="true" className="text-zinc-600">·</span>
-                <span className="text-[#22D3EE]">Edição Miami Sunset</span>
                 <span aria-hidden="true" className="text-zinc-600">·</span>
                 <span>A partir de R$ 150,00</span>
               </div>

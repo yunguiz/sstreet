@@ -13,6 +13,7 @@ export interface MercadoPagoPixResponse {
   statusDetail?: string;
   amount?: number;
   qrCode?: string;
+  pixCopyPaste?: string;
   qrCodeBase64?: string;
   ticketUrl?: string;
   expiresAt?: string;
