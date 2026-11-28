@@ -633,8 +633,8 @@ async function syncOrderToBling(params: {
         produtoId: null,
       });
     }
-
-    const buildBlingItems = (opts?: { stripCodeForUnlinkedItems?: boolean }) =>
+    
+const buildBlingItems = (opts?: { stripCodeForUnlinkedItems?: boolean }) =>
       preparedItems.map((it) => {
         const obj: Record<string, any> = {
           unidade: it.unidade,
@@ -644,8 +644,7 @@ async function syncOrderToBling(params: {
         };
         if (it.produtoId && it.produtoId > 0) {
           obj.produto = { id: it.produtoId };
-        }
-        if (!(opts?.stripCodeForUnlinkedItems && !it.produtoId)) {
+        } else if (!opts?.stripCodeForUnlinkedItems && it.codigo) {
           obj.codigo = it.codigo;
         }
         return obj;
