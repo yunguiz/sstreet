@@ -12,6 +12,7 @@ export interface CatalogVariantItem {
   size?: string;
   color?: string;
   image?: string;
+  images?: string[];
 }
 
 interface ColorRule {
@@ -26,6 +27,16 @@ interface ColorRule {
  * "ROSE GOLD" resolves to "Rose Gold" (never "Rosa").
  */
 const COLOR_RULES: ColorRule[] = [
+  {
+    name: 'Roxo com Preto',
+    hex: '#6B21A8',
+    regex: /\b(?:roxo|roxa|purple)\s*(?:com|c\/|\/|\+|e|-)\s*(?:preto|preta|black)\b/i,
+  },
+  {
+    name: 'Preto com Roxo',
+    hex: '#111111',
+    regex: /\b(?:preto|preta|black)\s*(?:com|c\/|\/|\+|e|-)\s*(?:roxo|roxa|purple)\b/i,
+  },
   {
     name: 'Off-White',
     hex: '#EAE6DF',
@@ -177,6 +188,12 @@ export const COLOR_HEX_MAP: Record<string, string> = {
   'rose gold': '#E0A99B',
   roxo: '#6B21A8',
   roxa: '#6B21A8',
+  'roxo com preto': '#6B21A8',
+  'roxa com preto': '#6B21A8',
+  'roxo/preto': '#6B21A8',
+  'preto com roxo': '#111111',
+  'preta com roxo': '#111111',
+  'preto/roxo': '#111111',
   bege: '#D6C5A7',
   caqui: '#A89F81',
   marrom: '#78350F',
@@ -504,39 +521,175 @@ export function inferStoreCategory(
 const TITLE_COLOR_STRIP_REGEX =
   /\b(?:off[\s-]*(?:white|withe|whithe)|offwhite|rose\s*gold|azul\s+marinho|all[\s-]?black|multi[\s-]?cor|colorid[oa]|pret[oa]s?|branc[oa]s?|cinza|grafite|chumbo|mescla|azul|verde|militar|musgo|oliva|vermelh[oa]s?|bord[oô]|vinho|marsala|burgundy|rox[oa]s?|lil[aá]s|violeta|lavanda|ros[ae]|pink|marrom|marron|caf[eé]|chocolate|terracota|beg[eé]|areia|caramelo|caqui|khaki|camelo|amarel[oa]s?|laranja|coral|creme|cream|marfim|nude|mostarda|prata|pratead[oa]|dourad[oa]|ouro|estonad[oa]|transparente|cristal|black|white|navy|grey|gray|blue|green|red|purple|brown|yellow|orange|silver|gold)\b/gi;
 
-function isValidPhotoUrl(url?: string): boolean {
+export function isExpiredPresignedImageUrl(url?: string): boolean {
+  const clean = String(url || '').trim();
+  if (!clean || !clean.startsWith('http')) return false;
+  try {
+    const parsed = new URL(clean);
+    const expiresParam = parsed.searchParams.get('Expires');
+    if (expiresParam) {
+      const expSec = Number(expiresParam);
+      if (Number.isFinite(expSec) && expSec > 0 && expSec * 1000 <= Date.now()) {
+        return true;
+      }
+    }
+    const amzDate = parsed.searchParams.get('X-Amz-Date');
+    const amzExpires = parsed.searchParams.get('X-Amz-Expires');
+    if (amzDate && amzExpires) {
+      const m = amzDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+      if (m) {
+        const startMs = Date.UTC(
+          Number(m[1]),
+          Number(m[2]) - 1,
+          Number(m[3]),
+          Number(m[4]),
+          Number(m[5]),
+          Number(m[6])
+        );
+        const ttlSec = Number(amzExpires);
+        if (Number.isFinite(ttlSec) && startMs + ttlSec * 1000 <= Date.now()) {
+          return true;
+        }
+      }
+    }
+  } catch {
+    // ignore malformed URL
+  }
+  return false;
+}
+
+export function isValidPhotoUrl(url?: string): boolean {
   const u = String(url || '').trim();
   if (!u) return false;
   const low = u.toLowerCase();
-  if (low.includes('streetstore-fallback') || low.includes('placeholder') || low.includes('unsplash.com')) {
+  if (
+    low.includes('streetstore-fallback') ||
+    low.includes('placeholder') ||
+    low.includes('unsplash.com') ||
+    low.includes('/src/assets/')
+  ) {
     return false;
   }
+  if (isExpiredPresignedImageUrl(u)) return false;
   return true;
 }
 
-function isThumbPhotoUrl(url?: string): boolean {
-  const low = String(url || '').toLowerCase();
-  return low.includes('/t/') || low.includes('/p/') || low.includes('miniatura') || low.includes('_thumb');
+export function isLowResThumbnailUrl(url?: string): boolean {
+  const low = String(url || '').toLowerCase().trim();
+  if (!low) return true;
+  if (
+    low.includes('miniatura') ||
+    low.includes('/thumb/') ||
+    low.includes('_thumb.') ||
+    low.includes('-thumb.') ||
+    low.includes('_mini.') ||
+    low.includes('-mini.') ||
+    /-(?:50|100|150|200|240|250|300|320|480)-\d+\.(?:jpe?g|png|webp|avif)/i.test(low)
+  ) {
+    return true;
+  }
+  if (low.includes('orgbling.s3.amazonaws.com') || low.includes('bling.com')) {
+    try {
+      const parsed = new URL(low);
+      if (
+        /\/(?:t|p|m)\/[^/]+$/i.test(parsed.pathname) ||
+        /\/(?:t|p|m)\/[a-z0-9_-]{8,}/i.test(parsed.pathname)
+      ) {
+        return true;
+      }
+    } catch {
+      if (/\/(?:t|p|m)\/[a-z0-9_-]{8,}/i.test(low)) return true;
+    }
+  }
+  return false;
 }
 
-function mergeUniquePhotos(...lists: Array<string[] | undefined>): string[] {
-  const seen = new Set<string>();
+const FRONTEND_RESIZE_PARAMS = new Set([
+  'w',
+  'h',
+  'width',
+  'height',
+  'max-w',
+  'max-h',
+  'size',
+  'resize',
+  'quality',
+  'q',
+  'fit',
+  'thumb',
+  'mini',
+  'miniatura',
+]);
+
+export function cleanHighResImageUrl(url?: string): string {
+  const raw = String(url || '').trim();
+  if (!raw || raw.startsWith('data:image') || raw.startsWith('/')) return raw;
+  try {
+    const parsed = new URL(raw);
+    for (const k of Array.from(parsed.searchParams.keys())) {
+      if (FRONTEND_RESIZE_PARAMS.has(k.toLowerCase())) {
+        parsed.searchParams.delete(k);
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return raw;
+  }
+}
+
+const PRESIGNED_AUTH_PARAMS = new Set([
+  'awsaccesskeyid',
+  'expires',
+  'signature',
+  'x-amz-algorithm',
+  'x-amz-credential',
+  'x-amz-date',
+  'x-amz-expires',
+  'x-amz-signedheaders',
+  'x-amz-signature',
+  'x-amz-security-token',
+]);
+
+export function getCanonicalPhotoKey(url?: string): string {
+  const clean = String(url || '').trim();
+  if (!clean || clean.startsWith('data:image') || clean.startsWith('/')) return clean;
+  try {
+    const parsed = new URL(clean);
+    for (const k of Array.from(parsed.searchParams.keys())) {
+      if (PRESIGNED_AUTH_PARAMS.has(k.toLowerCase())) {
+        parsed.searchParams.delete(k);
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return clean;
+  }
+}
+
+export function sortPreferredProductImages(...lists: Array<string[] | undefined>): string[] {
+  const seenKeys = new Set<string>();
   const full: string[] = [];
   const thumbs: string[] = [];
   for (const list of lists) {
     if (!Array.isArray(list)) continue;
     for (const raw of list) {
-      const clean = typeof raw === 'string' ? raw.trim() : '';
-      if (!clean || seen.has(clean) || !isValidPhotoUrl(clean)) continue;
-      seen.add(clean);
-      if (isThumbPhotoUrl(clean)) {
+      const clean = cleanHighResImageUrl(raw);
+      if (!clean || !isValidPhotoUrl(clean)) continue;
+      const canonical = getCanonicalPhotoKey(clean);
+      if (!canonical || seenKeys.has(canonical)) continue;
+      seenKeys.add(canonical);
+      if (isLowResThumbnailUrl(clean)) {
         thumbs.push(clean);
       } else {
         full.push(clean);
       }
     }
   }
-  return [...full, ...thumbs];
+  return full.length > 0 ? full : thumbs;
+}
+
+function mergeUniquePhotos(...lists: Array<string[] | undefined>): string[] {
+  return sortPreferredProductImages(...lists);
 }
 
 export function stripColorFromProductTitle(rawTitle: string): string {
@@ -563,24 +716,63 @@ export function stripColorFromProductTitle(rawTitle: string): string {
   return cleaned.length >= 3 ? cleaned : original;
 }
 
+/**
+ * Separates the 3 distinct "Oversized Boxy Tripside Recortada" models so they never collapse into
+ * one mixed card while still deduplicating duplicate Bling listings of the exact same model:
+ * 1) Traditional cut (not "boxy")
+ * 2) Boxy cut — "Roxa com Preto"
+ * 3) Boxy cut — "Preto com Roxo"
+ */
+export function getTripsideRecortadaModelSignature(rawName: string): string | null {
+  const ascii = stripAccents(String(rawName || ''))
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!/\b(?:tripside|trip\s+side)\b/i.test(ascii) || !/\brecortad[ao]\b/i.test(ascii)) {
+    return null;
+  }
+  const cut = /\bboxy\b/i.test(ascii) ? 'boxy' : 'tradicional';
+  let colorOrder = 'padrao';
+  if (/\b(?:roxo|roxa|purple)\s*(?:com|c\/|\/|\+|e|-)\s*(?:preto|preta|black)\b/i.test(ascii)) {
+    colorOrder = 'roxo-com-preto';
+  } else if (/\b(?:preto|preta|black)\s*(?:com|c\/|\/|\+|e|-)\s*(?:roxo|roxa|purple)\b/i.test(ascii)) {
+    colorOrder = 'preto-com-roxo';
+  } else {
+    const detected = detectColorFromText(ascii);
+    if (detected?.name) {
+      colorOrder = stripAccents(detected.name).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    }
+  }
+  return `${cut}::${colorOrder}`;
+}
+
 export function getImagesForColor(
   product: {
     images?: string[];
     colorImages?: Record<string, string[]>;
-    variantsList?: Array<{ color?: string; image?: string }>;
+    variantsList?: Array<{ color?: string; image?: string; images?: string[] }>;
   },
   colorName?: string
 ): string[] {
   const target = normalizeColorName(colorName || '').toLowerCase();
+  const baseProductImages = sortPreferredProductImages(product.images);
   if (!target || target === 'cor única' || target === 'cor unica') {
-    return Array.isArray(product.images) ? product.images : [];
+    return baseProductImages;
   }
 
   const fromMap: string[] = [];
+  const otherColorCanonicalKeys = new Set<string>();
   if (product.colorImages && typeof product.colorImages === 'object') {
     for (const [k, urls] of Object.entries(product.colorImages)) {
-      if (normalizeColorName(k).toLowerCase() === target && Array.isArray(urls)) {
+      if (!Array.isArray(urls)) continue;
+      const normalizedKey = normalizeColorName(k).toLowerCase();
+      if (normalizedKey === target) {
         fromMap.push(...urls);
+      } else {
+        for (const u of urls) {
+          const canon = getCanonicalPhotoKey(cleanHighResImageUrl(u));
+          if (canon) otherColorCanonicalKeys.add(canon);
+        }
       }
     }
   }
@@ -588,14 +780,38 @@ export function getImagesForColor(
   const fromVars: string[] = [];
   if (Array.isArray(product.variantsList)) {
     for (const v of product.variantsList) {
-      if (v?.color && normalizeColorName(v.color).toLowerCase() === target && v.image) {
-        fromVars.push(v.image);
+      const vColor = v?.color ? normalizeColorName(v.color).toLowerCase() : '';
+      if (vColor === target) {
+        if (Array.isArray(v.images)) fromVars.push(...v.images);
+        if (v.image) fromVars.push(v.image);
+      } else if (vColor) {
+        if (Array.isArray(v.images)) {
+          for (const u of v.images) {
+            const canon = getCanonicalPhotoKey(cleanHighResImageUrl(u));
+            if (canon) otherColorCanonicalKeys.add(canon);
+          }
+        }
+        if (v.image) {
+          const canon = getCanonicalPhotoKey(cleanHighResImageUrl(v.image));
+          if (canon) otherColorCanonicalKeys.add(canon);
+        }
       }
     }
   }
 
-  const resolved = mergeUniquePhotos(fromMap, fromVars);
-  return resolved.length > 0 ? resolved : Array.isArray(product.images) ? product.images : [];
+  const resolved = sortPreferredProductImages(fromMap, fromVars);
+  if (resolved.length > 0) {
+    return resolved;
+  }
+
+  if (otherColorCanonicalKeys.size > 0) {
+    const unattributed = baseProductImages.filter(
+      (u) => !otherColorCanonicalKeys.has(getCanonicalPhotoKey(cleanHighResImageUrl(u)))
+    );
+    if (unattributed.length > 0) return unattributed;
+  }
+
+  return baseProductImages;
 }
 
 /**
@@ -627,6 +843,7 @@ export function unifyProductsByColor<
       size?: string;
       color?: string;
       image?: string;
+      images?: string[];
     }>;
     [k: string]: any;
   }
@@ -640,6 +857,7 @@ export function unifyProductsByColor<
     product: T;
     strippedTitle: string;
     normStrippedTitle: string;
+    modelSignature: string | null;
     titleHadColor: boolean;
     realColors: string[];
     colorImages: Record<string, string[]>;
@@ -647,7 +865,8 @@ export function unifyProductsByColor<
   };
 
   const prepared: PreparedEntry[] = products.map((p) => {
-    const strippedTitle = stripColorFromProductTitle(p.name);
+    const modelSignature = getTripsideRecortadaModelSignature(p.name);
+    const strippedTitle = modelSignature ? p.name : stripColorFromProductTitle(p.name);
     const normOrig = normalizeKeyPart(p.name);
     const normStrippedTitle = normalizeKeyPart(strippedTitle);
     const titleHadColor = Boolean(normStrippedTitle) && normStrippedTitle !== normOrig;
@@ -681,11 +900,13 @@ export function unifyProductsByColor<
       Array.isArray(p.variantsList) && p.variantsList.length > 0
         ? p.variantsList.map((v) => {
             const vColor = normalizeColorName(v.color || '') || fallbackSingleColor || undefined;
-            const vImg = isValidPhotoUrl(v.image) ? String(v.image).trim() : validProductImgs[0];
+            const vVarImgs = sortPreferredProductImages(v.images, v.image ? [v.image] : []);
+            const vImg = vVarImgs[0] || (realColors.length <= 1 ? validProductImgs[0] : undefined);
             return {
               ...v,
               ...(vColor ? { color: vColor } : {}),
               ...(vImg ? { image: vImg } : {}),
+              ...(vVarImgs.length > 0 ? { images: vVarImgs } : {}),
             };
           })
         : [
@@ -697,15 +918,18 @@ export function unifyProductsByColor<
               size: p.sizes?.[0] || 'Tamanho Único',
               ...(fallbackSingleColor ? { color: fallbackSingleColor } : {}),
               ...(validProductImgs[0] ? { image: validProductImgs[0] } : {}),
+              ...(validProductImgs.length > 0 ? { images: validProductImgs } : {}),
             },
           ];
 
     for (const v of baseVariants) {
-      if (v.color && v.image && isValidPhotoUrl(v.image)) {
-        colorImages[v.color] = mergeUniquePhotos(colorImages[v.color], [v.image]);
+      if (!v.color) continue;
+      const vUrls = sortPreferredProductImages(v.images, v.image ? [v.image] : []);
+      if (vUrls.length > 0) {
+        colorImages[v.color] = mergeUniquePhotos(colorImages[v.color], vUrls);
       }
     }
-    if (fallbackSingleColor && validProductImgs.length > 0) {
+    if (fallbackSingleColor && realColors.length <= 1 && validProductImgs.length > 0) {
       colorImages[fallbackSingleColor] = mergeUniquePhotos(colorImages[fallbackSingleColor], validProductImgs);
     }
 
@@ -713,6 +937,7 @@ export function unifyProductsByColor<
       product: p,
       strippedTitle,
       normStrippedTitle,
+      modelSignature,
       titleHadColor,
       realColors,
       colorImages,
@@ -723,7 +948,9 @@ export function unifyProductsByColor<
   const buckets = new Map<string, PreparedEntry[][]>();
 
   for (const entry of prepared) {
-    const baseBucketKey = `${entry.product.category}::${entry.product.subcategory}::${entry.normStrippedTitle}`;
+    const baseBucketKey = entry.modelSignature
+      ? `${entry.product.category}::${entry.product.subcategory}::tripside-recortada::${entry.modelSignature}`
+      : `${entry.product.category}::${entry.product.subcategory}::${entry.normStrippedTitle}`;
     let groups = buckets.get(baseBucketKey);
     if (!groups) {
       groups = [];
@@ -743,6 +970,10 @@ export function unifyProductsByColor<
       const maxPrice = Math.max(cand.product.price || 0, entry.product.price || 0, 1);
       const priceDiffRatio = Math.abs((cand.product.price || 0) - (entry.product.price || 0)) / maxPrice;
       if (priceDiffRatio > 0.25) return false;
+
+      if (entry.modelSignature && cand.modelSignature === entry.modelSignature) {
+        return true;
+      }
 
       const candColorSet = new Set(cand.realColors.map((c) => c.toLowerCase()));
       const candHasColor = cand.titleHadColor || candColorSet.size > 0;
@@ -782,9 +1013,12 @@ export function unifyProductsByColor<
 
     // Group entries that actually matched each other (first entry is canonical; check price compatibility for remaining)
     const primary = entries[0];
-    const cleanTitle = entries.some((e) => e.titleHadColor)
-      ? primary.strippedTitle
-      : primary.product.name;
+    const cleanTitle =
+      primary.modelSignature
+        ? primary.product.name
+        : entries.some((e) => e.titleHadColor)
+          ? primary.strippedTitle
+          : primary.product.name;
 
     const variantMap = new Map<string, NonNullable<T['variantsList']>[number]>();
     for (const e of entries) {
@@ -797,10 +1031,12 @@ export function unifyProductsByColor<
         if (!prev) {
           variantMap.set(varKey, { ...v });
         } else {
+          const mergedVarImgs = mergeUniquePhotos(prev.images, v.images, prev.image ? [prev.image] : [], v.image ? [v.image] : []);
           variantMap.set(varKey, {
             ...prev,
             stock: Math.max(prev.stock, v.stock),
-            image: prev.image || v.image,
+            image: mergedVarImgs[0] || prev.image || v.image,
+            ...(mergedVarImgs.length > 0 ? { images: mergedVarImgs } : {}),
           });
         }
       }

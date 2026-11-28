@@ -8,6 +8,7 @@ import {
   normalizeColorName,
   normalizeColorOptions,
   parseBlingVariantMeta,
+  sortPreferredProductImages,
   sortSizes,
   unifyProductsByColor,
 } from '../lib/catalogVariants';
@@ -84,10 +85,9 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
   if (!nome) return null;
 
   const preco = Number(data.preco || 0) > 0 ? Number(data.preco) : 119.9;
-  const rawImages = Array.isArray(data.imagens) ? data.imagens.filter((u: unknown) => typeof u === 'string' && u.length > 0) : [];
-  if (rawImages.length === 0 && typeof data.imagemURL === 'string' && data.imagemURL.trim()) {
-    rawImages.push(data.imagemURL.trim());
-  }
+  const docImagens = Array.isArray(data.imagens) ? (data.imagens as string[]) : [];
+  const fallbackCover = docImagens.length === 0 && typeof data.imagemURL === 'string' ? [data.imagemURL] : [];
+  const rawImages = sortPreferredProductImages(docImagens, fallbackCover);
 
   const variantsList = variacoesRaw.map((v: any) => {
     const parsedMeta = v?.nome
@@ -95,12 +95,12 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
       : null;
     const rawSize = parsedMeta?.hasExplicitSize ? parsedMeta.size : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
     const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
-    const rawVarImg =
-      typeof v.imagemURL === 'string' && v.imagemURL.trim()
-        ? v.imagemURL.trim()
-        : typeof v.image === 'string' && v.image.trim()
-          ? v.image.trim()
-          : '';
+    const vImgs = sortPreferredProductImages(
+      Array.isArray(v.imagens) ? (v.imagens as string[]) : [],
+      typeof v.imagemURL === 'string' ? [v.imagemURL] : [],
+      typeof v.image === 'string' ? [v.image] : []
+    );
+    const rawVarImg = vImgs[0] || '';
     return {
       id: Number(v.blingId || v.id || 0),
       sku: String(v.codigo || ''),
@@ -109,6 +109,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
       size: sortSizes([rawSize])[0] || 'Tamanho Único',
       ...(rawColor ? { color: rawColor } : {}),
       ...(rawVarImg ? { image: rawVarImg } : {}),
+      ...(vImgs.length > 0 ? { images: vImgs } : {}),
     };
   });
 
@@ -140,6 +141,18 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
       : (docColors.length > 0 ? docColors : (fallbackTitleColor ? [fallbackTitleColor] : []))
   );
 
+  const colorImages: Record<string, string[]> = {};
+  for (const v of inStockVariants) {
+    if (!v.color) continue;
+    const vPool = sortPreferredProductImages(
+      Array.isArray((v as any).images) ? (v as any).images : [],
+      v.image ? [v.image] : []
+    );
+    if (vPool.length > 0) {
+      colorImages[v.color] = sortPreferredProductImages(colorImages[v.color] || [], vPool);
+    }
+  }
+
   const { category, subcategory } = inferStoreCategory(
     nome,
     String(data.categoriaStore ?? data.categoria ?? ''),
@@ -156,7 +169,8 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, any>): Pro
     tag: stockCount <= 3 ? 'POUCAS UNIDADES' : null,
     rating: 4.9,
     reviewsCount: 24,
-    images: rawImages.length > 0 ? rawImages : ['/assets/streetstore-fallback.svg'],
+    images: rawImages,
+    ...(Object.keys(colorImages).length > 0 ? { colorImages } : {}),
     sizes,
     colors: resolvedColors,
     description: cleanDescription(String(data.descricao || `${nome} - Street Store Itabira`)),
@@ -227,11 +241,15 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
     }
 
     const data = await res.json();
-    if (data.success && Array.isArray(data.products) && data.products.length > 0 && data.blingConnected !== false) {
-      const rawList: Product[] = data.products.map((p: Product) => ({
-        ...p,
-        description: cleanDescription(p.description),
-      }));
+    if (data.success && Array.isArray(data.products) && data.blingConnected !== false) {
+      const rawList: Product[] = data.products.map((p: Product) => {
+        const sortedImgs = sortPreferredProductImages(p.images);
+        return {
+          ...p,
+          images: sortedImgs.length > 0 ? sortedImgs : p.images,
+          description: cleanDescription(p.description),
+        };
+      });
       const sanitizedProducts = unifyProductsByColor(filterVisibleProducts<Product>(rawList)).sort(
         (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
       );
@@ -239,9 +257,12 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
         products: sanitizedProducts,
         isLive: true,
         blingConnected: Boolean(data.blingConnected),
-        blingCount: Number(data.blingCount || sanitizedProducts.length),
+        blingCount: Number(data.blingCount ?? sanitizedProducts.length),
         blingError: data.blingError || null,
-        statusText: `Catálogo Oficial Ativo (${sanitizedProducts.length} peças em estoque)`,
+        statusText:
+          sanitizedProducts.length > 0
+            ? `Catálogo Oficial Ativo (${sanitizedProducts.length} peças em estoque)`
+            : 'Nenhum produto em estoque no Bling ERP no momento',
       };
     }
 
@@ -259,10 +280,14 @@ export async function getLiveCatalog(forceRefresh: boolean = false): Promise<{
     }
 
     if (data.success && Array.isArray(data.products) && data.products.length > 0) {
-      const rawList: Product[] = data.products.map((p: Product) => ({
-        ...p,
-        description: cleanDescription(p.description),
-      }));
+      const rawList: Product[] = data.products.map((p: Product) => {
+        const sortedImgs = sortPreferredProductImages(p.images);
+        return {
+          ...p,
+          images: sortedImgs.length > 0 ? sortedImgs : p.images,
+          description: cleanDescription(p.description),
+        };
+      });
       const sanitizedProducts = unifyProductsByColor(filterVisibleProducts<Product>(rawList)).sort(
         (a, b) => Number(b.integration?.blingId || 0) - Number(a.integration?.blingId || 0)
       );

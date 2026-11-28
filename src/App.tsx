@@ -95,6 +95,7 @@ function StorefrontApp() {
   // Live products loaded automatically from Bling ERP & official store catalog
   const [products, setProducts] = useState<Product[]>([]);
   const [isCatalogLive, setIsCatalogLive] = useState(false);
+  const [isCatalogLoading, setIsCatalogLoading] = useState(true);
   const [mercadoPagoSuccessBanner, setMercadoPagoSuccessBanner] = useState<string | null>(null);
 
   // Customer authentication state (Firebase Auth + Firestore users/{uid})
@@ -129,15 +130,19 @@ function StorefrontApp() {
 
     const applyCatalogResult = (res: Awaited<ReturnType<typeof getLiveCatalog>>) => {
       if (!mounted) return;
-      if (Array.isArray(res.products) && res.products.length > 0) {
+      setIsCatalogLoading(false);
+      if (Array.isArray(res.products) && (res.isLive || res.products.length > 0)) {
         setProducts((prev) => {
           if (prev.length !== res.products.length) return res.products;
           const hasChange = res.products.some(
             (p, i) =>
+              p.id !== prev[i]?.id ||
               p.price !== prev[i]?.price ||
               p.stockCount !== prev[i]?.stockCount ||
               p.name !== prev[i]?.name ||
-              p.images?.[0] !== prev[i]?.images?.[0]
+              (p.images || []).join('|') !== (prev[i]?.images || []).join('|') ||
+              (p.colors?.length || 0) !== (prev[i]?.colors?.length || 0) ||
+              (p.variantsList?.length || 0) !== (prev[i]?.variantsList?.length || 0)
           );
           return hasChange ? res.products : prev;
         });
@@ -487,6 +492,7 @@ function StorefrontApp() {
           <CatalogSection
             products={products}
             isCatalogLive={isCatalogLive}
+            isLoadingCatalog={isCatalogLoading}
             catalogCount={products.length}
             activeCategory={activeCategory}
             activeSubcategory={activeSubcategory}

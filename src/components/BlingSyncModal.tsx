@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react';
-import { X, RefreshCw, CheckCircle2, AlertCircle, Image as ImageIcon, Sparkles, ExternalLink, Upload, Key, Copy, Check } from 'lucide-react';
+import { useState, useEffect } from 'react';
+import { X, RefreshCw, CheckCircle2, AlertCircle, Image as ImageIcon, Sparkles, ExternalLink, Key, Copy, Check } from 'lucide-react';
 import { Product } from '../types';
 
 interface BlingSyncModalProps {
@@ -48,7 +48,6 @@ export function BlingSyncModal({
   const [isUpdatingImage, setIsUpdatingImage] = useState(false);
   const [imageUpdateSuccess, setImageUpdateSuccess] = useState(false);
   const [copiedWebhook, setCopiedWebhook] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const webhookUrl = typeof window !== 'undefined'
     ? `${window.location.origin}/api/webhooks/bling`
@@ -227,44 +226,6 @@ export function BlingSyncModal({
     }
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    setIsUpdatingImage(true);
-    setImageUpdateSuccess(false);
-    setErrorMsg(null);
-
-    const reader = new FileReader();
-    reader.onload = async () => {
-      try {
-        const fileData = reader.result as string;
-        const res = await fetch('/api/products/upload-image', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sku: selectedTarget.sku,
-            name: selectedTarget.name,
-            fileData,
-            fileName: file.name
-          })
-        });
-        const data = await res.json();
-        if (data.success) {
-          setImageUpdateSuccess(true);
-          onCatalogRefresh();
-        } else {
-          setErrorMsg(data.error || 'Falha ao fazer upload da imagem.');
-        }
-      } catch (err: any) {
-        setErrorMsg(err.message || 'Erro ao processar imagem.');
-      } finally {
-        setIsUpdatingImage(false);
-      }
-    };
-    reader.readAsDataURL(file);
-  };
-
   const handleCopyWebhook = () => {
     navigator.clipboard.writeText(webhookUrl);
     setCopiedWebhook(true);
@@ -282,9 +243,9 @@ export function BlingSyncModal({
             </div>
             <div>
               <h2 className="text-base font-black uppercase text-white font-oswald tracking-wide flex items-center gap-2">
-                Sincronizar Bling ERP (Até 1.350 Produtos)
+                Sincronizar Bling ERP em Tempo Real
               </h2>
-              <p className="text-xs text-zinc-400">Puxa até 1.350 produtos com fotos reais e oculta itens sem estoque automaticamente</p>
+              <p className="text-xs text-zinc-400">Puxa produtos, preços, fotos e estoque diretamente do Bling ERP</p>
             </div>
           </div>
           <button
@@ -301,12 +262,12 @@ export function BlingSyncModal({
           <div className="mt-4 p-3.5 rounded-xl bg-amber-950/30 border border-amber-800/50 text-amber-200 text-xs leading-relaxed space-y-1.5">
             <div className="flex items-center gap-2 font-bold uppercase tracking-wider text-amber-300">
               <AlertCircle className="w-4 h-4 shrink-0 text-amber-400" />
-              <span>Conexão Bling ERP necessária para puxar novos produtos</span>
+              <span>Conexão Bling ERP necessária para puxar produtos</span>
             </div>
             <p className="text-[11px] text-zinc-300 leading-normal">
               {status?.tokenInvalid
-                ? 'O token anterior do Bling expirou ou é inválido. Clique em "Autorizar Conexão no Bling ERP (1 Clique)" abaixo para gerar um novo token OAuth e puxar todos os novos produtos.'
-                : 'Autorize sua conta Bling API v3 abaixo para importar automaticamente até 1.350 produtos novos, estoque real (ocultando itens sem estoque) e fotos internas armazenadas no Bling.'}
+                ? 'O token anterior do Bling expirou ou é inválido. Clique em "Autorizar Conexão no Bling ERP (1 Clique)" abaixo para gerar um novo token OAuth e puxar todos os produtos.'
+                : 'Autorize sua conta Bling API v3 abaixo para importar automaticamente produtos ativos, estoque real e fotos diretamente do Bling.'}
             </p>
           </div>
         )}
@@ -316,7 +277,7 @@ export function BlingSyncModal({
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-white font-bold text-xs uppercase tracking-wider font-oswald">
               <Key className="w-4 h-4 text-yellow-400" />
-              <span>1. Conectar Bling ERP e Puxar Até 1.350 Produtos</span>
+              <span>1. Conectar Bling ERP e Sincronizar Catálogo</span>
             </div>
             <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${status?.connected ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-red-950/60 text-red-300 border border-red-800/60'}`}>
               {status?.connected ? 'CONECTADO' : 'RECONECTAR OAUTH'}
@@ -384,7 +345,7 @@ export function BlingSyncModal({
             className="w-full py-2.5 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-white font-bold text-xs uppercase tracking-wider rounded-xl transition-all flex items-center justify-center gap-2 cursor-pointer border border-zinc-700"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
-            <span>{isSyncing ? 'Puxando até 1.350 Produtos e Fotos...' : 'Puxar Até 1.350 Produtos e Fotos do Bling Agora'}</span>
+            <span>{isSyncing ? 'Sincronizando Catálogo e Fotos do Bling...' : 'Sincronizar Produtos e Fotos do Bling Agora'}</span>
           </button>
 
           {syncResult && (
@@ -440,29 +401,9 @@ export function BlingSyncModal({
             </div>
           </div>
 
-          {/* Direct File Upload Button */}
-          <div className="pt-2">
-            <input
-              type="file"
-              ref={fileInputRef}
-              accept="image/*"
-              onChange={handleFileUpload}
-              className="hidden"
-            />
-            <button
-              type="button"
-              disabled={isUpdatingImage}
-              onClick={() => fileInputRef.current?.click()}
-              className="w-full py-2.5 bg-zinc-800 hover:bg-zinc-700 text-white rounded-xl text-xs font-bold uppercase tracking-wider transition-all flex items-center justify-center gap-2 cursor-pointer border border-zinc-700 hover:border-zinc-500"
-            >
-              <Upload className="w-4 h-4 text-emerald-400" />
-              <span>{isUpdatingImage ? 'Enviando Imagem...' : `Escolher Arquivo do Computador p/ ${selectedTarget.name.split(' ')[2] || 'Produto'}`}</span>
-            </button>
-          </div>
-
-          {/* OR Paste URL */}
+          {/* Paste External URL */}
           <div className="pt-1">
-            <div className="text-[11px] text-zinc-500 text-center mb-1.5 uppercase font-bold tracking-wider">OU COLE A URL DA IMAGEM:</div>
+            <div className="text-[11px] text-zinc-500 text-center mb-1.5 uppercase font-bold tracking-wider">COLE A URL DA IMAGEM:</div>
             <form onSubmit={handleUpdateProductImageByUrl} className="flex gap-2">
               <input
                 type="url"

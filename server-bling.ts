@@ -3,7 +3,12 @@ import dotenv from 'dotenv';
 import fs from 'fs';
 import path from 'path';
 import { isProductHidden } from './src/lib/hiddenProducts.js';
-import { extractImagesFromBlingItem, getBlingImagesForProduct, isThumbnailLikeUrl } from './server-bling-images.js';
+import {
+  clearImageCache,
+  extractImagesFromBlingItem,
+  getBlingImagesForProduct,
+  isThumbnailLikeUrl,
+} from './server-bling-images.js';
 import {
   getBlingTokenFromDb,
   upsertBlingTokenInDb,
@@ -514,15 +519,25 @@ export function clearBlingAuthCache(): void {
 }
 
 const inFlightBlingGets = new Map<string, Promise<any>>();
+const cachedProductsRoute = new Map<string, { payload: any; fetchedAt: number }>();
+const inFlightProductsRoute = new Map<string, Promise<any>>();
+
+export function clearBlingProductsRouteCache(): void {
+  cachedProductsRoute.clear();
+}
+
+export interface BlingFetchOptions extends RequestInit {
+  bypassCache?: boolean;
+}
 
 function getBlingCacheTtlMs(urlOrEndpoint: string): number {
   const lower = urlOrEndpoint.toLowerCase();
   if (lower.includes('/formas-pagamentos')) return 60 * 60 * 1000;
-  if (/\/produtos\/\d+/.test(lower)) return 10 * 60 * 1000;
-  if (lower.includes('/estoques/saldos')) return 45 * 1000;
-  if (lower.includes('/pedidos/vendas')) return 45 * 1000;
+  if (/\/produtos\/\d+/.test(lower)) return 45 * 1000;
+  if (lower.includes('/estoques/saldos')) return 30 * 1000;
+  if (lower.includes('/pedidos/vendas')) return 30 * 1000;
   if (lower.includes('/contatos')) return 60 * 1000;
-  if (lower.includes('/produtos')) return 60 * 1000;
+  if (lower.includes('/produtos')) return 45 * 1000;
   return 30 * 1000;
 }
 
@@ -677,29 +692,37 @@ async function executeBlingHttpRequest(endpoint: string, options: RequestInit = 
  * - Fallback para cache stale em caso de 429 / cota diária
  * - Tratamento claro de 409 Conflict e backoff não-bloqueante em 429
  */
-export async function fetchFromBling(endpoint: string, options: RequestInit = {}, retryCount: number = 0): Promise<any> {
-  const method = String(options.method || 'GET').toUpperCase();
+export async function fetchFromBling(
+  endpoint: string,
+  options: BlingFetchOptions = {},
+  retryCount: number = 0
+): Promise<any> {
+  const { bypassCache, ...fetchOptions } = options;
+  const method = String(fetchOptions.method || 'GET').toUpperCase();
   const url = endpoint.startsWith('http') ? endpoint : `${BLING_API_BASE}${endpoint}`;
 
   if (method !== 'GET') {
-    const result = await executeBlingHttpRequest(endpoint, options, retryCount);
+    const result = await executeBlingHttpRequest(endpoint, fetchOptions, retryCount);
     invalidateCacheForMutation(url);
     return result;
   }
 
-  const cachedFresh = getBlingCachedResponse(url, { allowStale: false });
-  if (cachedFresh) {
-    return cachedFresh.data;
+  if (!bypassCache) {
+    const cachedFresh = getBlingCachedResponse(url, { allowStale: false });
+    if (cachedFresh) {
+      return cachedFresh.data;
+    }
   }
 
-  const existingInFlight = inFlightBlingGets.get(url);
+  const inFlightKey = bypassCache ? `${url}::bypass` : url;
+  const existingInFlight = inFlightBlingGets.get(inFlightKey);
   if (existingInFlight) {
     return existingInFlight;
   }
 
   const run = (async () => {
     try {
-      const payload = await executeBlingHttpRequest(endpoint, options, retryCount);
+      const payload = await executeBlingHttpRequest(endpoint, fetchOptions, retryCount);
       setBlingCachedResponse(url, payload, getBlingCacheTtlMs(url));
       return payload;
     } catch (err: any) {
@@ -711,18 +734,21 @@ export async function fetchFromBling(endpoint: string, options: RequestInit = {}
       }
       throw err;
     } finally {
-      inFlightBlingGets.delete(url);
+      inFlightBlingGets.delete(inFlightKey);
     }
   })();
 
-  inFlightBlingGets.set(url, run);
+  inFlightBlingGets.set(inFlightKey, run);
   return run;
 }
 
 /**
  * Register all Bling ERP routes on the Express app
  */
-export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpdated?: () => void }) {
+export function registerBlingRoutes(
+  app: express.Express,
+  hooks?: { onTokensUpdated?: () => void; onCatalogSynced?: () => void }
+) {
   const { clientId, state } = getClientCredentials();
 
   function resolveAppUrl(req: Request): string {
@@ -1241,20 +1267,47 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
     try {
       const hasExplicitPage = typeof req.query.pagina === 'string' && req.query.pagina.trim() !== '';
       const autoAll = req.query.all === 'true' || !hasExplicitPage;
+      const forceRefresh =
+        req.query.refresh === 'true' ||
+        req.query.force === 'true' ||
+        req.body?.refresh === true ||
+        req.body?.force === true;
+      const clearImages =
+        req.query.clearImages === 'true' ||
+        req.body?.clearImages === true;
+
+      if (forceRefresh) {
+        invalidateBlingCachedResponse('/produtos');
+        invalidateBlingCachedResponse('/estoques');
+        clearBlingProductsRouteCache();
+      }
 
       if (autoAll) {
         const startPageRaw = typeof req.query.pagina === 'string' ? req.query.pagina : '1';
         const startPage = Math.max(1, parseInt(startPageRaw, 10) || 1);
+        if (clearImages && startPage === 1) {
+          clearImageCache(true);
+        }
         const maxMsRaw = typeof req.query.maxMs === 'string' ? parseInt(req.query.maxMs, 10) : 0;
         const result = await syncAllBlingProdutosToFirestore({
           startPage,
+          forceRefresh,
           maxExecutionMs: maxMsRaw > 0 ? Math.min(55000, maxMsRaw) : (process.env.VERCEL ? 7500 : 45000),
         });
+        if (result.success) {
+          hooks?.onCatalogSynced?.();
+        }
         return res.status(200).json(result);
       }
 
       const pagina = Math.max(1, parseInt(String(req.query.pagina), 10) || 1);
-      const result = await syncBlingProdutosPageToFirestore(pagina);
+      if (clearImages && pagina === 1) {
+        clearImageCache(true);
+      }
+      const result = await syncBlingProdutosPageToFirestore(pagina, { forceRefresh });
+      if (result.success) {
+        hooks?.onCatalogSynced?.();
+      }
       return res.status(200).json(result);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1272,7 +1325,28 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
     try {
       const paginaRaw = typeof req.query.pagina === 'string' ? req.query.pagina : '1';
       const pagina = Math.max(1, parseInt(paginaRaw, 10) || 1);
-      const resultado = await syncBlingProdutosPageToFirestore(pagina);
+      const forceRefresh =
+        req.query.refresh === 'true' ||
+        req.query.force === 'true' ||
+        req.body?.refresh === true ||
+        req.body?.force === true;
+      const clearImages =
+        req.query.clearImages === 'true' ||
+        req.body?.clearImages === true;
+
+      if (forceRefresh) {
+        invalidateBlingCachedResponse('/produtos');
+        invalidateBlingCachedResponse('/estoques');
+        clearBlingProductsRouteCache();
+      }
+      if (clearImages && pagina === 1) {
+        clearImageCache(true);
+      }
+
+      const resultado = await syncBlingProdutosPageToFirestore(pagina, { forceRefresh });
+      if (resultado.success) {
+        hooks?.onCatalogSynced?.();
+      }
       return res.status(200).json(resultado);
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1282,9 +1356,6 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
   });
 
   app.use('/api/bling', blingRouter);
-
-  const cachedProductsRoute = new Map<string, { payload: any; fetchedAt: number }>();
-  const inFlightProductsRoute = new Map<string, Promise<any>>();
 
   // 6. Fetch Products from Bling API v3 (Interceptado por blingAuthInterceptorMiddleware + cache TTL 60s + single-flight)
   app.get('/api/bling/products', blingAuthInterceptorMiddleware, async (req: Request, res: Response) => {
@@ -1296,13 +1367,19 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
     const forceRefresh = req.query.refresh === 'true';
     const routeKey = `${pagina}:${limiteParam}:${maxProducts}:${includeZeroStock}:${fetchAll}`;
 
+    if (forceRefresh) {
+      invalidateBlingCachedResponse('/produtos');
+      invalidateBlingCachedResponse('/estoques');
+      cachedProductsRoute.delete(routeKey);
+    }
+
     const cached = !forceRefresh ? cachedProductsRoute.get(routeKey) : undefined;
-    if (cached && Date.now() - cached.fetchedAt < 60 * 1000) {
+    if (cached && Date.now() - cached.fetchedAt < 45 * 1000) {
       return res.json({ ...cached.payload, cached: true });
     }
 
     try {
-      let runner = inFlightProductsRoute.get(routeKey);
+      let runner = !forceRefresh ? inFlightProductsRoute.get(routeKey) : undefined;
       if (!runner) {
         runner = (async () => {
           let rawProducts: any[] = [];
@@ -1322,7 +1399,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
             for (let p = 1; p <= 100 && rawProducts.length < maxProducts; p++) {
               if (isBlingDailyQuotaExceeded()) break;
               try {
-                const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
+                const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`, {
+                  bypassCache: forceRefresh,
+                });
                 const items = pageData?.data || [];
                 if (items.length > 0) pushUnique(items);
                 if (items.length < 100) break;
@@ -1333,7 +1412,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
               }
             }
           } else {
-            const data = await fetchFromBling(`/produtos?pagina=${pagina}&limite=${limiteParam}&criterio=2`);
+            const data = await fetchFromBling(`/produtos?pagina=${pagina}&limite=${limiteParam}&criterio=2`, {
+              bypassCache: forceRefresh,
+            });
             rawProducts = (data?.data || []).slice(0, maxProducts);
           }
 
@@ -1346,7 +1427,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
             const chunk = allIds.slice(i, i + 50);
             try {
               const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
-              const stockData = await fetchFromBling(`/estoques/saldos?${qs}`);
+              const stockData = await fetchFromBling(`/estoques/saldos?${qs}`, {
+                bypassCache: forceRefresh,
+              });
               stockApiSucceeded = true;
               (stockData.data || []).forEach((item: any) => {
                 const pId = item.produto?.id;
@@ -1368,10 +1451,9 @@ export function registerBlingRoutes(app: express.Express, hooks?: { onTokensUpda
             const directFullRes = directImages.filter(u => !isThumbnailLikeUrl(u));
             const cachedImgs = getBlingImagesForProduct({ name: p.nome, sku: p.codigo, blingId: String(p.id) }) || [];
             const cachedFullRes = cachedImgs.filter(u => !isThumbnailLikeUrl(u));
-            const combinedFullRes = Array.from(new Set([...directFullRes, ...cachedFullRes]));
-            const storedImages = combinedFullRes.length > 0
-              ? combinedFullRes
-              : (cachedImgs.length > 0 ? cachedImgs : directImages);
+            const storedImages = directFullRes.length > 0
+              ? directFullRes
+              : (cachedFullRes.length > 0 ? cachedFullRes : (cachedImgs.length > 0 ? cachedImgs : directImages));
             const realStock = stockMap[p.id] !== undefined
               ? stockMap[p.id]
               : (p.estoque?.saldoVirtualTotal ?? p.estoque?.saldoFisicoTotal ?? p.estoque?.saldoFisico ?? (stockApiSucceeded ? 0 : 0));

@@ -19,6 +19,7 @@ interface SyncPageResponse {
   paginasProcessadas?: number;
   importadosNaPagina?: number;
   documentosGravados?: number;
+  desativados?: number;
   authorized?: boolean;
   error?: string;
 }
@@ -39,6 +40,7 @@ export function AdminBlingSyncPage() {
   const [estimatedPages, setEstimatedPages] = useState(ESTIMATED_TOTAL_PAGES);
   const [totalImported, setTotalImported] = useState(0);
   const [totalDocsWritten, setTotalDocsWritten] = useState(0);
+  const [cleanRefresh, setCleanRefresh] = useState(true);
   const [lastBatchInfo, setLastBatchInfo] = useState<string>('');
 
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -117,6 +119,7 @@ export function AdminBlingSyncPage() {
     let finalizado = false;
     let acumuladoProdutos = 0;
     let acumuladoDocs = 0;
+    let acumuladoDesativados = 0;
 
     try {
       while (!finalizado && !cancelledRef.current) {
@@ -128,8 +131,19 @@ export function AdminBlingSyncPage() {
         const controller = new AbortController();
         abortControllerRef.current = controller;
 
+        const qs = new URLSearchParams({
+          all: 'true',
+          pagina: String(pagina),
+        });
+        if (cleanRefresh) {
+          qs.set('refresh', 'true');
+          if (pagina === 1) {
+            qs.set('clearImages', 'true');
+          }
+        }
+
         const response = await fetch(
-          `/api/bling/sync?all=true&pagina=${encodeURIComponent(String(pagina))}`,
+          `/api/bling/sync?${qs.toString()}`,
           {
             method: 'GET',
             headers: {
@@ -153,18 +167,27 @@ export function AdminBlingSyncPage() {
 
         const naPagina = Number(data.totalImportado ?? data.importadosNaPagina ?? 0);
         const docsNaPagina = Number(data.documentosGravados ?? naPagina);
+        const desativadosNaPagina = Number(data.desativados ?? 0);
         acumuladoProdutos += naPagina;
         acumuladoDocs += docsNaPagina;
+        acumuladoDesativados += desativadosNaPagina;
 
         setTotalImported(acumuladoProdutos);
         setTotalDocsWritten(acumuladoDocs);
 
         if (data.finalizado) {
           finalizado = true;
+          if (cleanRefresh) {
+            fetch('/api/catalog/refresh?async=true').catch(() => {});
+          }
           setIsFinished(true);
+          const desativadosSuffix =
+            acumuladoDesativados > 0
+              ? ` (${acumuladoDesativados} removido(s)/inativado(s) no Bling desativado(s))`
+              : '';
           setLastBatchInfo(
             acumuladoProdutos > 0
-              ? `Sincronização concluída! ${acumuladoProdutos} itens processados em ${acumuladoDocs} produtos no Firestore.`
+              ? `Sincronização concluída! ${acumuladoProdutos} itens processados em ${acumuladoDocs} produtos no Firestore${desativadosSuffix}.`
               : 'Nenhum produto ativo encontrado no Bling para sincronizar.'
           );
           break;
@@ -339,6 +362,23 @@ export function AdminBlingSyncPage() {
                   </div>
                 </div>
               )}
+
+              {/* Clean Forced Refresh Toggle */}
+              <label className="flex items-start gap-2.5 text-xs text-neutral-300 bg-[#0E0E0E] border border-white/10 rounded-md p-3 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={cleanRefresh}
+                  onChange={(e) => setCleanRefresh(e.target.checked)}
+                  disabled={isSyncing}
+                  className="mt-0.5 accent-[#E50914] cursor-pointer"
+                />
+                <span>
+                  <strong className="text-white block">Atualização limpa do Bling (recomendado)</strong>
+                  <span className="text-neutral-400">
+                    Substitui fotos alteradas no Bling, limpa cache antigo e desativa produtos excluídos.
+                  </span>
+                </span>
+              </label>
 
               {/* Actions */}
               <div className="flex flex-col sm:flex-row gap-3">

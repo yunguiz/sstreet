@@ -43,12 +43,11 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
       : '';
 
   const fullText = `${rawName} ${rawSku} ${rawDesc} ${variantTexts}`.trim();
+  const allCatalogText = `${rawName} ${rawSku} ${rawCat} ${rawSubcat} ${rawDesc} ${variantTexts}`.trim();
 
   // 0. Peças infantis e tamanhos infantis (ex: Camisa Compton Infantil Preta ou qualquer item infantil)
   if (
-    /\b(infantil|infant|juvenil|kids?|crianca|criancas|bebe|bebes)\b/i.test(
-      `${rawName} ${rawSku} ${rawCat} ${rawSubcat} ${rawDesc} ${variantTexts}`
-    )
+    /\b(infantil|infant|juvenil|kids?|crianca|criancas|bebe|bebes)\b/i.test(allCatalogText)
   ) {
     return true;
   }
@@ -108,13 +107,15 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
     return true;
   }
 
-  // 4. Meias e bonés da Chronic e da Tripside (manter bonés da New Era)
+  // 4. Todas as meias (qualquer marca/campo, preservando "meia malha", "meia estacao", "meia manga") e bonés Chronic/Tripside
   const isNewEra = /\bnew\s*era\b/i.test(`${rawName} ${rawSku} ${rawDesc}`);
-  const isChronicOrTripside = /\b(chronic|trip\s*side|tripside)\b/i.test(fullText);
+  const isChronicOrTripside = /\b(chronic|trip\s*side|tripside)\b/i.test(allCatalogText);
   const isBone = rawSubcat === 'bones' || /\bbones?\b/i.test(rawName);
-  const isMeia =
-    /\bmeias?\b/i.test(rawName) &&
-    !/\bmeia\s*(?:malha|estacao|manga)\b/i.test(rawName);
+  const textWithoutMeiaFalsePositives = allCatalogText.replace(
+    /\bmeia[\s-]+(?:malha|estacao|manga)\b/gi,
+    ' '
+  );
+  const isMeia = /\bmeias?\b/i.test(textWithoutMeiaFalsePositives);
 
   if (isMeia) {
     return true;
@@ -126,7 +127,20 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
     }
   }
 
-  // 5. Calça Cargo Oncros
+  // 5. Jaquetas de couro (inclui variações "jaqueta de couro", "jaqueta couro", "jaqueta de coro", "courino", "eco-couro")
+  if (
+    /\bjaqueta(?:s)?\b/i.test(allCatalogText) &&
+    /\b(couro|coro|courino|eco[\s-]*couro)\b/i.test(allCatalogText)
+  ) {
+    return true;
+  }
+
+  // 6. Todas as regatas
+  if (/\bregatas?\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 7. Calça Cargo Oncros
   if (
     /\bcalca\b/i.test(rawName) &&
     /\bcargo\b/i.test(rawName) &&
@@ -135,7 +149,7 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
     return true;
   }
 
-  // 6. Bermuda Canelada Alto Luxo Preta
+  // 8. Bermuda Canelada Alto Luxo Preta
   if (
     /\bbermuda\b/i.test(rawName) &&
     /\bcanelad[ao]\b/i.test(rawName) &&
@@ -144,28 +158,75 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
     return true;
   }
 
-  // 7. Bermuda Dri Fit
+  // 9. Todas as peças Dry Fit (qualquer variação/categoria/título com dry fit / dri fit)
+  if (/\b(dry[\s_-]*fit|dryfit|dri[\s_-]*fit|drifit)\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 10. Tudo que for da Zara
+  if (/\bzara\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 11. Qualquer item escrito skate longboard (ou longboard)
+  if (/\b(skate[\s_-]*long[\s_-]*board|long[\s_-]*board)\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 12. Qualquer item escrito prata
+  if (/\bprata\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 13. Qualquer item escrito lenco pixa-in / lencopicha-in ou variações próximas
   if (
-    /\bbermuda\b/i.test(rawName) &&
-    /\b(dri[\s-]?fit|drifit|dry[\s-]?fit|dryfit)\b/i.test(fullText)
+    /\b(?:lenc[o]?[\s_-]*pi(?:x|ch)a(?:[\s_-]*in)?|lencopixain|lencopichain|lenco[\s_-]*pixain|lenco[\s_-]*pichain|pi(?:x|ch)a[\s_-]*in)\b/i.test(
+      allCatalogText
+    )
   ) {
     return true;
   }
 
-  // 8. Camisetas Chronic / Tripside originais multi-cor
+  // 13b. Camisa/camiseta estonada (preserva calça baggy estonada)
+  if (/\bcamis(?:et)?a(?:s)?\b/i.test(allCatalogText) && /\bestonad[ao]s?\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 13c. Gola polo malha chinesa
   if (
+    /\bmalha\s*chinesa\b/i.test(allCatalogText) ||
+    (/\bgol[ao]\s*polo\b/i.test(allCatalogText) && /\bchinesa\b/i.test(allCatalogText))
+  ) {
+    return true;
+  }
+
+  // 13d. Camisa/camiseta canelada
+  if (/\bcamis(?:et)?a(?:s)?\b/i.test(allCatalogText) && /\bcanelad[ao]s?\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 13e. Oversized Louis Vitton / Louis Vuitton
+  if (/\blouis\s*(?:vui?tton|vitton|viton)\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 14. Chronic multi color e Camisetas Chronic / Tripside originais multi-cor
+  const isChronic = /\bchronic\b/i.test(allCatalogText);
+  const isMultiColor = /\b(multi[\s-]*(?:cor(?:es)?|color(?:ido|ida|s)?)|multicolor(?:ido|ida)?)\b/i.test(allCatalogText);
+  if (
+    (isChronic && isMultiColor) ||
     fullText.includes('cco500') ||
     (rawName.includes('chronic') &&
       (rawName.includes('tripside') || rawName.includes('trip side')) &&
       (rawName.includes('origina') || /\bcamis(?:et)?as?\b/i.test(rawName))) ||
     (isChronicOrTripside &&
       /\bcamis(?:et)?as?\b/i.test(rawName) &&
-      (/\bmulti[\s-]?cor\b/i.test(fullText) || /\borigina(?:l|is)\b/i.test(rawName)))
+      (isMultiColor || /\borigina(?:l|is)\b/i.test(rawName)))
   ) {
     return true;
   }
 
-  // 9. Legados ocultos mantidos (CSM500, Street Multimarcas, Hocks Montreal, Bermudas Carpinteiro/Raio Trip Side)
+  // 15. Legados ocultos mantidos (CSM500, Street Multimarcas, Hocks Montreal, Bermudas Carpinteiro/Raio Trip Side)
   if (
     fullText.includes('csm500') ||
     rawName.includes('street multimarca') ||

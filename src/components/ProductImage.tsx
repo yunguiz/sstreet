@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { sortPreferredProductImages } from '../lib/catalogVariants';
 
 export const STREET_STORE_FALLBACK_IMAGE = '/assets/streetstore-fallback.svg';
 
@@ -9,12 +10,14 @@ interface ProductImageProps extends Omit<React.ImgHTMLAttributes<HTMLImageElemen
   src?: string;
   candidates?: string[];
   fallbackSrc?: string;
+  priority?: boolean;
 }
 
 export const ProductImage: React.FC<ProductImageProps> = ({
   src,
   candidates,
   fallbackSrc = STREET_STORE_FALLBACK_IMAGE,
+  priority = false,
   alt = 'Street Store Oficial',
   className = '',
   onError,
@@ -24,15 +27,10 @@ export const ProductImage: React.FC<ProductImageProps> = ({
   ...rest
 }) => {
   const sources = useMemo(() => {
-    const raw = [...(src ? [src] : []), ...(Array.isArray(candidates) ? candidates : [])];
-    const unique: string[] = [];
-    for (const item of raw) {
-      const clean = typeof item === 'string' ? item.trim() : '';
-      if (clean && !unique.includes(clean)) {
-        unique.push(clean);
-      }
-    }
-    return unique;
+    return sortPreferredProductImages(
+      src ? [src] : [],
+      Array.isArray(candidates) ? candidates : []
+    );
   }, [src, candidates]);
 
   const sourcesKey = sources.join('|');
@@ -68,7 +66,8 @@ export const ProductImage: React.FC<ProductImageProps> = ({
       {...rest}
       src={activeSrc}
       alt={alt}
-      loading={loading}
+      loading={priority ? 'eager' : loading}
+      fetchPriority={priority ? 'high' : 'auto'}
       decoding={decoding}
       referrerPolicy={referrerPolicy}
       onError={handleError}

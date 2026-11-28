@@ -19,7 +19,7 @@ import {
 } from 'lucide-react';
 import { Product } from '../types';
 import { cleanDescription } from '../lib/cleanHtml';
-import { getImagesForColor, sortSizes } from '../lib/catalogVariants';
+import { getImagesForColor, sortPreferredProductImages, sortSizes } from '../lib/catalogVariants';
 import { calculateShippingQuotes, ShippingOption } from '../services/shipping';
 import { ProductImage } from './ProductImage';
 
@@ -82,28 +82,17 @@ export function ProductModal({
 
   const galleryImages = useMemo(() => {
     if (!product) return [];
-    const pool: string[] = [];
-    const pushUrl = (u?: string) => {
-      const clean = typeof u === 'string' ? u.trim() : '';
-      if (!clean || pool.includes(clean)) return;
-      pool.push(clean);
-    };
-
-    for (const img of product.images || []) pushUrl(img);
-    if (product.colorImages && typeof product.colorImages === 'object') {
-      for (const urls of Object.values(product.colorImages)) {
-        if (Array.isArray(urls)) {
-          for (const img of urls) pushUrl(img);
-        }
-      }
-    }
-    for (const v of product.variantsList || []) {
-      if (v.image) pushUrl(v.image);
-    }
-
-    const real = pool.filter((u) => !u.includes('streetstore-fallback'));
-    return real.length > 0 ? real : pool;
-  }, [product]);
+    const hasSelectedColor =
+      Boolean(selectedColor) &&
+      selectedColor.toLowerCase() !== 'cor única' &&
+      selectedColor.toLowerCase() !== 'cor unica';
+    const rawPool =
+      hasSelectedColor || selectableColors.length > 1
+        ? getImagesForColor(product, selectedColor)
+        : sortPreferredProductImages(product.images || []);
+    const real = rawPool.filter((u) => !u.includes('streetstore-fallback'));
+    return real.length > 0 ? real : rawPool;
+  }, [product, selectedColor, selectableColors.length]);
 
   const selectableSizes = useMemo(() => {
     if (!product) return [];
@@ -136,16 +125,6 @@ export function ProductModal({
     return product.stockCount ?? 0;
   }, [product, inStockVariants, selectedSize, selectedColor]);
 
-  const resolveImageIndexForColor = (colorName: string): number => {
-    if (!product || galleryImages.length === 0) return 0;
-    const colorImgs = getImagesForColor(product, colorName);
-    for (const url of colorImgs) {
-      const idx = galleryImages.indexOf(url);
-      if (idx >= 0) return idx;
-    }
-    return 0;
-  };
-
   // Synchronize selection whenever active product or initialColor changes
   useEffect(() => {
     if (product) {
@@ -155,7 +134,7 @@ export function ProductModal({
       const nextColor = matchedInitial || selectableColors[0]?.name || product.colors?.[0]?.name || 'Cor Única';
       setSelectedColor(nextColor);
       setSelectedSize(selectableSizes[0] || product.sizes?.[0] || 'Tamanho Único');
-      setSelectedImage(resolveImageIndexForColor(nextColor));
+      setSelectedImage(0);
       setShowSizeGuide(false);
       setQuantity(1);
       setIsLightboxOpen(false);
@@ -163,6 +142,13 @@ export function ProductModal({
       setIsHoverZooming(false);
     }
   }, [product?.id, initialColor]);
+
+  // Clamp selectedImage safely if color change reduces gallery length
+  useEffect(() => {
+    if (selectedImage >= galleryImages.length && galleryImages.length > 0) {
+      setSelectedImage(0);
+    }
+  }, [galleryImages.length, selectedImage]);
 
   // Keep selectedSize and quantity valid when color or available sizes update
   useEffect(() => {
@@ -218,8 +204,7 @@ export function ProductModal({
 
   const handleSelectColor = (colorName: string) => {
     setSelectedColor(colorName);
-    const matchingIdx = resolveImageIndexForColor(colorName);
-    setSelectedImage(matchingIdx);
+    setSelectedImage(0);
   };
 
   const handleMainImageMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -336,7 +321,7 @@ export function ProductModal({
                     setIsLightboxOpen(true);
                   }
                 }}
-                className="group/img relative aspect-square w-full rounded-xl overflow-hidden bg-[#181818] border border-zinc-800 cursor-zoom-in select-none"
+                className="group/img relative aspect-square w-full rounded-xl overflow-hidden bg-[#141414] border border-zinc-800 cursor-zoom-in select-none"
               >
                 <div
                   className="w-full h-full transition-transform duration-150 ease-out will-change-transform"
@@ -348,9 +333,9 @@ export function ProductModal({
                   <ProductImage
                     src={activeImageSrc}
                     candidates={galleryImages}
+                    priority
                     alt={`${product.name}${selectedColor && selectedColor !== 'Cor Única' ? ` - ${selectedColor}` : ''}`}
-                    loading="eager"
-                    className="w-full h-full object-cover object-center"
+                    className="w-full h-full object-contain object-center p-1.5"
                   />
                 </div>
 

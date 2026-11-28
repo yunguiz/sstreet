@@ -14,6 +14,7 @@ import {
   normalizeColorName,
   normalizeColorOptions,
   parseBlingVariantMeta,
+  sortPreferredProductImages,
   sortSizes,
   unifyProductsByColor,
 } from '../lib/catalogVariants';
@@ -26,14 +27,13 @@ interface CatalogSectionProps {
   onClearBrandFilter?: () => void;
   favorites: string[];
   isCatalogLive?: boolean;
+  isLoadingCatalog?: boolean;
   catalogCount?: number;
   onToggleFavorite: (productId: string) => void;
   onSelectCategory: (cat: ProductCategory | 'all', subcat?: string) => void;
   onOpenProduct: (product: Product, initialColor?: string) => void;
   onQuickAdd: (product: Product, preferredColor?: string) => void;
 }
-
-const DEFAULT_PRODUCT_IMAGE = '/assets/streetstore-fallback.svg';
 
 function getNumericBlingId(product: Product): number {
   const raw = String(product.integration?.blingId || product.id || '').replace(/\D/g, '');
@@ -89,12 +89,12 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
             ? parsedMeta.size
             : String(v.tamanho || parsedMeta?.size || 'Tamanho Único');
           const rawColor = parsedMeta?.color?.name || normalizeColorName(String(v.cor || ''));
-          const rawVarImg =
-            typeof v.imagemURL === 'string' && v.imagemURL.trim()
-              ? v.imagemURL.trim()
-              : typeof v.image === 'string' && v.image.trim()
-                ? v.image.trim()
-                : '';
+          const vImgs = sortPreferredProductImages(
+            Array.isArray(v.imagens) ? (v.imagens as string[]) : [],
+            typeof v.imagemURL === 'string' ? [v.imagemURL] : [],
+            typeof v.image === 'string' ? [v.image] : []
+          );
+          const rawVarImg = vImgs[0] || '';
           return {
             id: Number(v.blingId || 0) || 0,
             sku: String(v.codigo || ''),
@@ -103,6 +103,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
             size: sortSizes([rawSize])[0] || 'Tamanho Único',
             ...(rawColor ? { color: rawColor } : {}),
             ...(rawVarImg ? { image: rawVarImg } : {}),
+            ...(vImgs.length > 0 ? { images: vImgs } : {}),
           };
         })
       : undefined;
@@ -114,24 +115,13 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
   const directStock = Number.isFinite(rawStock) ? Math.max(0, rawStock) : 0;
   const stockCount = variantsList && variantsList.length > 0 ? variacoesStock : directStock;
 
-  const rawImages: string[] = [];
-  if (Array.isArray(data.imagens)) {
-    for (const img of data.imagens) {
-      if (typeof img === 'string' && img.trim()) rawImages.push(img.trim());
-    }
-  }
-  if (Array.isArray(data.images)) {
-    for (const img of data.images) {
-      if (typeof img === 'string' && img.trim() && !rawImages.includes(img.trim())) {
-        rawImages.push(img.trim());
-      }
-    }
-  }
-  if (typeof data.imagemURL === 'string' && data.imagemURL.trim() && !rawImages.includes(data.imagemURL.trim())) {
-    rawImages.unshift(data.imagemURL.trim());
-  }
-
-  const images = rawImages.length > 0 ? rawImages : [DEFAULT_PRODUCT_IMAGE];
+  const docImagens = Array.isArray(data.imagens) ? (data.imagens as string[]) : [];
+  const docImages = Array.isArray(data.images) ? (data.images as string[]) : [];
+  const fallbackCover =
+    docImagens.length === 0 && docImages.length === 0 && typeof data.imagemURL === 'string'
+      ? [data.imagemURL]
+      : [];
+  const images = sortPreferredProductImages(docImagens, docImages, fallbackCover);
 
   const inStockVariants = (variantsList || []).filter((v) => v.stock > 0);
   const activeVariantSizes = sortSizes(
@@ -164,6 +154,18 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
       : (rawColors.length > 0 ? rawColors : (fallbackTitleColor ? [fallbackTitleColor] : []))
   );
 
+  const colorImages: Record<string, string[]> = {};
+  for (const v of inStockVariants) {
+    if (!v.color) continue;
+    const vPool = sortPreferredProductImages(
+      Array.isArray((v as { images?: string[] }).images) ? (v as { images?: string[] }).images : [],
+      v.image ? [v.image] : []
+    );
+    if (vPool.length > 0) {
+      colorImages[v.color] = sortPreferredProductImages(colorImages[v.color] || [], vPool);
+    }
+  }
+
   const cleanedDesc =
     cleanDescription(String(data.descricao || data.description || '')) ||
     `${name} — Drop oficial Street Store com acabamento reforçado e envio rápido.`;
@@ -182,6 +184,7 @@ function mapFirestoreDocToProduct(docId: string, data: Record<string, unknown>):
     rating: Number((4.8 + (numericIdSeed % 3) / 10).toFixed(1)),
     reviewsCount: 14 + (numericIdSeed % 35),
     images,
+    ...(Object.keys(colorImages).length > 0 ? { colorImages } : {}),
     sizes: finalSizes,
     colors: finalColors,
     description: cleanedDesc,
@@ -223,6 +226,8 @@ export function CatalogSection({
   brandFilter,
   onClearBrandFilter,
   favorites,
+  isCatalogLive = false,
+  isLoadingCatalog = false,
   onToggleFavorite,
   onSelectCategory,
   onOpenProduct,
@@ -243,7 +248,10 @@ export function CatalogSection({
         snapshot.forEach((docSnap) => {
           const data = docSnap.data() as Record<string, unknown>;
           if (data?.ativo === false) return;
-          mapped.push(mapFirestoreDocToProduct(docSnap.id, data));
+          const prod = mapFirestoreDocToProduct(docSnap.id, data);
+          if ((prod.stockCount ?? 0) > 0) {
+            mapped.push(prod);
+          }
         });
         mapped.sort((a, b) => getNumericBlingId(b) - getNumericBlingId(a));
         const visibleSorted = filterVisibleProducts<Product>(mapped).map((p, idx) => ({
@@ -266,27 +274,38 @@ export function CatalogSection({
     return () => unsubscribe();
   }, []);
 
-  // Merge API & Firestore products so newest drops, complete inventory, and highest-resolution images always win
+  // When live Bling catalog is active, keep it authoritative so deleted/0-stock items are never resurrected from Firestore
   const catalogSourceProducts = useMemo(() => {
-    const mergedByKey = new Map<string, Product>();
     const getKey = (p: Product) =>
       String(p.integration?.blingId || p.id || '').replace(/^bling-/, '').trim() || p.name;
 
+    const firestoreByKey = new Map<string, Product>();
     for (const fp of firestoreProducts) {
-      mergedByKey.set(getKey(fp), fp);
+      firestoreByKey.set(getKey(fp), fp);
+    }
+
+    const mergedByKey = new Map<string, Product>();
+    if (!isCatalogLive) {
+      for (const fp of firestoreProducts) {
+        mergedByKey.set(getKey(fp), fp);
+      }
     }
 
     for (const ap of products) {
       const key = getKey(ap);
-      const existingFp = mergedByKey.get(key);
-      if (!existingFp) {
-        mergedByKey.set(key, ap);
-      } else {
-        const apiHasGood = ap.images?.some((u) => !isLowResOrBrokenImage(u));
-        const fpHasGood = existingFp.images?.some((u) => !isLowResOrBrokenImage(u));
+      const existingFp = firestoreByKey.get(key);
+      const apiSorted = sortPreferredProductImages(ap.images);
+      const apiHasGood = apiSorted.some((u) => !isLowResOrBrokenImage(u));
+      if (apiHasGood || !existingFp || isCatalogLive) {
         mergedByKey.set(key, {
           ...ap,
-          images: !apiHasGood && fpHasGood ? existingFp.images : ap.images,
+          images: apiSorted.length > 0 ? apiSorted : ap.images,
+        });
+      } else {
+        const fpSorted = sortPreferredProductImages(existingFp.images);
+        mergedByKey.set(key, {
+          ...ap,
+          images: fpSorted.length > 0 ? fpSorted : apiSorted,
         });
       }
     }
@@ -295,7 +314,7 @@ export function CatalogSection({
     return unifyProductsByColor(visibleMerged).sort(
       (a, b) => getNumericBlingId(b) - getNumericBlingId(a)
     );
-  }, [products, firestoreProducts]);
+  }, [products, firestoreProducts, isCatalogLive]);
 
   // Reset pagination whenever user changes category, subcategory, brand, or sort
   useEffect(() => {
@@ -435,14 +454,20 @@ export function CatalogSection({
 
         {/* Product Grid: 2-column mobile and 3/4 desktop */}
         <div className="pt-6 sm:pt-8">
-          {isLoadingFirestore && catalogSourceProducts.length === 0 ? (
-            <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-6">
-              {Array.from({ length: 8 }).map((_, idx) => (
-                <div
-                  key={idx}
-                  className="bg-[#121212] border border-[#222222] rounded-xl h-80 animate-pulse"
-                />
-              ))}
+          {(isLoadingCatalog || isLoadingFirestore) && catalogSourceProducts.length === 0 ? (
+            <div className="space-y-4">
+              <div className="flex items-center justify-center gap-2.5 text-xs font-bold uppercase tracking-widest text-zinc-400">
+                <span className="w-2 h-2 rounded-full bg-[#E50914] animate-ping" />
+                <span>Carregando catálogo...</span>
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3 sm:gap-6">
+                {Array.from({ length: 8 }).map((_, idx) => (
+                  <div
+                    key={idx}
+                    className="bg-[#121212] border border-[#222222] rounded-xl h-80 animate-pulse"
+                  />
+                ))}
+              </div>
             </div>
           ) : filteredProducts.length === 0 ? (
             <div className="py-16 text-center space-y-3 bg-[#111111] rounded-xl border border-dashed border-zinc-800 p-8">
@@ -494,6 +519,7 @@ export function CatalogSection({
                     <ProductCard
                       product={product}
                       isFavorited={favorites.includes(product.id)}
+                      priority={idx < 4}
                       onToggleFavorite={onToggleFavorite}
                       onOpenDetails={onOpenProduct}
                       onQuickAdd={onQuickAdd}

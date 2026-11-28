@@ -1,5 +1,3 @@
-import fs from 'fs';
-import path from 'path';
 import { ensureBlingAuthorized, fetchFromBling } from './server-bling.js';
 import {
   isBlingDailyQuotaExceeded,
@@ -9,13 +7,8 @@ import {
 } from './lib/blingToken.js';
 import type { Product } from './src/types/index.js';
 
-const BUNDLED_IMAGES_STORE_FILE = path.resolve(process.cwd(), '.bling_product_images.json');
-const IMAGES_STORE_FILE = process.env.VERCEL
-  ? path.resolve('/tmp', '.bling_product_images.json')
-  : BUNDLED_IMAGES_STORE_FILE;
-
-const IMAGE_STORE_VERSION = 3;
-const DETAIL_CHECK_COOLDOWN_MS = 12 * 60 * 60 * 1000;
+const IMAGE_STORE_VERSION = 5;
+const DETAIL_CHECK_COOLDOWN_MS = 45 * 1000;
 
 export interface BlingImageStore {
   version?: number;
@@ -24,6 +17,7 @@ export interface BlingImageStore {
   byName: Record<string, string[]>;
   byId: Record<string, string[]>;
   checkedAtById?: Record<string, number>;
+  summaryKeyById?: Record<string, string>;
 }
 
 let cachedImageStore: BlingImageStore | null = null;
@@ -33,27 +27,52 @@ export function getLastBlingImageSyncTime(): number {
   return lastSyncCompletedAt;
 }
 
-function isManualLocalUpload(url: string): boolean {
-  const u = (url || '').trim();
-  return u.startsWith('/assets/uploads/') || u.startsWith('/assets/aistudio/');
+export function getImageStoreSnapshot(): BlingImageStore {
+  return loadImageStore();
+}
+
+export function isExpiredPresignedUrl(url?: string): boolean {
+  const clean = String(url || '').trim();
+  if (!clean || !clean.startsWith('http')) return false;
+  try {
+    const parsed = new URL(clean);
+    const expiresParam = parsed.searchParams.get('Expires');
+    if (expiresParam) {
+      const expSec = Number(expiresParam);
+      if (Number.isFinite(expSec) && expSec > 0 && expSec * 1000 <= Date.now()) {
+        return true;
+      }
+    }
+    const amzDate = parsed.searchParams.get('X-Amz-Date');
+    const amzExpires = parsed.searchParams.get('X-Amz-Expires');
+    if (amzDate && amzExpires) {
+      const m = amzDate.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+      if (m) {
+        const startMs = Date.UTC(
+          Number(m[1]),
+          Number(m[2]) - 1,
+          Number(m[3]),
+          Number(m[4]),
+          Number(m[5]),
+          Number(m[6])
+        );
+        const ttlSec = Number(amzExpires);
+        if (Number.isFinite(ttlSec) && startMs + ttlSec * 1000 <= Date.now()) {
+          return true;
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return false;
 }
 
 /**
- * Clears the cached Bling image store (preserving manual local file uploads by default)
- * and resets sync timestamp so original high-res images are re-fetched cleanly.
+ * Clears the in-memory Bling image store and resets sync timestamp
+ * so original high-res images are re-fetched live from Bling.
  */
-export function clearImageCache(preserveManualUploads: boolean = true): BlingImageStore {
-  const prev = cachedImageStore || (() => {
-    try {
-      if (fs.existsSync(IMAGES_STORE_FILE)) {
-        return JSON.parse(fs.readFileSync(IMAGES_STORE_FILE, 'utf-8'));
-      }
-    } catch {
-      // ignore
-    }
-    return null;
-  })();
-
+export function clearImageCache(_preserveManualUploads: boolean = false): BlingImageStore {
   const fresh: BlingImageStore = {
     version: IMAGE_STORE_VERSION,
     updatedAt: new Date().toISOString(),
@@ -61,52 +80,18 @@ export function clearImageCache(preserveManualUploads: boolean = true): BlingIma
     byName: {},
     byId: {},
     checkedAtById: {},
+    summaryKeyById: {},
   };
-
-  if (preserveManualUploads && prev) {
-    for (const bucket of ['bySku', 'byName', 'byId'] as const) {
-      const src = prev[bucket] || {};
-      for (const [k, urls] of Object.entries(src)) {
-        if (Array.isArray(urls)) {
-          const kept = urls.filter((u) => typeof u === 'string' && isManualLocalUpload(u));
-          if (kept.length > 0) fresh[bucket][k] = kept;
-        }
-      }
-    }
-  }
 
   lastSyncCompletedAt = 0;
   saveImageStore(fresh);
-  console.log('[Bling Images] Image cache cleared cleanly (high-res schema v2).');
+  console.log('[Bling Images] In-memory image cache cleared cleanly.');
   return fresh;
 }
 
 export function loadImageStore(): BlingImageStore {
   if (cachedImageStore && cachedImageStore.version === IMAGE_STORE_VERSION) {
     return cachedImageStore;
-  }
-  try {
-    const sourceFile = fs.existsSync(IMAGES_STORE_FILE)
-      ? IMAGES_STORE_FILE
-      : (fs.existsSync(BUNDLED_IMAGES_STORE_FILE) ? BUNDLED_IMAGES_STORE_FILE : null);
-    if (sourceFile) {
-      const raw = fs.readFileSync(sourceFile, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (parsed.version !== IMAGE_STORE_VERSION) {
-        return clearImageCache(true);
-      }
-      cachedImageStore = {
-        version: parsed.version,
-        updatedAt: parsed.updatedAt || new Date().toISOString(),
-        bySku: parsed.bySku || {},
-        byName: parsed.byName || {},
-        byId: parsed.byId || {},
-        checkedAtById: parsed.checkedAtById || {},
-      };
-      return cachedImageStore;
-    }
-  } catch (err) {
-    console.warn('[Bling Images] Could not read image store file:', err);
   }
 
   cachedImageStore = {
@@ -116,19 +101,59 @@ export function loadImageStore(): BlingImageStore {
     byName: {},
     byId: {},
     checkedAtById: {},
+    summaryKeyById: {},
   };
   return cachedImageStore;
 }
 
 export function saveImageStore(store: BlingImageStore): void {
   store.version = IMAGE_STORE_VERSION;
-  cachedImageStore = store;
   store.updatedAt = new Date().toISOString();
-  try {
-    fs.writeFileSync(IMAGES_STORE_FILE, JSON.stringify(store, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[Bling Images] Could not save image store file:', err);
+  cachedImageStore = store;
+}
+
+export function removeProductFromImageStore(identifier: {
+  id?: string | number;
+  sku?: string;
+  name?: string;
+}): boolean {
+  const store = loadImageStore();
+  let changed = false;
+  if (identifier.id !== undefined && identifier.id !== null) {
+    const idKey = String(identifier.id).trim();
+    if (idKey) {
+      if (store.byId[idKey]) {
+        delete store.byId[idKey];
+        changed = true;
+      }
+      if (store.checkedAtById?.[idKey]) {
+        delete store.checkedAtById[idKey];
+        changed = true;
+      }
+      if (store.summaryKeyById?.[idKey]) {
+        delete store.summaryKeyById[idKey];
+        changed = true;
+      }
+    }
   }
+  if (identifier.sku) {
+    const skuKey = String(identifier.sku).toUpperCase().trim();
+    if (skuKey && store.bySku[skuKey]) {
+      delete store.bySku[skuKey];
+      changed = true;
+    }
+  }
+  if (identifier.name) {
+    const nameKey = normalizeProductName(identifier.name);
+    if (nameKey && store.byName[nameKey]) {
+      delete store.byName[nameKey];
+      changed = true;
+    }
+  }
+  if (changed) {
+    saveImageStore(store);
+  }
+  return changed;
 }
 
 export function isLegacyExternalUrl(url?: string): boolean {
@@ -141,11 +166,11 @@ export function isPlaceholderImageUrl(url?: string): boolean {
   if (!url || typeof url !== 'string') return true;
   const u = url.trim().toLowerCase();
   if (!u) return true;
-  if (u.includes('unsplash.com')) return true;
+  if (u.includes('unsplash.com') || u.includes('streetstore-fallback') || u.includes('placeholder')) return true;
   if (
-    u.startsWith('/src/assets/images/product_') ||
-    u.startsWith('/src/assets/images/lookview_') ||
-    u.startsWith('/src/assets/images/hero_')
+    u.startsWith('/src/assets/') ||
+    u.startsWith('/assets/uploads/') ||
+    u.startsWith('/assets/aistudio/')
   ) {
     return true;
   }
@@ -215,19 +240,23 @@ export function isThumbnailLikeUrl(url: string): boolean {
     u.includes('_thumb.') ||
     u.includes('-thumb.') ||
     u.includes('_mini.') ||
-    u.includes('-mini.')
+    u.includes('-mini.') ||
+    /-(?:50|100|150|200|240|250|300|320|480)-\d+\.(?:jpe?g|png|webp|avif)/i.test(u)
   ) {
     return true;
   }
-  // Bling S3 thumbnails live under /<tenant>/t/<hash> while full-res originals omit /t/
+  // Bling S3 thumbnails live under /<tenant>/t/<hash> or /p/<hash> while full-res originals omit /t/ & /p/
   if (u.includes('orgbling.s3.amazonaws.com') || u.includes('bling.com')) {
     try {
       const parsed = new URL(u);
-      if (/\/t\/[^/]+$/i.test(parsed.pathname) || /\/t\/[a-z0-9_-]{8,}/i.test(parsed.pathname)) {
+      if (
+        /\/(?:t|p|m)\/[^/]+$/i.test(parsed.pathname) ||
+        /\/(?:t|p|m)\/[a-z0-9_-]{8,}/i.test(parsed.pathname)
+      ) {
         return true;
       }
     } catch {
-      if (/\/t\/[a-z0-9_-]{8,}/i.test(u)) return true;
+      if (/\/(?:t|p|m)\/[a-z0-9_-]{8,}/i.test(u)) return true;
     }
   }
   return false;
@@ -250,7 +279,7 @@ const AUTH_SIGNATURE_PARAMS = new Set([
  * Produces a canonical comparison key for image deduplication so the exact same
  * Bling S3 object with different Expires/Signature timestamps isn't saved multiple times.
  */
-function getCanonicalImageKey(url: string): string {
+export function getCanonicalImageKey(url: string): string {
   const clean = (url || '').trim();
   if (!clean || clean.startsWith('data:image') || clean.startsWith('/')) return clean;
   try {
@@ -334,8 +363,6 @@ function extractImagesFromSingleObject(
   };
 
   if (!allowThumbnailFallback) {
-    // PRIMARY PASS: High-resolution original URLs ONLY (never read linkMiniatura or thumbnail here)
-    // 1. item.midia.imagens.internas[x].link & externas[x].link first
     if (item.midia) {
       const imagens = item.midia.imagens;
       if (Array.isArray(imagens)) {
@@ -369,7 +396,6 @@ function extractImagesFromSingleObject(
       }
     }
 
-    // 2. item.imagens (nested internas/externas or array)
     if (Array.isArray(item.imagens)) {
       pushArray(item.imagens, false);
     } else if (item.imagens && typeof item.imagens === 'object') {
@@ -378,23 +404,19 @@ function extractImagesFromSingleObject(
       if (Array.isArray(item.imagens.imagensURL)) pushArray(item.imagens.imagensURL, false);
     }
 
-    // 3. Standard Bling direct URL fields (high-res only)
     push(item.imagemURL, false);
     push(item.urlImagem, false);
     push(item.imagem, false);
 
-    // 4. item.anexos / item.anexo
     if (Array.isArray(item.anexos)) pushArray(item.anexos, false);
     if (item.anexo) push(item.anexo, false);
 
-    // 5. item.fotos
     if (Array.isArray(item.fotos)) {
       pushArray(item.fotos, false);
     } else if (item.fotos && typeof item.fotos === 'object' && Array.isArray(item.fotos.foto)) {
       pushArray(item.fotos.foto, false);
     }
   } else {
-    // LAST-RESORT FALLBACK PASS: Only executed if zero .link / original high-res URLs were found anywhere
     if (item.midia?.imagens && typeof item.midia.imagens === 'object' && !Array.isArray(item.midia.imagens)) {
       if (Array.isArray(item.midia.imagens.internas)) {
         const sortedInternas = [...item.midia.imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
@@ -437,60 +459,47 @@ export function extractImagesFromBlingItem(rawItem: any, includeVariations: bool
 
   if (includeVariations && Array.isArray(item.variacoes)) {
     for (const v of item.variacoes) {
+      if (v?.situacao === 'I' || v?.situacao === 'E') continue;
       extractImagesFromSingleObject(v, highResUrls, false);
     }
   }
 
-  // Filter out thumbnail-like URLs if true full-res URLs are present
-  const nonThumbHighRes = highResUrls.filter(u => !isThumbnailLikeUrl(u));
+  const nonThumbHighRes = highResUrls.filter(u => !isThumbnailLikeUrl(u) && !isExpiredPresignedUrl(u));
   if (nonThumbHighRes.length > 0) {
     return nonThumbHighRes;
   }
-  if (highResUrls.length > 0) {
-    return highResUrls;
+  const nonExpiredHighRes = highResUrls.filter(u => !isExpiredPresignedUrl(u));
+  if (nonExpiredHighRes.length > 0) {
+    return nonExpiredHighRes;
   }
 
-  // Last resort fallback to linkMiniatura / thumbnail ONLY if no .link / original URL exists
   const fallbackUrls: string[] = [];
   extractImagesFromSingleObject(item, fallbackUrls, true);
   if (includeVariations && Array.isArray(item.variacoes)) {
     for (const v of item.variacoes) {
+      if (v?.situacao === 'I' || v?.situacao === 'E') continue;
       extractImagesFromSingleObject(v, fallbackUrls, true);
     }
   }
 
-  return fallbackUrls;
+  return fallbackUrls.filter(u => !isExpiredPresignedUrl(u));
 }
 
-function mergeImageArrays(existing: string[] | undefined, incoming: string[]): string[] {
+function replaceWithIncomingImages(incoming: string[]): string[] {
   const cleanedIncoming = incoming
     .map(u => stripResizeAndCompressionParams(u))
-    .filter(Boolean);
-  const cleanedExisting = (Array.isArray(existing) ? existing : [])
-    .map(u => stripResizeAndCompressionParams(u))
-    .filter(img => Boolean(img) && !isPlaceholderImageUrl(img) && !isLegacyExternalUrl(img));
+    .filter(img => Boolean(img) && !isPlaceholderImageUrl(img) && !isExpiredPresignedUrl(img));
 
   const incomingHasFullRes = cleanedIncoming.some(u => !isThumbnailLikeUrl(u));
-  const existingHasFullRes = cleanedExisting.some(u => !isThumbnailLikeUrl(u));
-  const preferFullResOnly = incomingHasFullRes || existingHasFullRes;
-
   const result: string[] = [];
   const seenKeys = new Set<string>();
-  const addUnique = (img: string) => {
-    if (!img) return;
-    if (preferFullResOnly && isThumbnailLikeUrl(img)) return;
+  for (const img of cleanedIncoming) {
+    if (incomingHasFullRes && isThumbnailLikeUrl(img)) continue;
     const key = getCanonicalImageKey(img);
     if (!seenKeys.has(key)) {
       seenKeys.add(key);
       result.push(img);
     }
-  };
-
-  for (const img of cleanedIncoming) {
-    addUnique(img);
-  }
-  for (const img of cleanedExisting) {
-    addUnique(img);
   }
   return result.slice(0, 12);
 }
@@ -501,30 +510,32 @@ function mergeImageArrays(existing: string[] | undefined, incoming: string[]): s
 export function applyImageRecordToStore(
   store: BlingImageStore,
   identifier: { sku?: string; name?: string; id?: string | number; parentId?: string | number },
-  images: string[]
+  images: string[],
+  _options?: { replaceRemoteBling?: boolean }
 ): boolean {
   if (!images || images.length === 0) return false;
   const validImages = images
     .map(u => normalizeImageUrl(u, true))
-    .filter((u): u is string => Boolean(u) && !isPlaceholderImageUrl(u!));
+    .filter((u): u is string => Boolean(u) && !isPlaceholderImageUrl(u!) && !isExpiredPresignedUrl(u!));
 
-  if (validImages.length === 0) return false;
+  const replaced = replaceWithIncomingImages(validImages);
+  if (replaced.length === 0) return false;
 
   if (identifier.sku) {
     const s = String(identifier.sku).toUpperCase().trim();
-    if (s) store.bySku[s] = mergeImageArrays(store.bySku[s], validImages);
+    if (s) store.bySku[s] = [...replaced];
   }
   if (identifier.id) {
     const i = String(identifier.id).trim();
-    if (i) store.byId[i] = mergeImageArrays(store.byId[i], validImages);
+    if (i) store.byId[i] = [...replaced];
   }
   if (identifier.parentId) {
     const pid = String(identifier.parentId).trim();
-    if (pid) store.byId[pid] = mergeImageArrays(store.byId[pid], validImages);
+    if (pid) store.byId[pid] = [...replaced];
   }
   if (identifier.name) {
     const n = normalizeProductName(identifier.name);
-    if (n) store.byName[n] = mergeImageArrays(store.byName[n], validImages);
+    if (n) store.byName[n] = [...replaced];
   }
 
   return true;
@@ -535,10 +546,11 @@ export function applyImageRecordToStore(
  */
 export function recordProductImage(
   identifier: { sku?: string; name?: string; id?: string | number; parentId?: string | number },
-  images: string[]
+  images: string[],
+  options?: { replaceRemoteBling?: boolean }
 ): void {
   const store = loadImageStore();
-  if (applyImageRecordToStore(store, identifier, images)) {
+  if (applyImageRecordToStore(store, identifier, images, options)) {
     saveImageStore(store);
   }
 }
@@ -552,7 +564,12 @@ export function getBlingImagesForProduct(product: Partial<Product> | any): strin
   const sanitizeUrls = (urls?: string[]): string[] | null => {
     if (!urls || urls.length === 0) return null;
     const cleaned = urls
-      .filter((u): u is string => typeof u === 'string' && u.trim().length > 0 && !isPlaceholderImageUrl(u))
+      .filter((u): u is string =>
+        typeof u === 'string' &&
+        u.trim().length > 0 &&
+        !isPlaceholderImageUrl(u) &&
+        !isExpiredPresignedUrl(u)
+      )
       .map(u => stripResizeAndCompressionParams(u));
     if (cleaned.length === 0) return null;
     const fullRes = cleaned.filter(u => !isThumbnailLikeUrl(u));
@@ -607,7 +624,6 @@ export function getBlingImagesForProduct(product: Partial<Product> | any): strin
       if (clean) return clean;
     }
 
-    // Substring / fuzzy match across stored names (only when both names are descriptive >= 8 chars)
     if (n.length >= 8) {
       for (const [storedName, imgs] of Object.entries(store.byName)) {
         if (imgs.length > 0 && storedName.length >= 8 && (n.includes(storedName) || storedName.includes(n))) {
@@ -622,33 +638,60 @@ export function getBlingImagesForProduct(product: Partial<Product> | any): strin
 }
 
 /**
- * Injects real Bling images into products array, giving them top priority and eliminating placeholders
+ * Replaces product images strictly with active Bling images (never merging stale cached URLs).
  */
-export function applyBlingImageOverrides<T extends { images?: string[]; [key: string]: any } = Product>(products: T[]): T[] {
+export function applyBlingImageOverrides<T extends { images?: string[]; [key: string]: any } = Product>(
+  products: T[],
+  options?: { preferStore?: boolean }
+): T[] {
   return products.map(product => {
-    const realImages = getBlingImagesForProduct(product);
+    const existingClean = replaceWithIncomingImages(
+      Array.isArray(product.images) ? product.images : []
+    );
+    const existingFullRes = existingClean.filter((img: string) => !isThumbnailLikeUrl(img) && !isLegacyExternalUrl(img));
+
+    const realImagesRaw = getBlingImagesForProduct(product);
+    const realImages = realImagesRaw ? replaceWithIncomingImages(realImagesRaw) : null;
     if (realImages && realImages.length > 0) {
-      const hasNativeBling = realImages.some(u => !isLegacyExternalUrl(u));
-      const hasFullRes = realImages.some(u => !isThumbnailLikeUrl(u));
-      const existingReal = Array.isArray(product.images)
-        ? product.images
-            .filter((img: string) =>
-              !isPlaceholderImageUrl(img) &&
-              (!hasNativeBling || !isLegacyExternalUrl(img)) &&
-              (!hasFullRes || !isThumbnailLikeUrl(img))
-            )
-            .map((img: string) => stripResizeAndCompressionParams(img))
-        : [];
-      const combined = [
-        ...realImages,
-        ...existingReal.filter((img: string) => !realImages.includes(img))
-      ];
+      if (options?.preferStore) {
+        return {
+          ...product,
+          images: realImages,
+        };
+      }
+
+      const realCanonicalSet = new Set(realImages.map(getCanonicalImageKey));
+      const existingHasNewLivePhoto = existingFullRes.some(
+        (u) => !realCanonicalSet.has(getCanonicalImageKey(u))
+      );
+
+      if (existingHasNewLivePhoto || product._liveDetailFetched) {
+        return {
+          ...product,
+          images: existingFullRes.length > 0 ? existingFullRes : realImages,
+        };
+      }
+
+      if (existingFullRes.length === 1 && realImages.length > 1) {
+        return {
+          ...product,
+          images: realImages,
+        };
+      }
+
+      if (existingFullRes.length > 0) {
+        return {
+          ...product,
+          images: existingFullRes,
+        };
+      }
+
       return {
         ...product,
-        images: combined
+        images: realImages,
       };
     }
-    return product;
+    return existingClean.length > 0 ? { ...product, images: existingClean } : product;
   });
 }
 
@@ -667,22 +710,19 @@ export function setCatalogFetchInProgress(val: boolean): void {
   catalogFetchInProgress = val;
 }
 
-/**
- * Synchronizes all internal/external images directly from Bling ERP API v3.
- * Queries /produtos to list all products and calls GET /produtos/{id} on each unique product
- * to extract data.midia.imagens.internas (.link / .linkMiniatura), data.midia.imagens.externas (.link), and imagemURL.
- */
-const MIN_IMAGE_SYNC_COOLDOWN_MS = 2 * 60 * 1000;
+const MIN_IMAGE_SYNC_COOLDOWN_MS = 30 * 1000;
 
 export async function syncImagesFromBling(options?: {
   maxDetailFetches?: number;
   clearCache?: boolean;
+  forceRefresh?: boolean;
   onBatchSaved?: () => void;
 }): Promise<{
   success: boolean;
   updatedCount: number;
   detailedFetched: number;
   totalWithImages: number;
+  prunedDeletedCount?: number;
   sources: { bling: number };
   connected: boolean;
   message: string;
@@ -692,7 +732,9 @@ export async function syncImagesFromBling(options?: {
     return activeSyncPromise;
   }
 
-  if (!options?.clearCache && lastSyncCompletedAt > 0 && Date.now() - lastSyncCompletedAt < MIN_IMAGE_SYNC_COOLDOWN_MS) {
+  const bypassCache = Boolean(options?.clearCache || options?.forceRefresh);
+
+  if (!bypassCache && lastSyncCompletedAt > 0 && Date.now() - lastSyncCompletedAt < MIN_IMAGE_SYNC_COOLDOWN_MS) {
     const store = loadImageStore();
     const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
     return {
@@ -723,9 +765,11 @@ export async function syncImagesFromBling(options?: {
   activeSyncPromise = (async () => {
     const store = options?.clearCache ? clearImageCache(true) : loadImageStore();
     if (!store.checkedAtById) store.checkedAtById = {};
+    if (!store.summaryKeyById) store.summaryKeyById = {};
     let blingCount = 0;
     let detailedFetched = 0;
-    const maxDetailFetches = options?.maxDetailFetches ?? (options?.clearCache ? 200 : 40);
+    let prunedDeletedCount = 0;
+    const maxDetailFetches = options?.maxDetailFetches ?? (bypassCache ? 200 : 45);
 
     if (isBlingDailyQuotaExceeded()) {
       const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
@@ -759,7 +803,9 @@ export async function syncImagesFromBling(options?: {
       console.log('[Bling Image Sync] Querying Bling API v3 /produtos to collect all active product IDs...');
       const allItems: any[] = [];
       const seenItemIds = new Set<number>();
+      const activeIdAndParentStrings = new Set<string>();
       const MAX_ITEMS = 10000;
+      let reachedCleanListEnd = true;
 
       const pushUniqueItems = (items: any[]) => {
         for (const it of items) {
@@ -767,14 +813,21 @@ export async function syncImagesFromBling(options?: {
           if (it?.id && !seenItemIds.has(it.id) && allItems.length < MAX_ITEMS) {
             seenItemIds.add(it.id);
             allItems.push(it);
+            activeIdAndParentStrings.add(String(it.id));
+            if (it.idProdutoPai) activeIdAndParentStrings.add(String(it.idProdutoPai));
           }
         }
       };
 
-      // Prioritize newest registered products first (criterio=1, pages 1..2)
       for (let p = 1; p <= 2 && allItems.length < MAX_ITEMS; p++) {
-        if (isBlingDailyQuotaExceeded()) break;
-        const latestPage = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=1&tipo=T`);
+        if (isBlingDailyQuotaExceeded()) {
+          reachedCleanListEnd = false;
+          break;
+        }
+        const latestPage = await fetchFromBling(
+          `/produtos?pagina=${p}&limite=100&criterio=1&tipo=T`,
+          bypassCache ? ({ bypassCache: true } as any) : {}
+        );
         const latestItems = latestPage?.data || [];
         if (latestItems.length === 0) break;
         pushUniqueItems(latestItems);
@@ -783,8 +836,14 @@ export async function syncImagesFromBling(options?: {
       }
 
       for (let p = 1; p <= 100 && allItems.length < MAX_ITEMS; p++) {
-        if (isBlingDailyQuotaExceeded()) break;
-        const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2&tipo=T`);
+        if (isBlingDailyQuotaExceeded()) {
+          reachedCleanListEnd = false;
+          break;
+        }
+        const pageData = await fetchFromBling(
+          `/produtos?pagina=${p}&limite=100&criterio=2&tipo=T`,
+          bypassCache ? ({ bypassCache: true } as any) : {}
+        );
         const items = pageData?.data || [];
         if (items.length === 0) break;
         pushUniqueItems(items);
@@ -794,20 +853,37 @@ export async function syncImagesFromBling(options?: {
 
       console.log(`[Bling Image Sync] Listed ${allItems.length} Bling items. Extracting summary & preparing GET /produtos/{id} detail sync...`);
 
-      // Collect unique parent/standalone product IDs first (in Bling v3, GET /produtos/{id} returns full midia.imagens.internas + variacoes)
       const detailTargetMap = new Map<number, any>();
       const childItems: any[] = [];
+      const changedSummaryIds = new Set<number>();
 
       for (const item of allItems) {
-        // Save ONLY non-thumbnail URLs from /produtos list summary; /t/ thumbnails await GET /produtos/{id} full-res .link
-        const listImgs = extractImagesFromBlingItem(item).filter(u => !isThumbnailLikeUrl(u));
-        if (listImgs.length > 0) {
-          applyImageRecordToStore(store, {
-            sku: item.codigo,
-            id: item.id,
-            parentId: item.idProdutoPai,
-            name: item.nome
-          }, listImgs);
+        const summaryExtracted = extractImagesFromBlingItem(item);
+        const summarySignature = summaryExtracted.map(getCanonicalImageKey).slice(0, 3).join('|');
+        const idStr = item.id ? String(item.id) : '';
+        const prevSignature = idStr ? store.summaryKeyById[idStr] : '';
+        const summaryChanged = Boolean(idStr && summarySignature && prevSignature && summarySignature !== prevSignature);
+
+        if (summaryChanged && item.id) {
+          changedSummaryIds.add(item.id);
+          if (item.idProdutoPai) changedSummaryIds.add(Number(item.idProdutoPai));
+        }
+        if (idStr && summarySignature) {
+          store.summaryKeyById[idStr] = summarySignature;
+        }
+
+        const listImgs = summaryExtracted.filter(u => !isThumbnailLikeUrl(u) && !isExpiredPresignedUrl(u));
+        const hasDetailInStore = Boolean(idStr && store.byId[idStr]?.length && store.checkedAtById?.[idStr]);
+        if (listImgs.length > 0 && (!hasDetailInStore || summaryChanged || bypassCache || listImgs.length >= 2)) {
+          applyImageRecordToStore(
+            store,
+            {
+              sku: item.codigo,
+              id: item.id,
+              name: item.nome
+            },
+            listImgs
+          );
         }
 
         if (item.id && !item.idProdutoPai) {
@@ -817,7 +893,6 @@ export async function syncImagesFromBling(options?: {
         }
       }
 
-      // If any child item references a parent ID not present in page results, ensure parent ID is fetched too
       for (const child of childItems) {
         if (child.idProdutoPai && !detailTargetMap.has(child.idProdutoPai)) {
           detailTargetMap.set(child.idProdutoPai, {
@@ -825,6 +900,18 @@ export async function syncImagesFromBling(options?: {
             nome: child.nome,
             codigo: child.codigo
           });
+        }
+      }
+
+      // Prune deleted/inactivated Bling IDs from image store when full crawl completed cleanly
+      if (reachedCleanListEnd && activeIdAndParentStrings.size > 0) {
+        for (const storedId of Object.keys(store.byId)) {
+          if (!activeIdAndParentStrings.has(storedId)) {
+            delete store.byId[storedId];
+            delete store.checkedAtById[storedId];
+            delete store.summaryKeyById[storedId];
+            prunedDeletedCount++;
+          }
         }
       }
 
@@ -838,28 +925,48 @@ export async function syncImagesFromBling(options?: {
           ...(skuKey ? store.bySku[skuKey] || [] : []),
         ];
         return pools.some(
-          (u) => typeof u === 'string' && !isPlaceholderImageUrl(u) && !isLegacyExternalUrl(u) && !isThumbnailLikeUrl(u)
+          (u) =>
+            typeof u === 'string' &&
+            !isPlaceholderImageUrl(u) &&
+            !isLegacyExternalUrl(u) &&
+            !isThumbnailLikeUrl(u) &&
+            !isExpiredPresignedUrl(u)
         );
       };
 
       const nowTs = Date.now();
       const allTargets = Array.from(detailTargetMap.values());
-      const missingFullResTargets = allTargets.filter((t) => {
-        if (hasFullResInStore(t)) return false;
-        if (!options?.clearCache) {
-          const lastChecked = store.checkedAtById?.[String(t.id)] || 0;
-          if (nowTs - lastChecked < DETAIL_CHECK_COOLDOWN_MS) return false;
+      const missingOrStaleTargets = allTargets.filter((t) => {
+        if (changedSummaryIds.has(Number(t.id))) return true;
+        if (!hasFullResInStore(t)) {
+          if (!bypassCache) {
+            const lastChecked = store.checkedAtById?.[String(t.id)] || 0;
+            if (nowTs - lastChecked < DETAIL_CHECK_COOLDOWN_MS) return false;
+          }
+          return true;
         }
-        return true;
+        const lastChecked = store.checkedAtById?.[String(t.id)] || 0;
+        return nowTs - lastChecked >= DETAIL_CHECK_COOLDOWN_MS;
       });
       const detailTargets = (
-        options?.clearCache ? allTargets : missingFullResTargets
+        bypassCache ? allTargets : missingOrStaleTargets
       )
-        .sort((a, b) => Number(b?.id || 0) - Number(a?.id || 0))
+        .sort((a, b) => {
+          const aChanged = changedSummaryIds.has(Number(a?.id)) ? 1 : 0;
+          const bChanged = changedSummaryIds.has(Number(b?.id)) ? 1 : 0;
+          if (aChanged !== bChanged) return bChanged - aChanged;
+          const aHas = hasFullResInStore(a) ? 1 : 0;
+          const bHas = hasFullResInStore(b) ? 1 : 0;
+          if (aHas !== bHas) return aHas - bHas;
+          const aChecked = store.checkedAtById?.[String(a?.id)] || 0;
+          const bChecked = store.checkedAtById?.[String(b?.id)] || 0;
+          if (aChecked !== bChecked) return aChecked - bChecked;
+          return Number(b?.id || 0) - Number(a?.id || 0);
+        })
         .slice(0, maxDetailFetches);
 
       console.log(
-        `[Bling Image Sync] Fetching GET /produtos/{id} for ${detailTargets.length} products (${missingFullResTargets.length} missing full-res, ${allTargets.length} total parents)...`
+        `[Bling Image Sync] Fetching GET /produtos/{id} for ${detailTargets.length} products (${changedSummaryIds.size} with photo change, ${missingOrStaleTargets.length} stale/missing, ${allTargets.length} total parents)...`
       );
 
       const parentsWithImages = new Set<number>();
@@ -871,27 +978,31 @@ export async function syncImagesFromBling(options?: {
         }
         const item = detailTargets[idx];
         try {
-          const detail = await fetchFromBling(`/produtos/${item.id}`);
+          const detail = await fetchFromBling(
+            `/produtos/${item.id}`,
+            bypassCache ? ({ bypassCache: true } as any) : {}
+          );
           const fullData = detail?.data || detail;
           detailedFetched++;
           store.checkedAtById![String(item.id)] = Date.now();
 
           let fullImgs = extractImagesFromBlingItem(fullData);
-          let hasTrueFullRes = fullImgs.some((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+          let hasTrueFullRes = fullImgs.some((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u) && !isExpiredPresignedUrl(u));
 
-          // If parent detail had 0 full-res images but has variations, check up to 2 child variations directly
-          // (in Bling v3, some products store midia.imagens.internas[x].link only on variation records)
           if (!hasTrueFullRes && Array.isArray(fullData?.variacoes) && fullData.variacoes.length > 0) {
-            for (const v of fullData.variacoes.slice(0, 2)) {
+            for (const v of fullData.variacoes.filter((vr: any) => vr?.situacao !== 'I' && vr?.situacao !== 'E').slice(0, 2)) {
               if (!v?.id || isBlingDailyQuotaExceeded()) continue;
               try {
-                const vDetail = await fetchFromBling(`/produtos/${v.id}`);
+                const vDetail = await fetchFromBling(
+                  `/produtos/${v.id}`,
+                  bypassCache ? ({ bypassCache: true } as any) : {}
+                );
                 const vFullData = vDetail?.data || vDetail;
                 detailedFetched++;
                 const vDetailImgs = extractImagesFromBlingItem(vFullData);
-                const vFullRes = vDetailImgs.filter((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+                const vFullRes = vDetailImgs.filter((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u) && !isExpiredPresignedUrl(u));
                 if (vFullRes.length > 0) {
-                  fullImgs = Array.from(new Set([...vFullRes, ...fullImgs.filter((u) => !isThumbnailLikeUrl(u))]));
+                  fullImgs = replaceWithIncomingImages([...vFullRes, ...fullImgs.filter((u) => !isThumbnailLikeUrl(u))]);
                   hasTrueFullRes = true;
                   break;
                 }
@@ -903,32 +1014,51 @@ export async function syncImagesFromBling(options?: {
 
           if (fullImgs.length > 0) {
             parentsWithImages.add(item.id);
-            applyImageRecordToStore(store, {
-              sku: fullData?.codigo || item.codigo,
-              id: fullData?.id || item.id,
-              parentId: fullData?.idProdutoPai || item.idProdutoPai,
-              name: fullData?.nome || item.nome
-            }, fullImgs);
+            applyImageRecordToStore(
+              store,
+              {
+                sku: fullData?.codigo || item.codigo,
+                id: fullData?.id || item.id,
+                parentId: fullData?.idProdutoPai || item.idProdutoPai,
+                name: fullData?.nome || item.nome
+              },
+              fullImgs,
+              { replaceRemoteBling: true }
+            );
             blingCount++;
+          } else {
+            removeProductFromImageStore({
+              id: fullData?.id || item.id,
+              sku: fullData?.codigo || item.codigo,
+              name: fullData?.nome || item.nome,
+            });
           }
 
-          // Map all variations returned by GET /produtos/{id}
           if (Array.isArray(fullData?.variacoes)) {
             for (const v of fullData.variacoes) {
+              if (v?.situacao === 'I' || v?.situacao === 'E') {
+                removeProductFromImageStore({ id: v.id, sku: v.codigo, name: v.nome });
+                continue;
+              }
               const vImgs = extractImagesFromBlingItem(v, false);
               const effectiveVarImgs = vImgs.length > 0 ? vImgs : fullImgs;
               if (effectiveVarImgs.length > 0) {
-                applyImageRecordToStore(store, {
-                  sku: v.codigo,
-                  id: v.id,
-                  parentId: fullData?.id || item.id,
-                  name: v.nome || fullData?.nome || item.nome
-                }, effectiveVarImgs);
+                applyImageRecordToStore(
+                  store,
+                  {
+                    sku: v.codigo,
+                    id: v.id,
+                    name: v.nome || fullData?.nome || item.nome
+                  },
+                  effectiveVarImgs,
+                  { replaceRemoteBling: true }
+                );
+              } else {
+                removeProductFromImageStore({ id: v.id, sku: v.codigo, name: v.nome });
               }
             }
           }
 
-          // Save incrementally every 10 items so the storefront reflects new photos right away
           if (detailedFetched % 10 === 0) {
             saveImageStore(store);
             options?.onBatchSaved?.();
@@ -943,14 +1073,13 @@ export async function syncImagesFromBling(options?: {
         }
       }
 
-      // Fallback: if a child variation has no images from its parent yet, fetch its own /produtos/{child.id}
       if (detailedFetched < maxDetailFetches && !isBlingDailyQuotaExceeded()) {
         const orphanChildren = childItems.filter(
           (c) =>
             c.id &&
-            !hasFullResInStore(c) &&
+            (!hasFullResInStore(c) || changedSummaryIds.has(Number(c.id)) || bypassCache) &&
             (!c.idProdutoPai || !parentsWithImages.has(c.idProdutoPai)) &&
-            (options?.clearCache || Date.now() - (store.checkedAtById?.[String(c.id)] || 0) >= DETAIL_CHECK_COOLDOWN_MS)
+            (bypassCache || Date.now() - (store.checkedAtById?.[String(c.id)] || 0) >= DETAIL_CHECK_COOLDOWN_MS)
         );
         for (const child of orphanChildren) {
           if (detailedFetched >= maxDetailFetches || isBlingDailyQuotaExceeded()) break;
@@ -959,18 +1088,26 @@ export async function syncImagesFromBling(options?: {
           }
 
           try {
-            const detail = await fetchFromBling(`/produtos/${child.id}`);
+            const detail = await fetchFromBling(
+              `/produtos/${child.id}`,
+              bypassCache ? ({ bypassCache: true } as any) : {}
+            );
             const fullData = detail?.data || detail;
             detailedFetched++;
             store.checkedAtById![String(child.id)] = Date.now();
             const childImgs = extractImagesFromBlingItem(fullData);
             if (childImgs.length > 0) {
-              applyImageRecordToStore(store, {
-                sku: fullData?.codigo || child.codigo,
-                id: fullData?.id || child.id,
-                parentId: fullData?.idProdutoPai || child.idProdutoPai,
-                name: fullData?.nome || child.nome
-              }, childImgs);
+              applyImageRecordToStore(
+                store,
+                {
+                  sku: fullData?.codigo || child.codigo,
+                  id: fullData?.id || child.id,
+                  parentId: fullData?.idProdutoPai || child.idProdutoPai,
+                  name: fullData?.nome || child.nome
+                },
+                childImgs,
+                { replaceRemoteBling: true }
+              );
               blingCount++;
             }
             await sleep(80);
@@ -986,7 +1123,7 @@ export async function syncImagesFromBling(options?: {
       lastSyncCompletedAt = Date.now();
       options?.onBatchSaved?.();
 
-      console.log(`[Bling Image Sync] Finished: ${blingCount} Bling products synced (${detailedFetched} /produtos/{id} detail requests).`);
+      console.log(`[Bling Image Sync] Finished: ${blingCount} Bling products synced (${detailedFetched} detail requests, ${prunedDeletedCount} pruned).`);
 
       const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
 
@@ -995,11 +1132,12 @@ export async function syncImagesFromBling(options?: {
         updatedCount: blingCount,
         detailedFetched,
         totalWithImages,
+        prunedDeletedCount,
         sources: { bling: blingCount },
         connected: true,
         message: blingCount > 0
-          ? `Sincronização concluída! ${blingCount} produtos atualizados com fotos reais armazenadas no Bling ERP.`
-          : `Conexão com Bling verificada (${allItems.length} itens consultados), porém nenhuma imagem interna/externa foi retornada em midia.imagens ou imagemURL.`
+          ? `Sincronização concluída! ${blingCount} produtos atualizados com fotos em alta resolução do Bling ERP.`
+          : `Conexão com Bling verificada (${allItems.length} itens consultados).`
       };
     } catch (blingErr: any) {
       const errMessage = blingErr?.message || String(blingErr);

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { motion } from 'motion/react';
 import { Eye, Plus, Crown } from 'lucide-react';
 import { Product } from '../types';
@@ -8,6 +8,7 @@ import { getImagesForColor } from '../lib/catalogVariants';
 interface ProductCardProps {
   product: Product;
   isFavorited?: boolean;
+  priority?: boolean;
   onToggleFavorite?: (productId: string) => void;
   onOpenDetails: (product: Product, initialColor?: string) => void;
   onQuickAdd: (product: Product, preferredColor?: string) => void;
@@ -16,14 +17,11 @@ interface ProductCardProps {
 export function ProductCard({
   product,
   isFavorited = false,
+  priority = false,
   onToggleFavorite,
   onOpenDetails,
   onQuickAdd
 }: ProductCardProps) {
-  const cardRef = useRef<HTMLDivElement>(null);
-  const [rotateX, setRotateX] = useState(0);
-  const [rotateY, setRotateY] = useState(0);
-  const [isHovered, setIsHovered] = useState(false);
 
   const visibleColors = useMemo(
     () => (product.colors || []).filter((c) => c?.name && c.name.toLowerCase() !== 'cor única'),
@@ -48,47 +46,12 @@ export function ProductCard({
 
   const primaryImage = activeImages[0] || product.images[0];
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!cardRef.current) return;
-    const rect = cardRef.current.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-
-    const centerX = rect.width / 2;
-    const centerY = rect.height / 2;
-
-    const rotX = -((y - centerY) / centerY) * 7;
-    const rotY = ((x - centerX) / centerX) * 7;
-
-    setRotateX(rotX);
-    setRotateY(rotY);
-  };
-
-  const handleMouseLeave = () => {
-    setIsHovered(false);
-    setRotateX(0);
-    setRotateY(0);
-  };
-
-  const handleMouseEnter = () => {
-    setIsHovered(true);
-  };
-
   const installments = (product.price / 6).toFixed(2).replace('.', ',');
   const isOutOfStock = (product.stockCount ?? 0) <= 0;
 
   return (
     <motion.div
-      ref={cardRef}
-      onMouseMove={handleMouseMove}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
-      style={{
-        transformStyle: 'preserve-3d',
-        transform: `perspective(1000px) rotateX(${rotateX}deg) rotateY(${rotateY}deg) ${isHovered ? 'scale(1.025) translateY(-4px)' : 'scale(1) translateY(0)'}`,
-        transition: isHovered ? 'transform 0.1s ease-out, box-shadow 0.3s ease, border-color 0.3s ease' : 'transform 0.4s ease-out, box-shadow 0.4s ease, border-color 0.4s ease',
-      }}
-      className={`group relative flex flex-col bg-[#121212] rounded-xl border shadow-md transition-all duration-300 overflow-hidden cursor-pointer ${
+      className={`group relative flex flex-col bg-[#121212] rounded-xl border shadow-md transition-all duration-300 overflow-hidden cursor-pointer hover:-translate-y-1 ${
         isOutOfStock
           ? 'border-zinc-800/80 hover:border-red-900/60 opacity-90'
           : 'border-[#222222] hover:border-[#E50914]/80 hover:shadow-[0_0_28px_rgba(229,9,20,0.35),0_0_8px_rgba(229,9,20,0.5),0_16px_32px_rgba(0,0,0,0.85)]'
@@ -102,13 +65,14 @@ export function ProductCard({
       {/* Visual Image Container */}
       <div
         onClick={() => onOpenDetails(product, selectedColor)}
-        className="relative aspect-[4/3] sm:aspect-[1/1] w-full overflow-hidden bg-zinc-950 cursor-pointer"
+        className="relative aspect-square w-full overflow-hidden bg-[#141414] cursor-pointer"
       >
         <ProductImage
           src={primaryImage}
           candidates={activeImages}
+          priority={priority}
           alt={product.name}
-          className={`w-full h-full object-cover object-center group-hover:scale-108 transition-transform duration-500 ease-out ${
+          className={`w-full h-full object-cover object-center group-hover:scale-[1.03] transition-transform duration-300 ease-out [backface-visibility:hidden] ${
             isOutOfStock ? 'grayscale-[40%] contrast-90' : ''
           }`}
         />

@@ -6,7 +6,17 @@ import dotenv from 'dotenv';
 import QRCode from 'qrcode';
 import crypto from 'crypto';
 import { getAdminAuth, getAdminFirestore } from './lib/firebaseAdmin.js';
-import { registerBlingRoutes, blingRouter, blingAuthInterceptorMiddleware, fetchFromBling, loadBlingTokens, ensureBlingAuthorized, refreshBlingToken } from './server-bling.js';
+import {
+  registerBlingRoutes,
+  blingRouter,
+  blingAuthInterceptorMiddleware,
+  fetchFromBling,
+  loadBlingTokens,
+  ensureBlingAuthorized,
+  refreshBlingToken,
+  clearBlingProductsRouteCache,
+} from './server-bling.js';
+import { invalidateBlingCachedResponse } from './server-bling-db.js';
 import { registerMelhorEnvioRoutes, startMelhorEnvioAutoSync } from './server-melhor-envio.js';
 import {
   hasFirebaseAdminEnv,
@@ -19,6 +29,7 @@ import {
   isAnyHeavyBlingLockActive,
 } from './lib/blingToken.js';
 import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
+import { FieldValue } from 'firebase-admin/firestore';
 import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
 import {
   detectColorFromText,
@@ -39,12 +50,16 @@ import {
   stripResizeAndCompressionParams,
   applyImageRecordToStore,
   getBlingImagesForProduct,
+  removeProductFromImageStore,
+  getCanonicalImageKey,
+  isExpiredPresignedUrl,
   isPlaceholderImageUrl,
   isLegacyExternalUrl,
   isThumbnailLikeUrl,
   isImageSyncRunning,
   setCatalogFetchInProgress,
-  getLastBlingImageSyncTime
+  getLastBlingImageSyncTime,
+  getImageStoreSnapshot
 } from './server-bling-images.js';
 import {
   createStoreOrder,
@@ -82,7 +97,7 @@ let catalogCache: {
   totalUnitsInStock?: number;
   timestamp: number;
 } | null = null;
-const CATALOG_CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes fresh TTL with silent stale-while-revalidate
+const CATALOG_CACHE_TTL_MS = 45 * 1000; // 45s in-memory TTL with live Bling revalidation
 
 export function invalidateCatalogCache() {
   catalogCache = null;
@@ -91,9 +106,25 @@ export function invalidateCatalogCache() {
 
 export function reapplyImagesToCachedCatalog() {
   if (catalogCache && Array.isArray(catalogCache.products)) {
+    const updated = applyBlingImageOverrides(catalogCache.products, { preferStore: true }).map((p: any) => {
+      if (
+        p.colorImages &&
+        typeof p.colorImages === 'object' &&
+        Object.keys(p.colorImages).length === 1 &&
+        Array.isArray(p.images) &&
+        p.images.length > 0
+      ) {
+        const onlyKey = Object.keys(p.colorImages)[0];
+        return {
+          ...p,
+          colorImages: { [onlyKey]: [...p.images] },
+        };
+      }
+      return p;
+    });
     catalogCache = {
       ...catalogCache,
-      products: applyBlingImageOverrides(catalogCache.products),
+      products: updated,
     };
   }
 }
@@ -215,15 +246,35 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
       const basePrice = Number(d.preco || 0);
       const priceVal = Number.isFinite(basePrice) && basePrice > 0 ? basePrice : 119.9;
 
+      const dedupeByCanonical = (urls: string[]): string[] => {
+        const seen = new Set<string>();
+        const out: string[] = [];
+        for (const raw of urls) {
+          const clean = stripResizeAndCompressionParams(String(raw || '').trim());
+          if (!clean || isPlaceholderImageUrl(clean) || isExpiredPresignedUrl(clean)) continue;
+          const key = getCanonicalImageKey(clean);
+          if (!seen.has(key)) {
+            seen.add(key);
+            out.push(clean);
+          }
+        }
+        return out;
+      };
+
       const rawVars = d.variacoes && typeof d.variacoes === 'object' ? Object.values(d.variacoes as Record<string, any>) : [];
       const variantsList = rawVars.length > 0
         ? rawVars.map((v: any) => {
             const vMeta = parseBlingVariantMeta({ nome: String(v.nome || ''), isParentContainer: false });
             const vStock = Math.max(0, Number(v.estoque || 0) || 0);
             const vPrice = Number(v.preco || priceVal);
-            const rawVarImg = typeof v.imagemURL === 'string' && v.imagemURL.trim() && !isPlaceholderImageUrl(v.imagemURL)
-              ? v.imagemURL.trim()
-              : (typeof v.image === 'string' && v.image.trim() && !isPlaceholderImageUrl(v.image) ? v.image.trim() : '');
+            const varImgsPool = dedupeByCanonical([
+              ...(Array.isArray(v.imagens) ? v.imagens : []),
+              ...(typeof v.imagemURL === 'string' ? [v.imagemURL] : []),
+              ...(typeof v.image === 'string' ? [v.image] : []),
+            ]);
+            const varNonThumb = varImgsPool.filter((u) => !isThumbnailLikeUrl(u));
+            const finalVarImgs = varNonThumb.length > 0 ? varNonThumb : varImgsPool;
+            const rawVarImg = finalVarImgs[0] || '';
             return {
               id: Number(v.blingId || blingId),
               sku: String(v.codigo || `${groupSku}-${vMeta.size}`),
@@ -232,6 +283,7 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
               size: String(v.tamanho || vMeta.size || 'Tamanho Único'),
               ...(v.cor || vMeta.color?.name ? { color: String(v.cor || vMeta.color?.name) } : {}),
               ...(rawVarImg ? { image: rawVarImg } : {}),
+              ...(finalVarImgs.length > 0 ? { images: finalVarImgs } : {}),
             };
           })
         : [
@@ -267,25 +319,42 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
         rawColors.length > 0 ? rawColors : fallbackColor ? [fallbackColor] : []
       );
 
-      const storedImgs: string[] = [];
-      if (Array.isArray(d.imagens)) {
-        for (const u of d.imagens) {
-          if (typeof u === 'string' && u.trim() && !isPlaceholderImageUrl(u)) storedImgs.push(u.trim());
+      const docImgs = Array.isArray(d.imagens) ? dedupeByCanonical(d.imagens) : [];
+      const fallbackMain =
+        docImgs.length === 0 && typeof d.imagemURL === 'string'
+          ? dedupeByCanonical([d.imagemURL])
+          : [];
+      const storedImgs = docImgs.length > 0 ? docImgs : fallbackMain;
+      const nonThumb = storedImgs.filter((u) => !isThumbnailLikeUrl(u));
+      const cachedImgs = dedupeByCanonical(
+        getBlingImagesForProduct({
+          name: baseName,
+          integration: { sku: groupSku, blingId },
+          variantsList,
+        }) || []
+      );
+      const cachedFull = cachedImgs.filter((u) => !isThumbnailLikeUrl(u));
+      const finalImages =
+        nonThumb.length > 0
+          ? nonThumb
+          : cachedFull.length > 0
+          ? cachedFull
+          : storedImgs.length > 0
+          ? storedImgs
+          : cachedImgs;
+
+      const colorImages: Record<string, string[]> = {};
+      for (const v of inStockVariants) {
+        const cName = v.color ? (detectColorFromName(v.color)?.name || v.color) : '';
+        if (!cName) continue;
+        const vPool = dedupeByCanonical([
+          ...(Array.isArray((v as any).images) ? (v as any).images : []),
+          ...(v.image ? [v.image] : []),
+        ]);
+        if (vPool.length > 0) {
+          colorImages[cName] = dedupeByCanonical([...(colorImages[cName] || []), ...vPool]);
         }
       }
-      if (typeof d.imagemURL === 'string' && d.imagemURL.trim() && !isPlaceholderImageUrl(d.imagemURL)) {
-        if (!storedImgs.includes(d.imagemURL.trim())) storedImgs.unshift(d.imagemURL.trim());
-      }
-      const nonThumb = storedImgs.filter((u) => !isThumbnailLikeUrl(u));
-      const cachedImgs = getBlingImagesForProduct({
-        name: baseName,
-        integration: { sku: groupSku, blingId },
-        variantsList,
-      }) || [];
-      const cachedFull = cachedImgs.filter((u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
-      const finalImages = Array.from(new Set([...nonThumb, ...cachedFull, ...storedImgs, ...cachedImgs])).filter(
-        (u) => !isPlaceholderImageUrl(u)
-      );
 
       const numericId = Number(blingId) || 0;
       fallbackProducts.push({
@@ -298,7 +367,8 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
         tag: totalStock <= 3 ? 'POUCAS UNIDADES' : null,
         rating: 4.8 + ((numericId % 3) / 10),
         reviewsCount: 15 + (numericId % 40),
-        images: finalImages.length > 0 ? finalImages : ['/assets/streetstore-fallback.svg'],
+        images: finalImages,
+        ...(Object.keys(colorImages).length > 0 ? { colorImages } : {}),
         sizes: activeSizes,
         colors: finalColors,
         description:
@@ -341,10 +411,12 @@ async function loadCatalogFromFirestoreFallback(): Promise<any[]> {
   }
 }
 
-async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
+async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
   if (activeCatalogBuildPromise) {
     return activeCatalogBuildPromise;
   }
+
+  const forceRefresh = Boolean(options?.forceImageSync);
 
   activeCatalogBuildPromise = (async () => {
     const products: any[] = [];
@@ -354,6 +426,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
     let blingError: string | null = null;
     let hasAnyBlingSession = false;
     let catalogLockAcquired = false;
+    let crawlCompletedCleanly = false;
     const zeroStockFromBlingKeys = new Set<string>();
 
     // Merge all live products from Bling ERP seamlessly when connected (supports all 1411+ items & variations)
@@ -375,6 +448,11 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
       }
 
       if (hasAnyBlingSession && catalogLockAcquired && !isBlingDailyQuotaExceeded()) {
+        if (forceRefresh) {
+          invalidateBlingCachedResponse('/produtos');
+          invalidateBlingCachedResponse('/estoques');
+          clearBlingProductsRouteCache();
+        }
         // Interceptor pré-sincronização: valida expiração sem ping extra em /produtos
         const tokenReady = await ensureBlingAuthorized({ verifyLive: false });
         if (!tokenReady) {
@@ -401,12 +479,17 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
             break;
           }
           try {
-            const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`);
+            const pageData = await fetchFromBling(`/produtos?pagina=${p}&limite=100&criterio=2`, {
+              bypassCache: forceRefresh,
+            });
             const items = pageData?.data || [];
             if (items.length > 0) {
               pushUniqueBling(items);
             }
-            if (items.length < 100) break;
+            if (items.length < 100) {
+              crawlCompletedCleanly = true;
+              break;
+            }
             await new Promise(resolve => setTimeout(resolve, 140));
           } catch (pageErr: any) {
             const msg = pageErr?.message || String(pageErr);
@@ -437,7 +520,9 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
           if (isBlingDailyQuotaExceeded()) break;
           try {
             const qs = chunk.map((id: number) => `idsProdutos[]=${id}`).join('&');
-            const stockRes = await fetchFromBling(`/estoques/saldos?${qs}`);
+            const stockRes = await fetchFromBling(`/estoques/saldos?${qs}`, {
+              bypassCache: forceRefresh,
+            });
             stockApiQueried = true;
             const entries = stockRes?.data || [];
             for (const entry of entries) {
@@ -522,88 +607,95 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
 
         const existingBlingIds = new Set(products.map(p => String(p.integration?.blingId || '')));
 
-        const STUDIO_CUTOUT_BY_SKU: Array<{ prefixes: string[]; images: string[] }> = [
-          {
-            prefixes: ['OTSR1977'],
-            images: ['/assets/aistudio/C_pia_de_NOVIDADE__3__f437c7b1.png', '/assets/aistudio/C_pia_de_NOVIDADE__1__b4d9c4a8.png'],
-          },
-          {
-            prefixes: ['OTSR506'],
-            images: ['/assets/aistudio/Design_sem_nome__4__bfe5aaed.png', '/assets/aistudio/Design_sem_nome__3__5e605338.png'],
-          },
-          {
-            prefixes: ['OTSBP501', 'OVTP501'],
-            images: ['/assets/aistudio/Design_sem_nome__5__ef8bca41.png', '/assets/aistudio/Design_sem_nome__6__d3642ec7.png'],
-          },
-          {
-            prefixes: ['OTSBP502'],
-            images: ['/assets/aistudio/Design_sem_nome__8__f44ad096.png', '/assets/aistudio/Design_sem_nome__7__e6ab934f.png'],
-          },
-          {
-            prefixes: ['OTSP500', 'OVTP502'],
-            images: ['/assets/aistudio/Design_sem_nome__9__73306863.png'],
-          },
-          {
-            prefixes: ['OTSR505'],
-            images: ['/assets/aistudio/Design_sem_nome__10__4bbf1037.png'],
-          },
-          {
-            prefixes: ['OTSPN500'],
-            images: ['/assets/aistudio/Design_sem_nome__11__0eda0283.png'],
-          },
-        ];
-
         let addedFromBlingCount = 0;
         const imageStore = loadImageStore();
+        if (!imageStore.summaryKeyById) imageStore.summaryKeyById = {};
+        if (!imageStore.checkedAtById) imageStore.checkedAtById = {};
         let imageStoreDirty = false;
-        const groupsNeedingDetailFetch: Array<{ id: number; sku: string; baseName: string; productRef: any }> = [];
+        const groupsNeedingDetailFetch: Array<{
+          id: number;
+          sku: string;
+          baseName: string;
+          productRef: any;
+          forceReplace?: boolean;
+          checkedAt: number;
+          priority: number;
+        }> = [];
+
+        const dedupeCanonicalUrls = (urls: string[]): string[] => {
+          const seen = new Set<string>();
+          const out: string[] = [];
+          for (const raw of urls) {
+            const clean = stripResizeAndCompressionParams(String(raw || '').trim());
+            if (!clean || isPlaceholderImageUrl(clean) || isExpiredPresignedUrl(clean)) continue;
+            const key = getCanonicalImageKey(clean);
+            if (!seen.has(key)) {
+              seen.add(key);
+              out.push(clean);
+            }
+          }
+          return out;
+        };
 
         for (const [gIdx, group] of sortedGroups.entries()) {
           const firstItem = group.items[0];
           const groupSku = firstItem?.codigo || `BLING-${group.id}`;
           const normalizedBaseName = group.baseName.toLowerCase().trim();
 
-          // Extract ALL images across parent & variation items (preferring full-res over /produtos list /t/ thumbnails)
-          const blingImagesSet = new Set<string>();
+          // Extract images across parent & active variation items (deduped by canonical key)
+          const rawBlingUrls: string[] = [];
           for (const it of group.items) {
-            const itemImgs = extractImagesFromBlingItem(it);
-            for (const url of itemImgs) {
-              blingImagesSet.add(url);
+            rawBlingUrls.push(...extractImagesFromBlingItem(it));
+          }
+          const blingExtractedImages = dedupeCanonicalUrls(rawBlingUrls);
+          const fullResBlingExtracted = blingExtractedImages.filter((u) => !isThumbnailLikeUrl(u));
+          const summaryKey = blingExtractedImages
+            .map((u) => getCanonicalImageKey(u))
+            .filter(Boolean)
+            .sort()
+            .join('|');
+          const idKey = String(group.id);
+          const prevSummaryKey = imageStore.summaryKeyById[idKey] || '';
+          const summaryChanged = Boolean(summaryKey && prevSummaryKey && summaryKey !== prevSummaryKey);
+          if (summaryKey && imageStore.summaryKeyById[idKey] !== summaryKey) {
+            imageStore.summaryKeyById[idKey] = summaryKey;
+            imageStoreDirty = true;
+          }
+
+          // Update individual child/item cache strictly under its own identifiers (never clobbering parent multi-photo lists)
+          for (const it of group.items) {
+            const itemImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(it));
+            const fullResItemImgs = itemImgs.filter((u) => !isThumbnailLikeUrl(u));
+            if (fullResItemImgs.length > 0 && Number(it.id) !== Number(group.id)) {
+              const existingChild = it.id ? imageStore.byId[String(it.id)] || [] : [];
+              if (existingChild.length === 0 || forceRefresh || summaryChanged || fullResItemImgs.length >= 2) {
+                if (
+                  applyImageRecordToStore(
+                    imageStore,
+                    { sku: it.codigo, id: it.id, name: it.nome },
+                    fullResItemImgs,
+                    { replaceRemoteBling: true }
+                  )
+                ) {
+                  imageStoreDirty = true;
+                }
+              }
             }
-            const fullResItemImgs = itemImgs.filter(u => !isThumbnailLikeUrl(u));
-            if (fullResItemImgs.length > 0) {
+          }
+
+          const existingGroupImgs = imageStore.byId[idKey] || [];
+          if (fullResBlingExtracted.length > 0) {
+            if (existingGroupImgs.length === 0 || forceRefresh || summaryChanged || fullResBlingExtracted.length >= 2) {
               if (
                 applyImageRecordToStore(
                   imageStore,
-                  {
-                    sku: it.codigo,
-                    id: it.id,
-                    parentId: it.idProdutoPai || group.id,
-                    name: group.baseName
-                  },
-                  fullResItemImgs
+                  { sku: groupSku, id: group.id, name: group.baseName },
+                  fullResBlingExtracted,
+                  { replaceRemoteBling: true }
                 )
               ) {
                 imageStoreDirty = true;
               }
-            }
-          }
-          const blingExtractedImages = Array.from(blingImagesSet);
-          const fullResBlingExtracted = blingExtractedImages.filter(u => !isThumbnailLikeUrl(u));
-
-          if (fullResBlingExtracted.length > 0) {
-            if (
-              applyImageRecordToStore(
-                imageStore,
-                {
-                  sku: groupSku,
-                  id: group.id,
-                  name: group.baseName
-                },
-                fullResBlingExtracted
-              )
-            ) {
-              imageStoreDirty = true;
             }
           }
 
@@ -640,9 +732,22 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
             };
           });
 
+          const fullResByCanon = new Map<string, string>();
+          for (const u of fullResBlingExtracted) {
+            fullResByCanon.set(getCanonicalImageKey(u), u);
+          }
+
           const variantsList = parsedVariants.map(({ item: it, meta, stock: vStock }) => {
-            const varImgs = extractImagesFromBlingItem(it).filter((u) => !isPlaceholderImageUrl(u));
-            const fullVarImg = varImgs.find((u) => !isThumbnailLikeUrl(u)) || varImgs[0] || '';
+            const rawVarImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(it));
+            const upgradedVarImgs = dedupeCanonicalUrls(
+              rawVarImgs.map((u) => {
+                const canon = getCanonicalImageKey(u);
+                return fullResByCanon.get(canon) || u;
+              })
+            );
+            const nonThumbVar = upgradedVarImgs.filter((u) => !isThumbnailLikeUrl(u));
+            const finalVarImgs = nonThumbVar.length > 0 ? nonThumbVar : upgradedVarImgs;
+            const fullVarImg = finalVarImgs[0] || '';
             return {
               id: it.id,
               sku: it.codigo || `${groupSku}-${meta.size}`,
@@ -651,6 +756,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
               size: meta.size,
               ...(meta.color?.name ? { color: meta.color.name } : {}),
               ...(fullVarImg ? { image: fullVarImg } : {}),
+              ...(finalVarImgs.length > 0 ? { images: finalVarImgs } : {}),
             };
           });
 
@@ -687,31 +793,51 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
             rawVariantColors.length > 0 ? rawVariantColors : (fallbackBaseColor ? [fallbackBaseColor] : [])
           );
 
-          // Select images: 1. Full-res live/cached midia.imagens.internas[0].link -> 2. Studio HD cutouts -> 3. List fallback -> 4. Crisp SVG brand card
-          const cachedBlingImages = getBlingImagesForProduct({
-            name: group.baseName,
-            integration: { sku: groupSku, blingId: String(group.id) },
-            variantsList
-          }) || [];
-          const cachedFullRes = cachedBlingImages.filter(u => !isThumbnailLikeUrl(u));
-          const combinedFullRes = Array.from(new Set([...fullResBlingExtracted, ...cachedFullRes]));
-
-          const upperGroupSku = String(groupSku || '').toUpperCase().trim();
-          const studioPresetMatch = STUDIO_CUTOUT_BY_SKU.find((entry) =>
-            entry.prefixes.some((pref) => upperGroupSku.startsWith(pref))
+          // Select images strictly from one authoritative source (NEVER merge stale cached lists with live lists)
+          const cachedBlingImages = dedupeCanonicalUrls(
+            getBlingImagesForProduct({
+              name: group.baseName,
+              integration: { sku: groupSku, blingId: String(group.id) },
+              variantsList
+            }) || []
           );
+          const cachedFullRes = cachedBlingImages.filter(u => !isThumbnailLikeUrl(u));
+          for (const u of cachedFullRes) {
+            if (!fullResByCanon.has(getCanonicalImageKey(u))) {
+              fullResByCanon.set(getCanonicalImageKey(u), u);
+            }
+          }
+
+          for (const v of variantsList) {
+            if (Array.isArray(v.images) && v.images.length > 0) {
+              const upgraded = dedupeCanonicalUrls(v.images.map((u) => fullResByCanon.get(getCanonicalImageKey(u)) || u));
+              const nonThumb = upgraded.filter((u) => !isThumbnailLikeUrl(u));
+              v.images = nonThumb.length > 0 ? nonThumb : upgraded;
+              v.image = v.images[0] || v.image;
+            }
+          }
 
           let images: string[] = [];
-          if (combinedFullRes.length > 0) {
-            images = combinedFullRes;
-          } else if (studioPresetMatch) {
-            images = studioPresetMatch.images;
+          if (!forceRefresh && !summaryChanged && cachedFullRes.length > 0 && fullResBlingExtracted.length <= 1) {
+            images = cachedFullRes;
+          } else if (fullResBlingExtracted.length > 0) {
+            images = fullResBlingExtracted;
           } else if (cachedBlingImages.length > 0) {
             images = cachedBlingImages;
           } else if (blingExtractedImages.length > 0) {
             images = blingExtractedImages;
-          } else {
-            images = ['/assets/streetstore-fallback.svg'];
+          }
+
+          const colorImages: Record<string, string[]> = {};
+          for (const v of variantsList) {
+            if ((v.stock ?? 0) <= 0 || !v.color) continue;
+            const vImgs = dedupeCanonicalUrls([
+              ...(Array.isArray(v.images) ? v.images : []),
+              ...(v.image ? [v.image] : []),
+            ]);
+            if (vImgs.length > 0) {
+              colorImages[v.color] = dedupeCanonicalUrls([...(colorImages[v.color] || []), ...vImgs]);
+            }
           }
 
           const priceVal = isNaN(group.price) || group.price <= 0 ? 119.90 : group.price;
@@ -731,6 +857,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
             rating: 4.8 + ((group.id % 3) / 10),
             reviewsCount: 15 + (group.id % 40),
             images,
+            ...(Object.keys(colorImages).length > 0 ? { colorImages } : {}),
             sizes: activeSizes,
             colors: finalColors,
             description: cleanedBlingDesc,
@@ -759,12 +886,21 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
           const hasLowResOnly = images.length > 0 && images.every(u =>
             isPlaceholderImageUrl(u) || isThumbnailLikeUrl(u)
           );
-          if ((blingExtractedImages.length === 0 && images.every(u => isPlaceholderImageUrl(u))) || hasLowResOnly) {
+          const lastCheckedAt = Number(imageStore.checkedAtById[idKey] || 0);
+          const detailStale = Date.now() - lastCheckedAt > 5 * 60 * 1000;
+          const needsMissingOrLowRes = (blingExtractedImages.length === 0 && images.every(u => isPlaceholderImageUrl(u))) || hasLowResOnly;
+          const needsDriftRefresh = summaryChanged || forceRefresh || detailStale;
+
+          if (needsMissingOrLowRes || needsDriftRefresh) {
+            const priority = needsMissingOrLowRes ? 0 : (summaryChanged ? 1 : 2);
             groupsNeedingDetailFetch.push({
               id: group.id,
               sku: groupSku,
               baseName: group.baseName,
-              productRef: productObj
+              productRef: productObj,
+              forceReplace: true,
+              checkedAt: lastCheckedAt,
+              priority,
             });
           }
 
@@ -773,66 +909,131 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
           addedFromBlingCount++;
         }
 
-        // If background image sync isn't already running, fetch up to 5 missing high-res items inline without spawning heavy full-catalog crawls
+        // Fetch authoritative full detail media inline (oldest-checked & missing-media first)
         if (groupsNeedingDetailFetch.length > 0 && !isBlingDailyQuotaExceeded()) {
           if (!isImageSyncRunning()) {
-            const inlineBatch = groupsNeedingDetailFetch.slice(0, 5);
-            console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} products lacked full-res images in /produtos summary. Fetching detail media for ${inlineBatch.length}...`);
+            groupsNeedingDetailFetch.sort((a, b) => a.priority - b.priority || a.checkedAt - b.checkedAt);
+            const inlineBatch = groupsNeedingDetailFetch.slice(0, forceRefresh ? 25 : 8);
+            console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} products scheduled for live detail media verification. Fetching ${inlineBatch.length}...`);
             for (const target of inlineBatch) {
               if (isBlingDailyQuotaExceeded()) break;
               try {
-                const detail = await fetchFromBling(`/produtos/${target.id}`);
+                const detail = await fetchFromBling(`/produtos/${target.id}`, {
+                  bypassCache: true,
+                });
                 const fullData = detail?.data || detail;
-                let detailImgs = extractImagesFromBlingItem(fullData);
-                let hasTrueFull = detailImgs.some((u: string) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+                if (fullData?.situacao === 'I' || fullData?.situacao === 'E') {
+                  removeProductFromImageStore({ id: target.id, sku: target.sku, name: target.baseName });
+                  imageStoreDirty = true;
+                  continue;
+                }
 
-                if (!hasTrueFull && Array.isArray(fullData?.variacoes) && fullData.variacoes.length > 0) {
-                  for (const v of fullData.variacoes.slice(0, 2)) {
-                    if (!v?.id || isBlingDailyQuotaExceeded()) continue;
-                    try {
-                      const vDetail = await fetchFromBling(`/produtos/${v.id}`);
-                      const vImgs = extractImagesFromBlingItem(vDetail?.data || vDetail);
-                      const vFull = vImgs.filter((u: string) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
-                      if (vFull.length > 0) {
-                        detailImgs = Array.from(new Set([...vFull, ...detailImgs.filter((u: string) => !isThumbnailLikeUrl(u))]));
-                        hasTrueFull = true;
-                        break;
+                const detailImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(fullData, true));
+                const detailFull = detailImgs.filter((u) => !isThumbnailLikeUrl(u));
+                const detailFullMap = new Map<string, string>();
+                for (const u of detailFull) {
+                  detailFullMap.set(getCanonicalImageKey(u), u);
+                }
+
+                // Update each variation's images cleanly from active detail variacoes (no cross-color mixing)
+                const activeDetailVars = Array.isArray(fullData?.variacoes)
+                  ? fullData.variacoes.filter((v: any) => v?.situacao !== 'I' && v?.situacao !== 'E')
+                  : [];
+                const multiColorCount = Array.isArray(target.productRef.colors) ? target.productRef.colors.length : 0;
+
+                if (activeDetailVars.length > 0 && Array.isArray(target.productRef.variantsList)) {
+                  const varMediaById = new Map<number, string[]>();
+                  let extraVarFetches = 0;
+
+                  for (const dv of activeDetailVars) {
+                    if (!dv?.id) continue;
+                    let dvImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(dv, false)).map(
+                      (u) => detailFullMap.get(getCanonicalImageKey(u)) || u
+                    );
+                    dvImgs = dedupeCanonicalUrls(dvImgs);
+                    const dvHasFull = dvImgs.some((u) => !isThumbnailLikeUrl(u));
+                    if ((!dvHasFull || multiColorCount > 1) && extraVarFetches < 4 && !isBlingDailyQuotaExceeded()) {
+                      extraVarFetches++;
+                      try {
+                        const vDetail = await fetchFromBling(`/produtos/${dv.id}`, { bypassCache: true });
+                        const vData = vDetail?.data || vDetail;
+                        const fetchedVarImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(vData, false));
+                        if (fetchedVarImgs.length > 0) {
+                          dvImgs = fetchedVarImgs;
+                          for (const vu of fetchedVarImgs) {
+                            if (!isThumbnailLikeUrl(vu)) detailFullMap.set(getCanonicalImageKey(vu), vu);
+                          }
+                        }
+                      } catch (vErr: any) {
+                        if (isBlingRateLimitError(vErr) || isBlingDailyQuotaExceeded()) break;
                       }
-                    } catch (vErr: any) {
-                      if (isBlingRateLimitError(vErr) || isBlingDailyQuotaExceeded()) break;
                     }
+                    if (dvImgs.length > 0) {
+                      const dvFull = dvImgs.filter((u) => !isThumbnailLikeUrl(u));
+                      varMediaById.set(Number(dv.id), dvFull.length > 0 ? dvFull : dvImgs);
+                    }
+                  }
+
+                  const nextColorImages: Record<string, string[]> = {};
+                  target.productRef.variantsList = target.productRef.variantsList.map((v: any) => {
+                    const liveVarImgs = varMediaById.get(Number(v.id));
+                    const fallbackUpgraded = dedupeCanonicalUrls(
+                      [...(Array.isArray(v.images) ? v.images : []), ...(v.image ? [v.image] : [])].map(
+                        (u) => detailFullMap.get(getCanonicalImageKey(u)) || u
+                      )
+                    );
+                    const nextVarImgs = liveVarImgs && liveVarImgs.length > 0 ? liveVarImgs : fallbackUpgraded;
+                    if (v.color && (v.stock ?? 0) > 0 && nextVarImgs.length > 0) {
+                      nextColorImages[v.color] = dedupeCanonicalUrls([
+                        ...(nextColorImages[v.color] || []),
+                        ...nextVarImgs,
+                      ]);
+                    }
+                    return {
+                      ...v,
+                      ...(nextVarImgs[0] ? { image: nextVarImgs[0] } : {}),
+                      ...(nextVarImgs.length > 0 ? { images: nextVarImgs } : {}),
+                    };
+                  });
+                  if (Object.keys(nextColorImages).length > 0) {
+                    target.productRef.colorImages = nextColorImages;
                   }
                 }
 
-                if (detailImgs.length > 0) {
-                  const detailFull = detailImgs.filter((u: string) => !isThumbnailLikeUrl(u));
-                  const existingImgs: string[] = Array.isArray(target.productRef.images)
-                    ? target.productRef.images.filter((u: unknown): u is string => typeof u === 'string')
-                    : [];
-                  const existingFull = existingImgs.filter(
-                    (u: string) => !isPlaceholderImageUrl(u) && !isThumbnailLikeUrl(u)
-                  );
-                  const merged: string[] = Array.from(
-                    new Set<string>(
-                      detailFull.length > 0
-                        ? [...detailFull, ...existingFull]
-                        : existingFull.length > 0
-                        ? existingFull
-                        : detailImgs
-                    )
-                  );
-                  target.productRef.images = merged;
+                // Strictly REPLACE product images with active Bling detail photos (never merge stale cached photos)
+                const mergedAllDetail = dedupeCanonicalUrls([
+                  ...detailFull,
+                  ...Array.from(detailFullMap.values()),
+                ]);
+                const finalLiveImgs = mergedAllDetail.length > 0 ? mergedAllDetail : detailImgs;
+
+                if (finalLiveImgs.length > 0) {
+                  target.productRef.images = finalLiveImgs;
+                  target.productRef._liveDetailFetched = true;
                   if (
                     applyImageRecordToStore(
                       imageStore,
                       { sku: target.sku, id: target.id, name: target.baseName },
-                      merged
+                      finalLiveImgs,
+                      { replaceRemoteBling: true }
                     )
                   ) {
                     imageStoreDirty = true;
                   }
+                } else {
+                  removeProductFromImageStore({ id: target.id, sku: target.sku, name: target.baseName });
+                  target.productRef.images = [];
+                  imageStoreDirty = true;
                 }
+
+                imageStore.checkedAtById[String(target.id)] = Date.now();
+                imageStoreDirty = true;
               } catch (detailErr: any) {
+                const errMsg = String(detailErr?.message || '');
+                if (errMsg.includes('[404]')) {
+                  removeProductFromImageStore({ id: target.id, sku: target.sku, name: target.baseName });
+                  imageStoreDirty = true;
+                }
                 if (isBlingRateLimitError(detailErr) || isBlingDailyQuotaExceeded()) break;
               }
             }
@@ -841,8 +1042,24 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
           }
         }
 
+        // Remove deleted/inactivated Bling product IDs from local imageStore when crawl completes cleanly
+        if (crawlCompletedCleanly) {
+          for (const storedId of Object.keys(imageStore.byId || {})) {
+            const numId = Number(storedId);
+            if (Number.isFinite(numId) && numId > 0 && !seenBlingIds.has(numId)) {
+              delete imageStore.byId[storedId];
+              if (imageStore.checkedAtById?.[storedId]) delete imageStore.checkedAtById[storedId];
+              if (imageStore.summaryKeyById?.[storedId]) delete imageStore.summaryKeyById[storedId];
+              imageStoreDirty = true;
+            }
+          }
+        }
+
         if (imageStoreDirty) {
           saveImageStore(imageStore);
+          if (hasFirebaseAdminEnv()) {
+            syncImageStoreToFirestore(imageStore).catch(() => {});
+          }
         }
 
         blingCount = addedFromBlingCount;
@@ -909,18 +1126,22 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
         canonical.colors = normalizeColorOptions(combinedColors);
 
         if (Array.isArray(item.images)) {
-          const allCombined = [...canonical.images.map((u: string) => stripResizeAndCompressionParams(u))];
-          item.images.forEach((rawImg: string) => {
+          const seenCanon = new Set<string>();
+          const allCombined: string[] = [];
+          for (const rawImg of [...canonical.images, ...item.images]) {
             const img = stripResizeAndCompressionParams(rawImg);
-            if (img && !allCombined.includes(img)) {
+            if (!img) continue;
+            const key = getCanonicalImageKey(img);
+            if (!seenCanon.has(key)) {
+              seenCanon.add(key);
               allCombined.push(img);
             }
-          });
+          }
           const realOnly = allCombined.filter((img: string) => !isPlaceholderImageUrl(img));
           const nativeBlingOnly = realOnly.filter((img: string) => !isLegacyExternalUrl(img));
           const pool = nativeBlingOnly.length > 0 ? nativeBlingOnly : (realOnly.length > 0 ? realOnly : allCombined);
           const nonThumb = pool.filter((img: string) => !isThumbnailLikeUrl(img));
-          canonical.images = (nonThumb.length > 0 ? nonThumb : pool).slice(0, 8);
+          canonical.images = (nonThumb.length > 0 ? nonThumb : pool).slice(0, 12);
         }
 
         if (canonical.stockCount > 0 && canonical.tag === 'SEM ESTOQUE') {
@@ -942,8 +1163,8 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
         tag: (p.stockCount ?? 0) <= 3 ? 'POUCAS UNIDADES' : (idx < 16 ? 'NOVO DROP' : null),
       }));
 
-    if (finalProducts.length === 0) {
-      if (catalogCache && catalogCache.products.length > 0) {
+    if (finalProducts.length === 0 && !crawlCompletedCleanly) {
+      if (catalogCache && catalogCache.products.length > 0 && Date.now() - catalogCache.timestamp < 90 * 1000) {
         const nowKeep = Date.now();
         catalogCache = {
           ...catalogCache,
@@ -951,7 +1172,7 @@ async function buildAndCacheCatalog(_options?: { forceImageSync?: boolean }) {
           blingError: blingError || catalogCache.blingError,
           timestamp: nowKeep,
         };
-        console.warn(`[Catalog Engine] Bling retornou 0 itens (${blingError || 'sem dados'}). Mantendo ${catalogCache.products.length} produtos em cache.`);
+        console.warn(`[Catalog Engine] Bling retornou 0 itens (${blingError || 'sem dados'}). Mantendo ${catalogCache.products.length} produtos em cache temporário.`);
         return {
           success: true,
           count: catalogCache.count,
@@ -1068,39 +1289,158 @@ app.get('/api/catalog/products', async (req: Request, res: Response) => {
   }
 });
 
-// Real-time Webhook for Bling ERP (estoque, produtos, imagens)
+// Real-time Webhook for Bling ERP (estoque, produtos, imagens, exclusões/inativações)
 app.post(['/api/webhooks/bling', '/api/bling/webhook'], async (req: Request, res: Response) => {
   console.log('[Webhook] Bling ERP event received:', JSON.stringify(req.body));
-  
+
   try {
     const payload = req.body || {};
+    const eventName = String(payload.event || payload.evento || '').toLowerCase();
     const itemData = payload.data || payload.produto || payload;
-    
-    // Extract images if provided in payload
-    const extractedImages = extractImagesFromBlingItem(itemData);
-    if (extractedImages.length > 0) {
-      recordProductImage({
+    const itemId = itemData?.id ? String(itemData.id).trim() : '';
+    const parentId = itemData?.idProdutoPai || itemData?.variacao?.produtoPai?.id;
+    const targetDocId = parentId && Number(parentId) > 0 ? String(parentId) : itemId;
+    const isDeleteOrInactiveEvent =
+      eventName.includes('delete') ||
+      eventName.includes('exclu') ||
+      eventName.includes('remov') ||
+      itemData?.situacao === 'I' ||
+      itemData?.situacao === 'E';
+
+    if (isDeleteOrInactiveEvent && itemId) {
+      removeProductFromImageStore({
+        id: itemId,
         sku: itemData.codigo || itemData.sku,
         name: itemData.nome,
-        id: itemData.id
-      }, extractedImages);
-      console.log(`[Webhook Bling] Successfully captured ${extractedImages.length} updated images for product:`, itemData.nome || itemData.codigo);
-    } else if (itemData.id) {
-      // If only ID was sent in webhook, fetch the updated product images from Bling API
-      try {
-        const fullProd = await fetchFromBling(`/produtos/${itemData.id}`);
-        const freshImgs = extractImagesFromBlingItem(fullProd?.data || fullProd);
-        if (freshImgs.length > 0) {
-          recordProductImage({
-            sku: fullProd?.data?.codigo,
-            name: fullProd?.data?.nome,
-            id: itemData.id
-          }, freshImgs);
-          console.log(`[Webhook Bling] Fetched ${freshImgs.length} images from Bling API for product ID ${itemData.id}`);
+      });
+      if (hasFirebaseAdminEnv() && targetDocId) {
+        const db = getAdminFirestore();
+        if (parentId && Number(parentId) > 0) {
+          await db
+            .collection('products')
+            .doc(String(parentId))
+            .set(
+              {
+                [`variacoes.${itemId}.estoque`]: 0,
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            )
+            .catch(() => {});
+        } else {
+          await db
+            .collection('products')
+            .doc(targetDocId)
+            .set(
+              {
+                ativo: false,
+                deletedInBling: true,
+                deletedInBlingAt: new Date().toISOString(),
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            )
+            .catch(() => {});
         }
-      } catch (fetchErr: any) {
-        console.warn('[Webhook Bling] Notice: detailed product fetch skipped:', fetchErr?.message);
       }
+      invalidateBlingCachedResponse('/produtos');
+      invalidateBlingCachedResponse('/estoques');
+      clearBlingProductsRouteCache();
+    } else {
+      // Extract images if provided in payload
+      let finalImgs = extractImagesFromBlingItem(itemData);
+      let resolvedSku = itemData.codigo || itemData.sku;
+      let resolvedName = itemData.nome;
+
+      if (itemId) {
+        try {
+          const fullProd = await fetchFromBling(`/produtos/${itemId}`, { bypassCache: true });
+          const fullData = fullProd?.data || fullProd;
+          if (fullData?.situacao === 'I' || fullData?.situacao === 'E') {
+            removeProductFromImageStore({
+              id: itemId,
+              sku: fullData.codigo || resolvedSku,
+              name: fullData.nome || resolvedName,
+            });
+            if (hasFirebaseAdminEnv() && targetDocId) {
+              await getAdminFirestore()
+                .collection('products')
+                .doc(targetDocId)
+                .set(
+                  {
+                    ativo: false,
+                    deletedInBling: true,
+                    deletedInBlingAt: new Date().toISOString(),
+                    updatedAt: FieldValue.serverTimestamp(),
+                  },
+                  { merge: true }
+                )
+                .catch(() => {});
+            }
+          } else if (fullData) {
+            const freshImgs = extractImagesFromBlingItem(fullData);
+            if (freshImgs.length > 0) {
+              finalImgs = freshImgs;
+            }
+            resolvedSku = fullData.codigo || resolvedSku;
+            resolvedName = fullData.nome || resolvedName;
+          }
+        } catch (fetchErr: any) {
+          const msg = String(fetchErr?.message || '');
+          if (msg.includes('[404]')) {
+            removeProductFromImageStore({ id: itemId, sku: resolvedSku, name: resolvedName });
+            if (hasFirebaseAdminEnv() && targetDocId) {
+              await getAdminFirestore()
+                .collection('products')
+                .doc(targetDocId)
+                .set(
+                  {
+                    ativo: false,
+                    deletedInBling: true,
+                    deletedInBlingAt: new Date().toISOString(),
+                    updatedAt: FieldValue.serverTimestamp(),
+                  },
+                  { merge: true }
+                )
+                .catch(() => {});
+            }
+          } else {
+            console.warn('[Webhook Bling] Notice: detailed product fetch skipped:', msg);
+          }
+        }
+      }
+
+      if (finalImgs.length > 0) {
+        recordProductImage(
+          {
+            sku: resolvedSku,
+            name: resolvedName,
+            id: itemId || undefined,
+            parentId: parentId || undefined,
+          },
+          finalImgs,
+          { replaceRemoteBling: true }
+        );
+        if (hasFirebaseAdminEnv() && targetDocId) {
+          await getAdminFirestore()
+            .collection('products')
+            .doc(targetDocId)
+            .set(
+              {
+                imagemURL: finalImgs[0],
+                imagens: finalImgs,
+                updatedAt: FieldValue.serverTimestamp(),
+              },
+              { merge: true }
+            )
+            .catch(() => {});
+        }
+        console.log(`[Webhook Bling] Updated ${finalImgs.length} images (replace mode) for:`, resolvedName || resolvedSku || itemId);
+      }
+
+      invalidateBlingCachedResponse('/produtos');
+      invalidateBlingCachedResponse('/estoques');
+      clearBlingProductsRouteCache();
     }
   } catch (err: any) {
     console.error('[Webhook Bling] Processing error:', err);
@@ -1111,19 +1451,53 @@ app.post(['/api/webhooks/bling', '/api/bling/webhook'], async (req: Request, res
 });
 
 // Direct Catalog Revalidation / Sync Trigger
-app.all('/api/catalog/refresh', (req: Request, res: Response) => {
-  if (req.query.clearImages === 'true') {
-    clearImageCache(true);
+app.all('/api/catalog/refresh', async (req: Request, res: Response) => {
+  try {
+    if (req.query.clearImages !== 'false' && req.body?.clearImages !== false) {
+      clearImageCache(true);
+    }
+    invalidateBlingCachedResponse('/produtos');
+    invalidateBlingCachedResponse('/estoques');
+    clearBlingProductsRouteCache();
+    invalidateCatalogCache();
+
+    const triggerFirestoreSync = () => {
+      if (hasFirebaseAdminEnv() && !isBlingDailyQuotaExceeded() && !isAnyHeavyBlingLockActive()) {
+        syncAllBlingProdutosToFirestore({ startPage: 1, forceRefresh: true }).catch(() => {});
+      }
+    };
+
+    if (req.query.async === 'true') {
+      buildAndCacheCatalog({ forceImageSync: true })
+        .then(() => triggerFirestoreSync())
+        .catch(() => {});
+      return res.json({ success: true, message: 'Cache limpo e reconstrução do catálogo iniciada em segundo plano.' });
+    }
+
+    const rebuilt = await buildAndCacheCatalog({ forceImageSync: true });
+    triggerFirestoreSync();
+    return res.json({
+      success: true,
+      count: rebuilt.count,
+      message: 'Cache do catálogo limpo e sincronizado com o Bling com sucesso!',
+    });
+  } catch (err: any) {
+    return res.json({
+      success: true,
+      message: 'Cache do catálogo limpo (reconstrução em andamento).',
+      warning: err?.message,
+    });
   }
-  invalidateCatalogCache();
-  res.json({ success: true, message: 'Cache do catálogo limpo e sincronizado com sucesso!' });
 });
 
 // Clear cached images & catalog cache so full high-resolution Bling images are reloaded
 app.all(['/api/bling/clear-cache', '/api/bling/clear-image-cache'], (_req: Request, res: Response) => {
   clearImageCache(true);
+  invalidateBlingCachedResponse('/produtos');
+  invalidateBlingCachedResponse('/estoques');
+  clearBlingProductsRouteCache();
   invalidateCatalogCache();
-  res.json({ success: true, message: 'Cache de imagens e do catálogo limpos com sucesso!' });
+  res.json({ success: true, message: 'Cache de imagens, respostas Bling e catálogo limpos com sucesso!' });
 });
 
 // Full Bling ERP Image Synchronizer (Interceptado por blingAuthInterceptorMiddleware)
@@ -1136,7 +1510,7 @@ app.all(['/api/bling/sync-images', '/api/bling/sync-media'], blingAuthIntercepto
     });
     reapplyImagesToCachedCatalog();
     if (hasFirebaseAdminEnv()) {
-      syncImageStoreToFirestore().catch(() => {});
+      syncImageStoreToFirestore(getImageStoreSnapshot()).catch(() => {});
     }
     res.json(result);
   } catch (error: any) {
@@ -1177,57 +1551,12 @@ app.post('/api/products/update-image', (req: Request, res: Response) => {
   }
 });
 
-// Upload direct image file (base64) for any product
-app.post('/api/products/upload-image', (req: Request, res: Response) => {
-  try {
-    const { sku, name, id, fileData, imageDataUrl, fileName } = req.body;
-    const rawData = fileData || imageDataUrl;
-    if (!rawData || typeof rawData !== 'string') {
-      return res.status(400).json({ success: false, error: 'fileData ou imageDataUrl é obrigatório em formato base64' });
-    }
-
-    const matches = rawData.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
-    let buffer: Buffer;
-    let ext = 'jpg';
-
-    if (matches && matches.length === 3) {
-      const mime = matches[1];
-      if (mime.includes('png')) ext = 'png';
-      else if (mime.includes('webp')) ext = 'webp';
-      else if (mime.includes('gif')) ext = 'gif';
-      buffer = Buffer.from(matches[2], 'base64');
-    } else {
-      buffer = Buffer.from(rawData, 'base64');
-    }
-
-    const cleanBase = (fileName || `${sku || 'prod'}_${Date.now()}`)
-      .replace(/[^a-zA-Z0-9_-]/g, '_')
-      .slice(0, 40);
-    const finalFilename = `${cleanBase}_${Date.now()}.${ext}`;
-    const uploadsDir = process.env.VERCEL
-      ? path.resolve('/tmp', 'uploads')
-      : path.resolve(process.cwd(), 'public/assets/uploads');
-    if (!fs.existsSync(uploadsDir)) {
-      fs.mkdirSync(uploadsDir, { recursive: true });
-    }
-
-    const filePath = path.join(uploadsDir, finalFilename);
-    fs.writeFileSync(filePath, buffer);
-
-    const publicUrl = `/assets/uploads/${finalFilename}`;
-    recordProductImage({ sku, name, id }, [publicUrl]);
-    invalidateCatalogCache();
-
-    res.json({
-      success: true,
-      message: 'Foto enviada e vinculada ao produto com sucesso!',
-      imageUrl: publicUrl,
-      identifier: { sku, name, id }
-    });
-  } catch (err: any) {
-    console.error('[Upload Image Error]:', err);
-    res.status(500).json({ success: false, error: err.message || 'Erro ao processar upload de imagem' });
-  }
+// Local disk image uploads disabled (100% live Bling ERP images)
+app.post('/api/products/upload-image', (_req: Request, res: Response) => {
+  return res.status(410).json({
+    success: false,
+    error: 'Upload local em disco desativado. As imagens dos produtos são carregadas diretamente do Bling ERP.',
+  });
 });
 
 // Live Bling Catalog Metadata Endpoint
@@ -3377,6 +3706,9 @@ app.all(['/checkout/api_integration', '/checkout/api_integration/*'], (_req: Req
 
 // 7. Bling ERP Integration Routes (OAuth & Data sync) + explicit /api/bling router mount
 registerBlingRoutes(app, {
+  onCatalogSynced: () => {
+    invalidateCatalogCache();
+  },
   onTokensUpdated: () => {
     invalidateCatalogCache();
     buildAndCacheCatalog({ forceImageSync: false })

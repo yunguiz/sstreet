@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Sparkles, MapPin, Instagram } from 'lucide-react';
 import heroStreetwearImg from '../assets/images/hero_streetwear_urban_1793275500555.jpg';
 import lookviewModelImg from '../assets/images/lookview_fullkit_model_1793275500631.jpg';
-import sneakerChunkyImg from '../assets/images/product_sneaker_chunky_1793275503077.jpg';
+import graffitiWallImg from '../assets/images/graffiti_wall_dark_1793276349106.jpg';
 
 export function LogoHoverReveal() {
   const [isHovered, setIsHovered] = useState(false);
@@ -82,15 +82,15 @@ export function LogoHoverReveal() {
               </div>
               <div className="relative aspect-square rounded-lg overflow-hidden border border-zinc-800 bg-zinc-900">
                 <img 
-                  src={sneakerChunkyImg} 
-                  alt="Sneakers OG" 
+                  src={graffitiWallImg} 
+                  alt="Cultura Street" 
                   loading="lazy"
                   decoding="async"
                   className="w-full h-full object-cover"
                 />
                 <div className="absolute inset-0 bg-black/20" />
                 <span className="absolute bottom-1 left-1 text-[8px] font-bold text-white bg-black/60 px-1 py-0.5 rounded">
-                  KICKS
+                  STREET
                 </span>
               </div>
             </div>

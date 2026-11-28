@@ -1,6 +1,7 @@
 import { motion } from 'motion/react';
 import { Crown, X, ShoppingBag, Trash2, ArrowRight } from 'lucide-react';
 import { Product } from '../types';
+import { filterVisibleProducts } from '../lib/hiddenProducts';
 import { ProductImage } from './ProductImage';
 
 interface FavoritesDrawerProps {
@@ -22,6 +23,8 @@ export function FavoritesDrawer({
 }: FavoritesDrawerProps) {
   if (!isOpen) return null;
 
+  const visibleFavorites = filterVisibleProducts(favoriteProducts);
+
   return (
     <div className="fixed inset-0 z-50 overflow-hidden bg-black/80 backdrop-blur-sm">
       <div className="absolute inset-y-0 right-0 max-w-full flex pl-0 sm:pl-10">
@@ -40,7 +43,7 @@ export function FavoritesDrawer({
                 PEÇAS FAVORITAS
               </h2>
               <span className="bg-yellow-950/80 text-yellow-400 border border-yellow-800/60 text-xs font-bold px-2 py-0.5 rounded-full tabular-nums">
-                {favoriteProducts.length}
+                {visibleFavorites.length}
               </span>
             </div>
 
@@ -55,7 +58,7 @@ export function FavoritesDrawer({
 
           {/* List of Favorited Products */}
           <div className="flex-1 overflow-y-auto p-4 sm:p-5 space-y-4">
-            {favoriteProducts.length === 0 ? (
+            {visibleFavorites.length === 0 ? (
               <div className="py-20 text-center space-y-4">
                 <div className="w-16 h-16 rounded-full bg-zinc-900 border border-zinc-800 flex items-center justify-center mx-auto text-yellow-400/50">
                   <Crown className="w-8 h-8" />
@@ -76,7 +79,7 @@ export function FavoritesDrawer({
                 </button>
               </div>
             ) : (
-              favoriteProducts.map((product) => (
+              visibleFavorites.map((product) => (
                 <div
                   key={product.id}
                   className="flex gap-3 p-3 bg-[#181818] rounded-xl border border-zinc-800/80 hover:border-zinc-700 transition-colors"
@@ -144,7 +147,7 @@ export function FavoritesDrawer({
           </div>
 
           {/* Footer */}
-          {favoriteProducts.length > 0 && (
+          {visibleFavorites.length > 0 && (
             <div className="p-4 border-t border-[#262626] bg-[#141414]">
               <button
                 onClick={onClose}
