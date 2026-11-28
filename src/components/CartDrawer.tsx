@@ -468,8 +468,8 @@ export function CartDrawer({
     e.preventDefault();
     const code = couponCode.trim().toUpperCase();
     if (code === 'PRIMEIRACOMPRA') {
-      setAppliedDiscount(10);
-      setCouponMessage('Cupom de primeira compra aplicado! 10% de desconto!');
+      setAppliedDiscount(90);
+      setCouponMessage('Cupom de primeira compra aplicado! 90% de desconto!');
     } else {
       setAppliedDiscount(0);
       setCouponMessage('Cupom inválido ou expirado.');
