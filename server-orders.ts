@@ -315,7 +315,6 @@ async function resolveOrCreateBlingContact(params: {
   const email = (params.customer.email || '').trim().toLowerCase();
   const name = (params.customer.name || '').trim() || 'Cliente Street Store';
 
-  // 1. Search by CPF if valid 11 digits
   if (cleanCpf.length === 11) {
     try {
       const resCpf = await fetchFromBling(`/contatos?numeroDocumento=${cleanCpf}&limite=5`);
@@ -326,7 +325,6 @@ async function resolveOrCreateBlingContact(params: {
     }
   }
 
-  // 2. Search by email or name
   const searchKey = email && email !== 'streetstore364@gmail.com' ? email : name;
   if (searchKey && searchKey !== 'Cliente Street Store') {
     try {
@@ -344,7 +342,6 @@ async function resolveOrCreateBlingContact(params: {
     }
   }
 
-  // 3. Create customer contact in Bling
   try {
     const contactPayload: Record<string, any> = {
       nome: name,
@@ -413,7 +410,6 @@ async function resolveOrCreateBlingContact(params: {
     }
   }
 
-  // 4. Fallback to "Consumidor Final" contact in Bling
   try {
     const fallbackRes = await fetchFromBling('/contatos?pesquisa=Consumidor%20Final&limite=5');
     const fallbackContact = Array.isArray(fallbackRes?.data) ? fallbackRes.data[0] : null;
@@ -447,7 +443,7 @@ async function resolveBlingProductIdBySku(sku?: string): Promise<number | null> 
     try {
       const res = await fetchFromBling(`/produtos?codigos[]=${encodeURIComponent(cleanSku)}&limite=5`);
       const found = Array.isArray(res?.data)
-        ? res.data.find((p: any) => String(p.codigo || '').trim() === cleanSku) || res.data[0]
+        ? res.data.find((p: any) => String(p.codigo || '').trim().toLowerCase() === cleanSku.toLowerCase()) || res.data[0]
         : null;
       const resolvedId = found?.id ? Number(found.id) : null;
       skuBlingIdCache.set(cleanSku, { id: resolvedId, expiresAt: Date.now() + SKU_BLING_ID_TTL_MS });
@@ -461,6 +457,72 @@ async function resolveBlingProductIdBySku(sku?: string): Promise<number | null> 
 
   inFlightSkuLookups.set(cleanSku, promise);
   return promise;
+}
+
+const nameBlingIdCache = new Map<string, { id: number | null; expiresAt: number }>();
+const inFlightNameLookups = new Map<string, Promise<number | null>>();
+
+function normalizeProductNameForMatch(raw?: string): string {
+  return String(raw || '')
+    .replace(/\s*\([^)]*\)\s*/g, ' ')
+    .replace(/\s*-\s*Tam(?:anho)?\s*[^\s-]+$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function resolveBlingProductIdByName(name?: string, sku?: string): Promise<number | null> {
+  const baseName = normalizeProductNameForMatch(name);
+  if (!baseName || baseName.length < 2) return null;
+
+  const cacheKey = `${baseName.toLowerCase()}::${String(sku || '').trim().toLowerCase()}`;
+  const cached = nameBlingIdCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.id;
+  }
+
+  const existing = inFlightNameLookups.get(cacheKey);
+  if (existing) {
+    return existing;
+  }
+
+  const promise = (async () => {
+    try {
+      const res = await fetchFromBling(`/produtos?pesquisa=${encodeURIComponent(baseName)}&limite=10`);
+      const list = Array.isArray(res?.data) ? res.data : [];
+      if (!list.length) {
+        nameBlingIdCache.set(cacheKey, { id: null, expiresAt: Date.now() + SKU_BLING_ID_TTL_MS });
+        return null;
+      }
+
+      const cleanSku = String(sku || '').trim().toLowerCase();
+      const lowerBase = baseName.toLowerCase();
+      const matched =
+        (cleanSku && list.find((p: any) => String(p.codigo || '').trim().toLowerCase() === cleanSku)) ||
+        list.find((p: any) => String(p.nome || '').trim().toLowerCase() === lowerBase) ||
+        list.find((p: any) => String(p.nome || '').trim().toLowerCase().includes(lowerBase)) ||
+        list[0];
+
+      const resolvedId = matched?.id ? Number(matched.id) : null;
+      nameBlingIdCache.set(cacheKey, { id: resolvedId, expiresAt: Date.now() + SKU_BLING_ID_TTL_MS });
+      return resolvedId;
+    } catch {
+      return null;
+    } finally {
+      inFlightNameLookups.delete(cacheKey);
+    }
+  })();
+
+  inFlightNameLookups.set(cacheKey, promise);
+  return promise;
+}
+
+function isExistingItemCodeValidationError(errMsg: string): boolean {
+  const lower = String(errMsg || '').toLowerCase();
+  return (
+    lower.includes('código dos itens a serem cadastrados já existem') ||
+    lower.includes('codigo dos itens a serem cadastrados ja existem') ||
+    (lower.includes('validation_error') && lower.includes('"code":27'))
+  );
 }
 
 const inFlightBlingOrderSyncs = new Map<string, Promise<{ blingOrderId?: number; blingOrderNumber?: number; error?: string }>>();
@@ -519,174 +581,196 @@ async function syncOrderToBling(params: {
       return { error: msg };
     }
 
-  const todayDate = params.nowIso.slice(0, 10);
-  const contactId = await resolveOrCreateBlingContact({
-    customer: params.customer,
-    shippingAddress: params.shippingAddress,
-  });
-
-  if (!contactId) {
-    const msg = 'Não foi possível resolver contato.id no Bling.';
-    console.error('[Bling Order]', msg);
-    return { error: msg };
-  }
-
-  const blingItems: any[] = [];
-  for (let idx = 0; idx < (params.items || []).length; idx++) {
-    const it = params.items[idx];
-    const itemSku = (it.sku || '').trim() || `ST-${idx + 1}`;
-    let prodId = it.variantId && Number(it.variantId) > 0 ? Number(it.variantId) : null;
-    if (!prodId && it.sku) {
-      prodId = await resolveBlingProductIdBySku(it.sku);
-    }
-
-    const itemObj: Record<string, any> = {
-      codigo: itemSku,
-      unidade: 'UN',
-      descricao: it.name,
-      quantidade: Number(it.quantity || 1),
-      valor: Number(it.price || 0),
-    };
-    if (prodId && prodId > 0) {
-      itemObj.produto = { id: prodId };
-    }
-    blingItems.push(itemObj);
-  }
-
-  if (blingItems.length === 0) {
-    blingItems.push({
-      codigo: 'ST-ONLINE',
-      unidade: 'UN',
-      descricao: `Pedido Online ${params.orderNumber}`,
-      quantidade: 1,
-      valor: Number(params.total || 0),
+    const todayDate = params.nowIso.slice(0, 10);
+    const contactId = await resolveOrCreateBlingContact({
+      customer: params.customer,
+      shippingAddress: params.shippingAddress,
     });
-  }
 
-  const itemsSubtotal = blingItems.reduce((sum, it) => sum + Number(it.valor) * Number(it.quantidade), 0);
-  const shippingDiff = Math.max(0, Number((Number(params.total || 0) - itemsSubtotal).toFixed(2)));
-  const paymentMethodBlingId = await getBlingPaymentMethodId(params.paymentMethod);
-
- const blingPayload: Record<string, any> = {
-    numeroLoja: params.orderNumber,
-    loja: {
-      id: Number(process.env.BLING_STORE_ID || 206350173),
-    },
-    data: todayDate,
-    dataSaida: todayDate,
-    contato: { id: contactId },
-    observacoes: `[STREET STORE SITE] Pedido ${params.orderNumber} | Pago via ${params.paymentMethod} (MP ID: ${params.paymentId}) | Cliente: ${params.customer.name || 'Cliente'} (${params.customer.email})${params.customer.phone ? ` | WhatsApp: ${params.customer.phone}` : ''}`,
-    itens: blingItems,
-  };
-
-  if (params.shippingAddress?.street || shippingDiff > 0) {
-    blingPayload.transporte = {
-      fretePorConta: shippingDiff > 0 ? 0 : 9,
-      frete: shippingDiff,
-      ...(params.shippingAddress?.street
-        ? {
-            etiqueta: {
-              nome: params.shippingAddress.name || params.customer.name || 'Cliente Street Store',
-              endereco: params.shippingAddress.street,
-              numero: params.shippingAddress.number || 'S/N',
-              complemento: params.shippingAddress.complement || '',
-              municipio: params.shippingAddress.city || '',
-              uf: (params.shippingAddress.state || '').toUpperCase().slice(0, 2),
-              cep: (params.shippingAddress.zip || '').replace(/\D/g, ''),
-              bairro: params.shippingAddress.neighborhood || 'Centro',
-              nomePais: 'BRASIL',
-            },
-          }
-        : {}),
-    };
-  }
-
-  if (paymentMethodBlingId) {
-    blingPayload.parcelas = [
-      {
-        dataVencimento: todayDate,
-        valor: Number(params.total || itemsSubtotal),
-        observacoes: `Pagamento aprovado MP ${params.paymentId}`,
-        formaPagamento: { id: paymentMethodBlingId },
-      },
-    ];
-  }
-
-  let primaryErrorMsg = '';
-  try {
-    const blingRes = await fetchFromBling('/pedidos/vendas', {
-      method: 'POST',
-      body: JSON.stringify(blingPayload),
-    });
-    if (blingRes?.data?.id) {
-      console.log(`[Orders Store] Pedido ${params.orderNumber} sincronizado no Bling ERP (ID: ${blingRes.data.id}).`);
-      return {
-        blingOrderId: Number(blingRes.data.id),
-        blingOrderNumber: blingRes.data.numero ? Number(blingRes.data.numero) : undefined,
-      };
+    if (!contactId) {
+      const msg = 'Não foi possível resolver contato.id no Bling.';
+      console.error('[Bling Order]', msg);
+      return { error: msg };
     }
-  } catch (blingErr: any) {
-    primaryErrorMsg = blingErr?.message || String(blingErr);
 
-    // 409 Conflict = order likely already exists in Bling under this numeroLoja; resolve idempotently
-    if (isBlingConflictError(blingErr)) {
-      const existingBling = await lookupExistingBlingOrderByStoreNumber(params.orderNumber);
-      if (existingBling?.blingOrderId) {
-        console.log(`[Orders Store] Pedido ${params.orderNumber} já existia no Bling (409 idempotente -> ID: ${existingBling.blingOrderId}).`);
-        return existingBling;
+    const preparedItems: Array<{
+      codigo: string;
+      unidade: string;
+      descricao: string;
+      quantidade: number;
+      valor: number;
+      produtoId: number | null;
+    }> = [];
+
+    for (let idx = 0; idx < (params.items || []).length; idx++) {
+      const it = params.items[idx];
+      const itemSku = (it.sku || '').trim() || `ST-${idx + 1}`;
+      let prodId = it.variantId && Number(it.variantId) > 0 ? Number(it.variantId) : null;
+      if (!prodId && it.sku) {
+        prodId = await resolveBlingProductIdBySku(it.sku);
       }
-      return { error: primaryErrorMsg };
+      if (!prodId && it.name) {
+        prodId = await resolveBlingProductIdByName(it.name, it.sku);
+      }
+
+      preparedItems.push({
+        codigo: itemSku,
+        unidade: 'UN',
+        descricao: it.name,
+        quantidade: Number(it.quantity || 1),
+        valor: Number(it.price || 0),
+        produtoId: prodId && prodId > 0 ? prodId : null,
+      });
     }
 
-    // Do NOT trigger a second POST attempt on 429 Rate Limit or 401 Auth failure — fail fast & let retry queue handle it
-    if (isBlingRateLimitError(blingErr) || primaryErrorMsg.includes('[401]')) {
-      console.warn('[Orders Store] Envio ao Bling adiado por cota/autenticação (sem duplicar POST):', primaryErrorMsg);
-      return { error: primaryErrorMsg };
+    if (preparedItems.length === 0) {
+      preparedItems.push({
+        codigo: 'ST-ONLINE',
+        unidade: 'UN',
+        descricao: `Pedido Online ${params.orderNumber}`,
+        quantidade: 1,
+        valor: Number(params.total || 0),
+        produtoId: null,
+      });
     }
 
-    console.error('[Orders Store] Falha no envio completo ao Bling ERP:', primaryErrorMsg);
-
-    // Clean fallback retry without optional produto.id / parcelas / transporte in case Bling rejected SKU/payment relation
-    try {
-      const fallbackPayload = {
-        numeroLoja: params.orderNumber,
-        data: todayDate,
-        dataSaida: todayDate,
-        contato: { id: contactId },
-        observacoes: blingPayload.observacoes,
-        itens: blingItems.map((it) => ({
-          codigo: it.codigo,
-          unidade: 'UN',
+    const buildBlingItems = (opts?: { stripCodeForUnlinkedItems?: boolean }) =>
+      preparedItems.map((it) => {
+        const obj: Record<string, any> = {
+          unidade: it.unidade,
           descricao: it.descricao,
           quantidade: it.quantidade,
           valor: it.valor,
-        })),
-      };
-      const retryRes = await fetchFromBling('/pedidos/vendas', {
-        method: 'POST',
-        body: JSON.stringify(fallbackPayload),
+        };
+        if (it.produtoId && it.produtoId > 0) {
+          obj.produto = { id: it.produtoId };
+        }
+        if (!(opts?.stripCodeForUnlinkedItems && !it.produtoId)) {
+          obj.codigo = it.codigo;
+        }
+        return obj;
       });
-      if (retryRes?.data?.id) {
-        console.log(`[Orders Store] Pedido ${params.orderNumber} sincronizado no Bling ERP (fallback ID: ${retryRes.data.id}).`);
+
+    const blingItems = buildBlingItems({ stripCodeForUnlinkedItems: false });
+    const itemsSubtotal = blingItems.reduce((sum, it) => sum + Number(it.valor) * Number(it.quantidade), 0);
+    const shippingDiff = Math.max(0, Number((Number(params.total || 0) - itemsSubtotal).toFixed(2)));
+    const paymentMethodBlingId = await getBlingPaymentMethodId(params.paymentMethod);
+
+    const blingPayload: Record<string, any> = {
+      numeroLoja: params.orderNumber,
+      loja: {
+        id: Number(process.env.BLING_STORE_ID || 206350173),
+      },
+      data: todayDate,
+      dataSaida: todayDate,
+      contato: { id: contactId },
+      observacoes: `[STREET STORE SITE] Pedido ${params.orderNumber} | Pago via ${params.paymentMethod} (MP ID: ${params.paymentId}) | Cliente: ${params.customer.name || 'Cliente'} (${params.customer.email})${params.customer.phone ? ` | WhatsApp: ${params.customer.phone}` : ''}`,
+      itens: blingItems,
+    };
+
+    if (params.shippingAddress?.street || shippingDiff > 0) {
+      blingPayload.transporte = {
+        fretePorConta: shippingDiff > 0 ? 0 : 9,
+        frete: shippingDiff,
+        ...(params.shippingAddress?.street
+          ? {
+              etiqueta: {
+                nome: params.shippingAddress.name || params.customer.name || 'Cliente Street Store',
+                endereco: params.shippingAddress.street,
+                numero: params.shippingAddress.number || 'S/N',
+                complemento: params.shippingAddress.complement || '',
+                municipio: params.shippingAddress.city || '',
+                uf: (params.shippingAddress.state || '').toUpperCase().slice(0, 2),
+                cep: (params.shippingAddress.zip || '').replace(/\D/g, ''),
+                bairro: params.shippingAddress.neighborhood || 'Centro',
+                nomePais: 'BRASIL',
+              },
+            }
+          : {}),
+      };
+    }
+
+    if (paymentMethodBlingId) {
+      blingPayload.parcelas = [
+        {
+          dataVencimento: todayDate,
+          valor: Number(params.total || itemsSubtotal),
+          observacoes: `Pagamento aprovado MP ${params.paymentId}`,
+          formaPagamento: { id: paymentMethodBlingId },
+        },
+      ];
+    }
+
+    let primaryErrorMsg = '';
+    try {
+      const blingRes = await fetchFromBling('/pedidos/vendas', {
+        method: 'POST',
+        body: JSON.stringify(blingPayload),
+      });
+      if (blingRes?.data?.id) {
+        console.log(`[Orders Store] Pedido ${params.orderNumber} sincronizado no Bling ERP (ID: ${blingRes.data.id}).`);
         return {
-          blingOrderId: Number(retryRes.data.id),
-          blingOrderNumber: retryRes.data.numero ? Number(retryRes.data.numero) : undefined,
+          blingOrderId: Number(blingRes.data.id),
+          blingOrderNumber: blingRes.data.numero ? Number(blingRes.data.numero) : undefined,
         };
       }
-    } catch (retryErr: any) {
-      if (isBlingConflictError(retryErr)) {
+    } catch (blingErr: any) {
+      primaryErrorMsg = blingErr?.message || String(blingErr);
+
+      if (isBlingConflictError(blingErr)) {
         const existingBling = await lookupExistingBlingOrderByStoreNumber(params.orderNumber);
         if (existingBling?.blingOrderId) {
+          console.log(`[Orders Store] Pedido ${params.orderNumber} já existia no Bling (409 idempotente -> ID: ${existingBling.blingOrderId}).`);
           return existingBling;
         }
+        return { error: primaryErrorMsg };
       }
-      const retryMsg = retryErr?.message || String(retryErr);
-      console.error('[Orders Store] Fallback no Bling ERP também falhou:', retryMsg);
-      return { error: retryMsg };
-    }
-  }
 
-  return { error: primaryErrorMsg || 'Resposta sem ID ao criar pedido no Bling ERP.' };
+      if (isBlingRateLimitError(blingErr) || primaryErrorMsg.includes('[401]')) {
+        console.warn('[Orders Store] Envio ao Bling adiado por cota/autenticação (sem duplicar POST):', primaryErrorMsg);
+        return { error: primaryErrorMsg };
+      }
+
+      console.error('[Orders Store] Falha no envio completo ao Bling ERP:', primaryErrorMsg);
+
+      const stripCode = isExistingItemCodeValidationError(primaryErrorMsg);
+      try {
+        const fallbackPayload = {
+          numeroLoja: params.orderNumber,
+          loja: {
+            id: Number(process.env.BLING_STORE_ID || 206350173),
+          },
+          data: todayDate,
+          dataSaida: todayDate,
+          contato: { id: contactId },
+          observacoes: blingPayload.observacoes,
+          itens: buildBlingItems({ stripCodeForUnlinkedItems: stripCode }),
+        };
+        const retryRes = await fetchFromBling('/pedidos/vendas', {
+          method: 'POST',
+          body: JSON.stringify(fallbackPayload),
+        });
+        if (retryRes?.data?.id) {
+          console.log(`[Orders Store] Pedido ${params.orderNumber} sincronizado no Bling ERP (fallback ID: ${retryRes.data.id}).`);
+          return {
+            blingOrderId: Number(retryRes.data.id),
+            blingOrderNumber: retryRes.data.numero ? Number(retryRes.data.numero) : undefined,
+          };
+        }
+      } catch (retryErr: any) {
+        if (isBlingConflictError(retryErr)) {
+          const existingBling = await lookupExistingBlingOrderByStoreNumber(params.orderNumber);
+          if (existingBling?.blingOrderId) {
+            return existingBling;
+          }
+        }
+        const retryMsg = retryErr?.message || String(retryErr);
+        console.error('[Orders Store] Fallback no Bling ERP também falhou:', retryMsg);
+        return { error: retryMsg };
+      }
+    }
+
+    return { error: primaryErrorMsg || 'Resposta sem ID ao criar pedido no Bling ERP.' };
   })().finally(() => {
     inFlightBlingOrderSyncs.delete(syncKey);
   });
@@ -762,223 +846,218 @@ export async function createStoreOrder(params: {
   }
 
   const executeCreation = (async () => {
-  const existing = await findExistingOrderByPaymentId(params.paymentId, {
-    pendingPaymentId: params.pendingPaymentId,
-    endToEndId: params.endToEndId,
-  });
+    const existing = await findExistingOrderByPaymentId(params.paymentId, {
+      pendingPaymentId: params.pendingPaymentId,
+      endToEndId: params.endToEndId,
+    });
 
-  if (existing) {
-    let updated = false;
-    const resolvedUid = params.userId || params.customer?.uid;
-    if (resolvedUid && !existing.userId) {
-      existing.userId = resolvedUid;
-      existing.customer = { ...existing.customer, uid: resolvedUid };
-      updated = true;
-    }
-    if (params.pendingPaymentId && !existing.pendingPaymentId) {
-      existing.pendingPaymentId = params.pendingPaymentId;
-      updated = true;
-    }
-
-    // If previous save missed Bling sync and skipBling is false, retry Bling sync idempotently
-    if (!existing.blingOrderId && !params.skipBling) {
-      const blingSync = await syncOrderToBling({
-        orderNumber: existing.orderNumber,
-        paymentMethod: existing.paymentMethod,
-        paymentId: existing.paymentId,
-        customer: existing.customer,
-        items: (params.items && params.items.length > 0) ? params.items : existing.products.map((p) => ({
-          name: p.name,
-          price: p.price,
-          quantity: p.quantity,
-          sku: p.sku,
-          variantId: p.variantId,
-          image: p.image,
-        })),
-        shippingAddress: params.shippingAddress,
-        total: existing.total,
-        nowIso: existing.createdAt,
-      });
-      existing.blingSyncAttempts = (existing.blingSyncAttempts || 0) + 1;
-      existing.lastBlingSyncAt = new Date().toISOString();
-      if (blingSync.blingOrderId) {
-        existing.blingOrderId = blingSync.blingOrderId;
-        existing.blingOrderNumber = blingSync.blingOrderNumber;
-        existing.blingSyncStatus = 'synced';
-        existing.blingSyncError = null;
-      } else {
-        existing.blingSyncStatus = 'failed';
-        existing.blingSyncError = blingSync.error || 'Falha temporária ao enviar pedido ao Bling ERP';
+    if (existing) {
+      let updated = false;
+      const resolvedUid = params.userId || params.customer?.uid;
+      if (resolvedUid && !existing.userId) {
+        existing.userId = resolvedUid;
+        existing.customer = { ...existing.customer, uid: resolvedUid };
+        updated = true;
       }
-      updated = true;
+      if (params.pendingPaymentId && !existing.pendingPaymentId) {
+        existing.pendingPaymentId = params.pendingPaymentId;
+        updated = true;
+      }
+
+      if (!existing.blingOrderId && !params.skipBling) {
+        const blingSync = await syncOrderToBling({
+          orderNumber: existing.orderNumber,
+          paymentMethod: existing.paymentMethod,
+          paymentId: existing.paymentId,
+          customer: existing.customer,
+          items: (params.items && params.items.length > 0) ? params.items : existing.products.map((p) => ({
+            name: p.name,
+            price: p.price,
+            quantity: p.quantity,
+            sku: p.sku,
+            variantId: p.variantId,
+            image: p.image,
+          })),
+          shippingAddress: params.shippingAddress,
+          total: existing.total,
+          nowIso: existing.createdAt,
+        });
+        existing.blingSyncAttempts = (existing.blingSyncAttempts || 0) + 1;
+        existing.lastBlingSyncAt = new Date().toISOString();
+        if (blingSync.blingOrderId) {
+          existing.blingOrderId = blingSync.blingOrderId;
+          existing.blingOrderNumber = blingSync.blingOrderNumber;
+          existing.blingSyncStatus = 'synced';
+          existing.blingSyncError = null;
+        } else {
+          existing.blingSyncStatus = 'failed';
+          existing.blingSyncError = blingSync.error || 'Falha temporária ao enviar pedido ao Bling ERP';
+        }
+        updated = true;
+      }
+
+      if (updated) {
+        upsertOrderInLocalDb(existing);
+        await saveOrderToFirestore(existing);
+      }
+
+      return {
+        success: true,
+        id: existing.orderId,
+        number: existing.orderNumber,
+        blingOrderId: existing.blingOrderId,
+        blingOrderNumber: existing.blingOrderNumber,
+        blingSyncStatus: existing.blingSyncStatus,
+        blingSyncError: existing.blingSyncError || undefined,
+        melhorEnvioCartId: existing.melhorEnvioCartId,
+        alreadyExisted: true,
+      };
     }
 
-    if (updated) {
-      upsertOrderInLocalDb(existing);
-      await saveOrderToFirestore(existing);
+    const orderId = await getNextOrderSequence();
+    const orderNumber = `#${orderId}`;
+    const nowIso = params.paidAt || new Date().toISOString();
+    const resolvedUid = params.userId || params.customer?.uid;
+
+    const newOrder: StoredOrder = {
+      orderId,
+      orderNumber,
+      status: 'open',
+      paymentStatus: 'paid',
+      shippingStatus: 'unshipped',
+      shippingCarrier: params.shippingCarrier || 'Correios / Transportadora',
+      trackingNumber: null,
+      trackingUrl: null,
+      paymentMethod: params.paymentMethod,
+      paymentId: String(params.paymentId),
+      ...(params.pendingPaymentId ? { pendingPaymentId: params.pendingPaymentId } : {}),
+      ...(params.endToEndId ? { endToEndId: params.endToEndId } : {}),
+      ...(params.source ? { source: params.source } : {}),
+      ...(resolvedUid ? { userId: resolvedUid } : {}),
+      blingSyncStatus: params.skipBling ? 'skipped' : 'pending',
+      blingSyncAttempts: 0,
+      customer: {
+        ...(resolvedUid ? { uid: resolvedUid } : {}),
+        name: params.customer.name?.trim() || 'Cliente Street Store',
+        email: params.customer.email,
+        phone: params.customer.phone || '',
+        cpf: params.customer.cpf,
+      },
+      shippingAddress: params.shippingAddress
+        ? {
+            name: params.shippingAddress.name || params.customer.name || 'Cliente Street Store',
+            address: params.shippingAddress.street || 'Rua Principal',
+            number: params.shippingAddress.number || 'S/N',
+            locality: params.shippingAddress.neighborhood || 'Centro',
+            city: params.shippingAddress.city || 'Itabira',
+            province: params.shippingAddress.state || 'MG',
+            zipcode: (params.shippingAddress.zip || '').replace(/\D/g, ''),
+            country: 'BR',
+          }
+        : undefined,
+      products: (params.items || []).map((it) => ({
+        name: it.name,
+        price: Number(it.price || 0),
+        quantity: Number(it.quantity || 1),
+        variant: it.selectedSize || 'Tamanho Único',
+        ...(it.selectedColor ? { color: it.selectedColor } : {}),
+        sku: it.sku,
+        variantId: it.variantId,
+        image: it.image || '',
+      })),
+      total: Number(params.total || 0),
+      createdAt: nowIso,
+      paidAt: nowIso,
+      shippedAt: null,
+    };
+
+    upsertOrderInLocalDb(newOrder);
+    await saveOrderToFirestore(newOrder);
+    console.log(`[Orders Store] Pedido pago ${orderNumber} persistido em orders (ID pagamento: ${newOrder.paymentId}).`);
+
+    let postSaveDirty = false;
+
+    if (!params.skipBling) {
+      try {
+        newOrder.blingSyncAttempts = 1;
+        newOrder.lastBlingSyncAt = new Date().toISOString();
+        const blingSync = await syncOrderToBling({
+          orderNumber,
+          paymentMethod: params.paymentMethod,
+          paymentId: params.paymentId,
+          customer: newOrder.customer,
+          items: params.items || [],
+          shippingAddress: params.shippingAddress,
+          total: newOrder.total,
+          nowIso,
+        });
+        if (blingSync.blingOrderId) {
+          newOrder.blingOrderId = blingSync.blingOrderId;
+          newOrder.blingOrderNumber = blingSync.blingOrderNumber;
+          newOrder.blingSyncStatus = 'synced';
+          newOrder.blingSyncError = null;
+        } else {
+          newOrder.blingSyncStatus = 'failed';
+          newOrder.blingSyncError = blingSync.error || 'Erro temporário ao enviar pedido ao Bling ERP';
+        }
+        postSaveDirty = true;
+      } catch (blingErr: any) {
+        newOrder.blingSyncStatus = 'failed';
+        newOrder.blingSyncError = blingErr?.message || String(blingErr);
+        postSaveDirty = true;
+        console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP (pedido já salvo no site):', newOrder.blingSyncError);
+      }
+    }
+
+    let melhorEnvioCartId: string | undefined;
+    if (!params.skipMelhorEnvio && params.shippingAddress?.zip && params.shippingAddress?.street) {
+      try {
+        const meCart = await addOrderToMelhorEnvioCart({
+          serviceId: params.shippingServiceId || 1,
+          orderNumber,
+          customer: newOrder.customer,
+          shippingAddress: {
+            street: params.shippingAddress.street,
+            number: params.shippingAddress.number || 'S/N',
+            complement: params.shippingAddress.complement,
+            neighborhood: params.shippingAddress.neighborhood || 'Centro',
+            city: params.shippingAddress.city || 'Itabira',
+            state: params.shippingAddress.state || 'MG',
+            zip: params.shippingAddress.zip,
+          },
+          items: newOrder.products.map((p) => ({
+            name: p.name,
+            quantity: p.quantity,
+            price: p.price,
+          })),
+          total: newOrder.total,
+        });
+        if (meCart.success && meCart.cartId) {
+          melhorEnvioCartId = meCart.cartId;
+          newOrder.melhorEnvioCartId = meCart.cartId;
+          postSaveDirty = true;
+          console.log(`[Orders Store] Etiqueta adicionada ao carrinho Melhor Envio: ${meCart.cartId}`);
+        }
+      } catch (meErr: any) {
+        console.warn('[Orders Store] Registro opcional no Melhor Envio ignorado:', meErr?.message || meErr);
+      }
+    }
+
+    if (postSaveDirty) {
+      upsertOrderInLocalDb(newOrder);
+      await saveOrderToFirestore(newOrder);
     }
 
     return {
       success: true,
-      id: existing.orderId,
-      number: existing.orderNumber,
-      blingOrderId: existing.blingOrderId,
-      blingOrderNumber: existing.blingOrderNumber,
-      blingSyncStatus: existing.blingSyncStatus,
-      blingSyncError: existing.blingSyncError || undefined,
-      melhorEnvioCartId: existing.melhorEnvioCartId,
-      alreadyExisted: true,
+      id: orderId,
+      number: orderNumber,
+      blingOrderId: newOrder.blingOrderId,
+      blingOrderNumber: newOrder.blingOrderNumber,
+      blingSyncStatus: newOrder.blingSyncStatus,
+      blingSyncError: newOrder.blingSyncError || undefined,
+      melhorEnvioCartId,
     };
-  }
-
-  const orderId = await getNextOrderSequence();
-  const orderNumber = `#${orderId}`;
-  const nowIso = params.paidAt || new Date().toISOString();
-  const resolvedUid = params.userId || params.customer?.uid;
-
-  const newOrder: StoredOrder = {
-    orderId,
-    orderNumber,
-    status: 'open',
-    paymentStatus: 'paid',
-    shippingStatus: 'unshipped',
-    shippingCarrier: params.shippingCarrier || 'Correios / Transportadora',
-    trackingNumber: null,
-    trackingUrl: null,
-    paymentMethod: params.paymentMethod,
-    paymentId: String(params.paymentId),
-    ...(params.pendingPaymentId ? { pendingPaymentId: params.pendingPaymentId } : {}),
-    ...(params.endToEndId ? { endToEndId: params.endToEndId } : {}),
-    ...(params.source ? { source: params.source } : {}),
-    ...(resolvedUid ? { userId: resolvedUid } : {}),
-    blingSyncStatus: params.skipBling ? 'skipped' : 'pending',
-    blingSyncAttempts: 0,
-    customer: {
-      ...(resolvedUid ? { uid: resolvedUid } : {}),
-      name: params.customer.name?.trim() || 'Cliente Street Store',
-      email: params.customer.email,
-      phone: params.customer.phone || '',
-      cpf: params.customer.cpf,
-    },
-    shippingAddress: params.shippingAddress
-      ? {
-          name: params.shippingAddress.name || params.customer.name || 'Cliente Street Store',
-          address: params.shippingAddress.street || 'Rua Principal',
-          number: params.shippingAddress.number || 'S/N',
-          locality: params.shippingAddress.neighborhood || 'Centro',
-          city: params.shippingAddress.city || 'Itabira',
-          province: params.shippingAddress.state || 'MG',
-          zipcode: (params.shippingAddress.zip || '').replace(/\D/g, ''),
-          country: 'BR',
-        }
-      : undefined,
-    products: (params.items || []).map((it) => ({
-      name: it.name,
-      price: Number(it.price || 0),
-      quantity: Number(it.quantity || 1),
-      variant: it.selectedSize || 'Tamanho Único',
-      ...(it.selectedColor ? { color: it.selectedColor } : {}),
-      sku: it.sku,
-      variantId: it.variantId,
-      image: it.image || '',
-    })),
-    total: Number(params.total || 0),
-    createdAt: nowIso,
-    paidAt: nowIso,
-    shippedAt: null,
-  };
-
-  // CRITICAL: Save paid order to local DB & Firestore IMMEDIATELY BEFORE Bling / Melhor Envio calls.
-  // Temporary Bling 429 or network timeouts MUST NEVER block saving the paid order or leave it stuck in pending_payments.
-  upsertOrderInLocalDb(newOrder);
-  await saveOrderToFirestore(newOrder);
-  console.log(`[Orders Store] Pedido pago ${orderNumber} persistido em orders (ID pagamento: ${newOrder.paymentId}).`);
-
-  let postSaveDirty = false;
-
-  // Sync order to Bling ERP unless skipped (e.g. manual historical reconciliation)
-  if (!params.skipBling) {
-    try {
-      newOrder.blingSyncAttempts = 1;
-      newOrder.lastBlingSyncAt = new Date().toISOString();
-      const blingSync = await syncOrderToBling({
-        orderNumber,
-        paymentMethod: params.paymentMethod,
-        paymentId: params.paymentId,
-        customer: newOrder.customer,
-        items: params.items || [],
-        shippingAddress: params.shippingAddress,
-        total: newOrder.total,
-        nowIso,
-      });
-      if (blingSync.blingOrderId) {
-        newOrder.blingOrderId = blingSync.blingOrderId;
-        newOrder.blingOrderNumber = blingSync.blingOrderNumber;
-        newOrder.blingSyncStatus = 'synced';
-        newOrder.blingSyncError = null;
-      } else {
-        newOrder.blingSyncStatus = 'failed';
-        newOrder.blingSyncError = blingSync.error || 'Erro temporário ao enviar pedido ao Bling ERP';
-      }
-      postSaveDirty = true;
-    } catch (blingErr: any) {
-      newOrder.blingSyncStatus = 'failed';
-      newOrder.blingSyncError = blingErr?.message || String(blingErr);
-      postSaveDirty = true;
-      console.error('[Orders Store] Erro ao sincronizar pedido no Bling ERP (pedido já salvo no site):', newOrder.blingSyncError);
-    }
-  }
-
-  // Register shipment in Melhor Envio Cart if connected & address provided
-  let melhorEnvioCartId: string | undefined;
-  if (!params.skipMelhorEnvio && params.shippingAddress?.zip && params.shippingAddress?.street) {
-    try {
-      const meCart = await addOrderToMelhorEnvioCart({
-        serviceId: params.shippingServiceId || 1,
-        orderNumber,
-        customer: newOrder.customer,
-        shippingAddress: {
-          street: params.shippingAddress.street,
-          number: params.shippingAddress.number || 'S/N',
-          complement: params.shippingAddress.complement,
-          neighborhood: params.shippingAddress.neighborhood || 'Centro',
-          city: params.shippingAddress.city || 'Itabira',
-          state: params.shippingAddress.state || 'MG',
-          zip: params.shippingAddress.zip,
-        },
-        items: newOrder.products.map((p) => ({
-          name: p.name,
-          quantity: p.quantity,
-          price: p.price,
-        })),
-        total: newOrder.total,
-      });
-      if (meCart.success && meCart.cartId) {
-        melhorEnvioCartId = meCart.cartId;
-        newOrder.melhorEnvioCartId = meCart.cartId;
-        postSaveDirty = true;
-        console.log(`[Orders Store] Etiqueta adicionada ao carrinho Melhor Envio: ${meCart.cartId}`);
-      }
-    } catch (meErr: any) {
-      console.warn('[Orders Store] Registro opcional no Melhor Envio ignorado:', meErr?.message || meErr);
-    }
-  }
-
-  if (postSaveDirty) {
-    upsertOrderInLocalDb(newOrder);
-    await saveOrderToFirestore(newOrder);
-  }
-
-  return {
-    success: true,
-    id: orderId,
-    number: orderNumber,
-    blingOrderId: newOrder.blingOrderId,
-    blingOrderNumber: newOrder.blingOrderNumber,
-    blingSyncStatus: newOrder.blingSyncStatus,
-    blingSyncError: newOrder.blingSyncError || undefined,
-    melhorEnvioCartId,
-  };
   })().finally(() => {
     if (creationKey) {
       inFlightOrderCreations.delete(creationKey);
@@ -1240,7 +1319,7 @@ function isStoredOrderExpiredPendingPix(o: StoredOrder, nowMs: number = Date.now
   if (o.paymentStatus !== 'pending') return false;
   const isPix = Boolean(o.pendingPaymentId) || String(o.paymentMethod || '').toLowerCase().includes('pix');
   if (!isPix) return false;
-  const expMs =
+const expMs =
     typeof o.expiresAtMs === 'number' && o.expiresAtMs > 0
       ? o.expiresAtMs
       : o.expiresAt
