@@ -1714,6 +1714,9 @@ export async function createBlingOrder(params: BlingOrderParams): Promise<{
 
   const blingPayload = {
     numero: parseInt(orderNumber.replace(/\D/g, '') || String(Date.now()).slice(-5), 10),
+    loja: {
+      id: Number(process.env.BLING_STORE_ID || 206350173),
+    },
     data: todayStr,
     dataPrevista: todayStr,
     contato: {

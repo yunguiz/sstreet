@@ -567,8 +567,11 @@ async function syncOrderToBling(params: {
   const shippingDiff = Math.max(0, Number((Number(params.total || 0) - itemsSubtotal).toFixed(2)));
   const paymentMethodBlingId = await getBlingPaymentMethodId(params.paymentMethod);
 
-  const blingPayload: Record<string, any> = {
+ const blingPayload: Record<string, any> = {
     numeroLoja: params.orderNumber,
+    loja: {
+      id: Number(process.env.BLING_STORE_ID || 206350173),
+    },
     data: todayDate,
     dataSaida: todayDate,
     contato: { id: contactId },
