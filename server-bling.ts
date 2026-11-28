@@ -8,6 +8,7 @@ import {
   extractImagesFromBlingItem,
   getBlingImagesForProduct,
   isThumbnailLikeUrl,
+  recordProductImage,
 } from './server-bling-images.js';
 import {
   getBlingTokenFromDb,
@@ -1445,15 +1446,15 @@ export function registerBlingRoutes(
             }
           }
 
-          // Map to consistent format extracting all Bling image fields & real stock
+          // Map to consistent format extracting exclusively original full-resolution Bling URLs
           const formatted = rawProducts.map((p: any) => {
-            const directImages = extractImagesFromBlingItem(p);
-            const directFullRes = directImages.filter(u => !isThumbnailLikeUrl(u));
-            const cachedImgs = getBlingImagesForProduct({ name: p.nome, sku: p.codigo, blingId: String(p.id) }) || [];
-            const cachedFullRes = cachedImgs.filter(u => !isThumbnailLikeUrl(u));
-            const storedImages = directFullRes.length > 0
-              ? directFullRes
-              : (cachedFullRes.length > 0 ? cachedFullRes : (cachedImgs.length > 0 ? cachedImgs : directImages));
+            const directFullRes = extractImagesFromBlingItem(p).filter(u => !isThumbnailLikeUrl(u));
+            const cachedFullRes = (getBlingImagesForProduct({
+              name: p.nome,
+              sku: p.codigo,
+              blingId: String(p.idProdutoPai || p.id)
+            }) || []).filter(u => !isThumbnailLikeUrl(u));
+            const storedImages = directFullRes.length > 0 ? directFullRes : cachedFullRes;
             const realStock = stockMap[p.id] !== undefined
               ? stockMap[p.id]
               : (p.estoque?.saldoVirtualTotal ?? p.estoque?.saldoFisicoTotal ?? p.estoque?.saldoFisico ?? (stockApiSucceeded ? 0 : 0));
@@ -1479,6 +1480,43 @@ export function registerBlingRoutes(
           const visible = formatted
             .filter((p: any) => !isProductHidden(p) && (includeZeroStock || p.stock > 0))
             .sort((a: any, b: any) => Number(b.blingId || 0) - Number(a.blingId || 0));
+
+          // Hydrate missing full-res Bling media via GET /produtos/{id} for visible products
+          if (!isBlingDailyQuotaExceeded()) {
+            const detailFetchedCache = new Map<string, string[]>();
+            let detailCalls = 0;
+            for (const prod of visible) {
+              if (prod.images.length > 0 || detailCalls >= 35 || isBlingDailyQuotaExceeded()) continue;
+              const targetId = String(prod.idProdutoPai || prod.blingId || '').trim();
+              if (!targetId) continue;
+              if (detailFetchedCache.has(targetId)) {
+                const cached = detailFetchedCache.get(targetId)!;
+                if (cached.length > 0) {
+                  prod.images = cached;
+                  prod.imageUrl = cached[0];
+                }
+                continue;
+              }
+              detailCalls++;
+              try {
+                const detail = await fetchFromBling(`/produtos/${targetId}`, { bypassCache: forceRefresh });
+                const fullData = detail?.data || detail;
+                const fullImgs = extractImagesFromBlingItem(fullData, true).filter(u => !isThumbnailLikeUrl(u));
+                detailFetchedCache.set(targetId, fullImgs);
+                if (fullImgs.length > 0) {
+                  recordProductImage(
+                    { id: targetId, sku: fullData?.codigo || prod.sku, name: fullData?.nome || prod.name },
+                    fullImgs,
+                    { replaceRemoteBling: true }
+                  );
+                  prod.images = fullImgs;
+                  prod.imageUrl = fullImgs[0];
+                }
+              } catch (dErr: any) {
+                if (isBlingRateLimitError(dErr) || isBlingDailyQuotaExceeded()) break;
+              }
+            }
+          }
 
           const payload = {
             success: true,

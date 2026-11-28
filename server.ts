@@ -30,7 +30,7 @@ import {
 } from './lib/blingToken.js';
 import { syncAllBlingProdutosToFirestore, syncImageStoreToFirestore } from './lib/blingSyncProdutos.js';
 import { FieldValue } from 'firebase-admin/firestore';
-import { filterVisibleProducts } from './src/lib/hiddenProducts.js';
+import { filterVisibleProducts, isExcludedCatalogItem } from './src/lib/hiddenProducts.js';
 import {
   detectColorFromText,
   inferStoreCategory,
@@ -44,6 +44,7 @@ import {
   recordProductImage,
   syncImagesFromBling,
   extractImagesFromBlingItem,
+  getBlingSummaryMediaSignature,
   loadImageStore,
   saveImageStore,
   clearImageCache,
@@ -107,17 +108,26 @@ export function invalidateCatalogCache() {
 export function reapplyImagesToCachedCatalog() {
   if (catalogCache && Array.isArray(catalogCache.products)) {
     const updated = applyBlingImageOverrides(catalogCache.products, { preferStore: true }).map((p: any) => {
-      if (
-        p.colorImages &&
-        typeof p.colorImages === 'object' &&
-        Object.keys(p.colorImages).length === 1 &&
-        Array.isArray(p.images) &&
-        p.images.length > 0
-      ) {
-        const onlyKey = Object.keys(p.colorImages)[0];
+      const fullProductImgs = Array.isArray(p.images)
+        ? p.images.filter((u: string) => u && !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u))
+        : [];
+      if (p.colorImages && typeof p.colorImages === 'object') {
+        const nextColorImages: Record<string, string[]> = { ...p.colorImages };
+        const colorKeys = Object.keys(nextColorImages);
+        if (colorKeys.length === 1 && fullProductImgs.length > 0) {
+          nextColorImages[colorKeys[0]] = [...fullProductImgs];
+        } else if (fullProductImgs.length > 0) {
+          for (const ck of colorKeys) {
+            const cImgs = Array.isArray(nextColorImages[ck]) ? nextColorImages[ck] : [];
+            const cFull = cImgs.filter((u: string) => u && !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u));
+            if (cFull.length === 0) {
+              nextColorImages[ck] = [...fullProductImgs];
+            }
+          }
+        }
         return {
           ...p,
-          colorImages: { [onlyKey]: [...p.images] },
+          colorImages: nextColorImages,
         };
       }
       return p;
@@ -427,6 +437,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
     let hasAnyBlingSession = false;
     let catalogLockAcquired = false;
     let crawlCompletedCleanly = false;
+    let shouldScheduleBackgroundImageSync = false;
     const zeroStockFromBlingKeys = new Set<string>();
 
     // Merge all live products from Bling ERP seamlessly when connected (supports all 1411+ items & variations)
@@ -612,6 +623,62 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
         if (!imageStore.summaryKeyById) imageStore.summaryKeyById = {};
         if (!imageStore.checkedAtById) imageStore.checkedAtById = {};
         let imageStoreDirty = false;
+
+        // Cold-start pre-seed: when in-memory imageStore is empty (e.g. server restart) and not force-refreshing,
+        // load valid non-expired full-resolution Bling S3 URLs from Firestore `products` so no /t/ thumbnail appears.
+        if (!forceRefresh && Object.keys(imageStore.byId).length === 0 && hasFirebaseAdminEnv()) {
+          try {
+            const fsSnap = await getAdminFirestore().collection('products').where('ativo', '==', true).get();
+            fsSnap.forEach((docSnap) => {
+              const d = (docSnap.data() || {}) as Record<string, any>;
+              const docBlingId = String(d.blingId || docSnap.id).trim();
+              const docSku = String(d.codigo || '').trim();
+              const docName = String(d.nome || '').trim();
+              const docFullImgs = (Array.isArray(d.imagens) ? d.imagens : [])
+                .map((u: any) => stripResizeAndCompressionParams(String(u || '').trim()))
+                .filter((u: string) => Boolean(u) && !isPlaceholderImageUrl(u) && !isExpiredPresignedUrl(u) && !isThumbnailLikeUrl(u));
+              if (docFullImgs.length > 0) {
+                applyImageRecordToStore(
+                  imageStore,
+                  { id: docBlingId, sku: docSku || undefined, name: docName || undefined },
+                  docFullImgs,
+                  { replaceRemoteBling: true }
+                );
+                if (typeof d.summaryImageKey === 'string' && d.summaryImageKey) {
+                  imageStore.summaryKeyById![docBlingId] = d.summaryImageKey;
+                }
+                if (typeof d.detailCheckedAt === 'number' && d.detailCheckedAt > 0) {
+                  imageStore.checkedAtById![docBlingId] = d.detailCheckedAt;
+                }
+                imageStoreDirty = true;
+              }
+              if (d.variacoes && typeof d.variacoes === 'object') {
+                for (const v of Object.values(d.variacoes as Record<string, any>)) {
+                  const vId = String(v?.blingId || '').trim();
+                  const vSku = String(v?.codigo || '').trim();
+                  const vPool = [
+                    ...(Array.isArray(v?.imagens) ? v.imagens : []),
+                    ...(typeof v?.imagemURL === 'string' ? [v.imagemURL] : []),
+                  ]
+                    .map((u: any) => stripResizeAndCompressionParams(String(u || '').trim()))
+                    .filter((u: string) => Boolean(u) && !isPlaceholderImageUrl(u) && !isExpiredPresignedUrl(u) && !isThumbnailLikeUrl(u));
+                  if (vPool.length > 0 && (vId || vSku)) {
+                    applyImageRecordToStore(
+                      imageStore,
+                      { id: vId || undefined, sku: vSku || undefined, name: String(v?.nome || docName || '') || undefined },
+                      vPool,
+                      { replaceRemoteBling: true }
+                    );
+                    imageStoreDirty = true;
+                  }
+                }
+              }
+            });
+          } catch (fsSeedErr: any) {
+            console.warn('[Catalog] Notice pre-seeding full-res images from Firestore:', fsSeedErr?.message || fsSeedErr);
+          }
+        }
+
         const groupsNeedingDetailFetch: Array<{
           id: number;
           sku: string;
@@ -649,9 +716,13 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           }
           const blingExtractedImages = dedupeCanonicalUrls(rawBlingUrls);
           const fullResBlingExtracted = blingExtractedImages.filter((u) => !isThumbnailLikeUrl(u));
-          const summaryKey = blingExtractedImages
-            .map((u) => getCanonicalImageKey(u))
-            .filter(Boolean)
+          const summaryKey = Array.from(
+            new Set(
+              group.items
+                .map((it) => getBlingSummaryMediaSignature(it))
+                .filter(Boolean)
+            )
+          )
             .sort()
             .join('|');
           const idKey = String(group.id);
@@ -822,10 +893,8 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             images = cachedFullRes;
           } else if (fullResBlingExtracted.length > 0) {
             images = fullResBlingExtracted;
-          } else if (cachedBlingImages.length > 0) {
-            images = cachedBlingImages;
-          } else if (blingExtractedImages.length > 0) {
-            images = blingExtractedImages;
+          } else if (cachedFullRes.length > 0) {
+            images = cachedFullRes;
           }
 
           const colorImages: Record<string, string[]> = {};
@@ -883,15 +952,25 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
             variantsList
           };
 
-          const hasLowResOnly = images.length > 0 && images.every(u =>
+          const excludedItem = isExcludedCatalogItem({
+            name: group.baseName,
+            integration: { sku: groupSku },
+            category: group.category,
+            subcategory: group.subcategory,
+            description: cleanedBlingDesc,
+            sizes: activeSizes,
+            variantsList,
+          });
+
+          const hasNoFullRes = images.length === 0 || images.every(u =>
             isPlaceholderImageUrl(u) || isThumbnailLikeUrl(u)
           );
           const lastCheckedAt = Number(imageStore.checkedAtById[idKey] || 0);
           const detailStale = Date.now() - lastCheckedAt > 5 * 60 * 1000;
-          const needsMissingOrLowRes = (blingExtractedImages.length === 0 && images.every(u => isPlaceholderImageUrl(u))) || hasLowResOnly;
+          const needsMissingOrLowRes = hasNoFullRes;
           const needsDriftRefresh = summaryChanged || forceRefresh || detailStale;
 
-          if (needsMissingOrLowRes || needsDriftRefresh) {
+          if (!excludedItem && (needsMissingOrLowRes || needsDriftRefresh)) {
             const priority = needsMissingOrLowRes ? 0 : (summaryChanged ? 1 : 2);
             groupsNeedingDetailFetch.push({
               id: group.id,
@@ -909,12 +988,16 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
           addedFromBlingCount++;
         }
 
-        // Fetch authoritative full detail media inline (oldest-checked & missing-media first)
+        // Fetch authoritative full detail media inline (missing full-res first, then changed/stale)
         if (groupsNeedingDetailFetch.length > 0 && !isBlingDailyQuotaExceeded()) {
           if (!isImageSyncRunning()) {
             groupsNeedingDetailFetch.sort((a, b) => a.priority - b.priority || a.checkedAt - b.checkedAt);
-            const inlineBatch = groupsNeedingDetailFetch.slice(0, forceRefresh ? 25 : 8);
-            console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} products scheduled for live detail media verification. Fetching ${inlineBatch.length}...`);
+            const missingCount = groupsNeedingDetailFetch.filter((g) => g.priority === 0).length;
+            const batchLimit = forceRefresh
+              ? Math.max(95, Math.min(130, groupsNeedingDetailFetch.length))
+              : Math.max(25, Math.min(95, missingCount + 10));
+            const inlineBatch = groupsNeedingDetailFetch.slice(0, batchLimit);
+            console.log(`[Bling Sync] ${groupsNeedingDetailFetch.length} visible products scheduled for live detail media verification (${missingCount} needing full-res). Fetching ${inlineBatch.length}...`);
             for (const target of inlineBatch) {
               if (isBlingDailyQuotaExceeded()) break;
               try {
@@ -944,24 +1027,41 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                 if (activeDetailVars.length > 0 && Array.isArray(target.productRef.variantsList)) {
                   const varMediaById = new Map<number, string[]>();
                   let extraVarFetches = 0;
+                  const fetchedVarColors = new Set<string>();
 
                   for (const dv of activeDetailVars) {
                     if (!dv?.id) continue;
                     let dvImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(dv, false)).map(
                       (u) => detailFullMap.get(getCanonicalImageKey(u)) || u
                     );
-                    dvImgs = dedupeCanonicalUrls(dvImgs);
-                    const dvHasFull = dvImgs.some((u) => !isThumbnailLikeUrl(u));
-                    if ((!dvHasFull || multiColorCount > 1) && extraVarFetches < 4 && !isBlingDailyQuotaExceeded()) {
+                    dvImgs = dedupeCanonicalUrls(dvImgs).filter((u) => !isThumbnailLikeUrl(u));
+                    const dvHasFull = dvImgs.length > 0;
+                    const dvMeta = parseBlingVariantMeta({
+                      nome: String(dv.nome || ''),
+                      variacaoNome: String(dv.variacao?.nome || ''),
+                      isParentContainer: false,
+                    });
+                    const dvColorKey = dvMeta.color?.name ? dvMeta.color.name.toLowerCase() : '';
+                    const needParentFallbackFetch = detailFull.length === 0 && !dvHasFull && extraVarFetches < 2;
+                    const needMultiColorFetch =
+                      multiColorCount > 1 &&
+                      !dvHasFull &&
+                      (!dvColorKey || !fetchedVarColors.has(dvColorKey)) &&
+                      extraVarFetches < 4;
+
+                    if ((needParentFallbackFetch || needMultiColorFetch) && !isBlingDailyQuotaExceeded()) {
                       extraVarFetches++;
+                      if (dvColorKey) fetchedVarColors.add(dvColorKey);
                       try {
                         const vDetail = await fetchFromBling(`/produtos/${dv.id}`, { bypassCache: true });
                         const vData = vDetail?.data || vDetail;
-                        const fetchedVarImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(vData, false));
+                        const fetchedVarImgs = dedupeCanonicalUrls(extractImagesFromBlingItem(vData, false)).filter(
+                          (u) => !isThumbnailLikeUrl(u)
+                        );
                         if (fetchedVarImgs.length > 0) {
                           dvImgs = fetchedVarImgs;
                           for (const vu of fetchedVarImgs) {
-                            if (!isThumbnailLikeUrl(vu)) detailFullMap.set(getCanonicalImageKey(vu), vu);
+                            detailFullMap.set(getCanonicalImageKey(vu), vu);
                           }
                         }
                       } catch (vErr: any) {
@@ -969,8 +1069,7 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                       }
                     }
                     if (dvImgs.length > 0) {
-                      const dvFull = dvImgs.filter((u) => !isThumbnailLikeUrl(u));
-                      varMediaById.set(Number(dv.id), dvFull.length > 0 ? dvFull : dvImgs);
+                      varMediaById.set(Number(dv.id), dvImgs);
                     }
                   }
 
@@ -981,8 +1080,15 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                       [...(Array.isArray(v.images) ? v.images : []), ...(v.image ? [v.image] : [])].map(
                         (u) => detailFullMap.get(getCanonicalImageKey(u)) || u
                       )
-                    );
-                    const nextVarImgs = liveVarImgs && liveVarImgs.length > 0 ? liveVarImgs : fallbackUpgraded;
+                    ).filter((u) => !isThumbnailLikeUrl(u));
+                    const nextVarImgs =
+                      liveVarImgs && liveVarImgs.length > 0
+                        ? liveVarImgs
+                        : fallbackUpgraded.length > 0
+                        ? fallbackUpgraded
+                        : multiColorCount <= 1 && detailFull.length > 0
+                        ? detailFull
+                        : [];
                     if (v.color && (v.stock ?? 0) > 0 && nextVarImgs.length > 0) {
                       nextColorImages[v.color] = dedupeCanonicalUrls([
                         ...(nextColorImages[v.color] || []),
@@ -1034,8 +1140,14 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
                   removeProductFromImageStore({ id: target.id, sku: target.sku, name: target.baseName });
                   imageStoreDirty = true;
                 }
-                if (isBlingRateLimitError(detailErr) || isBlingDailyQuotaExceeded()) break;
+                if (isBlingRateLimitError(detailErr) || isBlingDailyQuotaExceeded()) {
+                  shouldScheduleBackgroundImageSync = true;
+                  break;
+                }
               }
+            }
+            if (inlineBatch.length < groupsNeedingDetailFetch.filter((g) => g.priority === 0).length) {
+              shouldScheduleBackgroundImageSync = true;
             }
           } else {
             console.log(`[Bling Sync] Background high-res image sync already active (${groupsNeedingDetailFetch.length} products awaiting detail media).`);
@@ -1074,6 +1186,22 @@ async function buildAndCacheCatalog(options?: { forceImageSync?: boolean }) {
       if (catalogLockAcquired) {
         releaseHeavyBlingLock('catalog-build');
       }
+    }
+
+    if (shouldScheduleBackgroundImageSync && !isBlingDailyQuotaExceeded() && !isImageSyncRunning()) {
+      setTimeout(() => {
+        syncImagesFromBling({
+          maxDetailFetches: 120,
+          onBatchSaved: () => reapplyImagesToCachedCatalog(),
+        })
+          .then(() => {
+            reapplyImagesToCachedCatalog();
+            if (hasFirebaseAdminEnv()) {
+              syncImageStoreToFirestore(getImageStoreSnapshot()).catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }, 1500);
     }
 
     // Helper to extract base product name (strips variation labels, sizes, colors)

@@ -64,6 +64,7 @@ export const ProductImage: React.FC<ProductImageProps> = ({
   return (
     <img
       {...rest}
+      key={activeSrc}
       src={activeSrc}
       alt={alt}
       loading={priority ? 'eager' : loading}

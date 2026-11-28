@@ -6,6 +6,7 @@ import {
   releaseHeavyBlingLock,
 } from './lib/blingToken.js';
 import type { Product } from './src/types/index.js';
+import { isExcludedCatalogItem } from './src/lib/hiddenProducts.js';
 
 const IMAGE_STORE_VERSION = 5;
 const DETAIL_CHECK_COOLDOWN_MS = 45 * 1000;
@@ -207,6 +208,7 @@ export function stripResizeAndCompressionParams(rawUrl: string): string {
 
   try {
     const parsed = new URL(trimmed);
+    let mutated = false;
     const keysToDelete: string[] = [];
     parsed.searchParams.forEach((_val, key) => {
       if (RESIZE_QUERY_PARAMS.has(key.toLowerCase())) {
@@ -215,17 +217,22 @@ export function stripResizeAndCompressionParams(rawUrl: string): string {
     });
     for (const key of keysToDelete) {
       parsed.searchParams.delete(key);
+      mutated = true;
     }
 
     // Remove common resize/compression path suffixes before extension (skipping mitiendanube fixed asset hashes)
     if (!parsed.hostname.includes('mitiendanube.com') && !parsed.hostname.includes('tiendanube.com')) {
-      parsed.pathname = parsed.pathname.replace(
+      const cleanedPath = parsed.pathname.replace(
         /(?:_miniatura|-miniatura|_mini|-mini|_thumb|-thumb|_small|-small|_medium|-medium|_low|-low|_\d{2,4}x\d{2,4}|-\d{2,4}x\d{2,4})(?=\.(?:jpe?g|png|webp|avif|gif)$)/i,
         ''
       );
+      if (cleanedPath !== parsed.pathname) {
+        parsed.pathname = cleanedPath;
+        mutated = true;
+      }
     }
 
-    return parsed.toString();
+    return mutated ? parsed.toString() : trimmed;
   } catch {
     return trimmed;
   }
@@ -299,7 +306,7 @@ export function getCanonicalImageKey(url: string): string {
   }
 }
 
-function normalizeImageUrl(val: any, allowThumbnailFallback: boolean = false): string | null {
+function normalizeImageUrl(val: any): string | null {
   if (!val) return null;
   if (typeof val === 'object') {
     const primaryCandidate =
@@ -313,13 +320,7 @@ function normalizeImageUrl(val: any, allowThumbnailFallback: boolean = false): s
       val.anexo?.link ||
       val.anexo?.url;
     if (typeof primaryCandidate === 'string' && primaryCandidate.trim()) {
-      return normalizeImageUrl(primaryCandidate, allowThumbnailFallback);
-    }
-    if (allowThumbnailFallback) {
-      const thumbCandidate = val.linkMiniatura || val.thumbnail;
-      if (typeof thumbCandidate === 'string' && thumbCandidate.trim()) {
-        return normalizeImageUrl(thumbCandidate, true);
-      }
+      return normalizeImageUrl(primaryCandidate);
     }
     return null;
   }
@@ -340,113 +341,106 @@ function normalizeImageUrl(val: any, allowThumbnailFallback: boolean = false): s
   return null;
 }
 
-function extractImagesFromSingleObject(
-  item: any,
-  urls: string[],
-  allowThumbnailFallback: boolean = false
-) {
+function extractImagesFromSingleObject(item: any, urls: string[]) {
   if (!item || typeof item !== 'object') return;
 
-  const push = (val: any, forceAllowThumb: boolean = allowThumbnailFallback) => {
-    const normalized = normalizeImageUrl(val, forceAllowThumb);
+  const push = (val: any) => {
+    const normalized = normalizeImageUrl(val);
     if (normalized && !urls.includes(normalized)) {
       urls.push(normalized);
     }
   };
 
-  const pushArray = (arr: any, forceAllowThumb: boolean = allowThumbnailFallback) => {
+  const pushArray = (arr: any) => {
     if (!Array.isArray(arr)) return;
     const sorted = [...arr].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
     for (const entry of sorted) {
-      push(entry, forceAllowThumb);
+      push(entry);
     }
   };
 
-  if (!allowThumbnailFallback) {
-    if (item.midia) {
-      const imagens = item.midia.imagens;
-      if (Array.isArray(imagens)) {
-        pushArray(imagens, false);
-      } else if (imagens && typeof imagens === 'object') {
-        if (Array.isArray(imagens.internas)) {
-          const sortedInternas = [...imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-          for (const imgObj of sortedInternas) {
-            if (typeof imgObj === 'string') {
-              push(imgObj, false);
-            } else if (imgObj && typeof imgObj === 'object') {
-              push(imgObj.link || imgObj.url, false);
-            }
-          }
-        }
-        if (Array.isArray(imagens.externas)) {
-          const sortedExternas = [...imagens.externas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
-          for (const imgObj of sortedExternas) {
-            if (typeof imgObj === 'string') {
-              push(imgObj, false);
-            } else if (imgObj && typeof imgObj === 'object') {
-              push(imgObj.link || imgObj.url, false);
-            }
-          }
-        }
-        pushArray(imagens.imagensURL, false);
-        pushArray(imagens.url, false);
-      }
-      if (Array.isArray(item.midia.fotos)) {
-        pushArray(item.midia.fotos, false);
-      }
-    }
-
-    if (Array.isArray(item.imagens)) {
-      pushArray(item.imagens, false);
-    } else if (item.imagens && typeof item.imagens === 'object') {
-      if (Array.isArray(item.imagens.internas)) pushArray(item.imagens.internas, false);
-      if (Array.isArray(item.imagens.externas)) pushArray(item.imagens.externas, false);
-      if (Array.isArray(item.imagens.imagensURL)) pushArray(item.imagens.imagensURL, false);
-    }
-
-    push(item.imagemURL, false);
-    push(item.urlImagem, false);
-    push(item.imagem, false);
-
-    if (Array.isArray(item.anexos)) pushArray(item.anexos, false);
-    if (item.anexo) push(item.anexo, false);
-
-    if (Array.isArray(item.fotos)) {
-      pushArray(item.fotos, false);
-    } else if (item.fotos && typeof item.fotos === 'object' && Array.isArray(item.fotos.foto)) {
-      pushArray(item.fotos.foto, false);
-    }
-  } else {
-    if (item.midia?.imagens && typeof item.midia.imagens === 'object' && !Array.isArray(item.midia.imagens)) {
-      if (Array.isArray(item.midia.imagens.internas)) {
-        const sortedInternas = [...item.midia.imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
+  if (item.midia) {
+    const imagens = item.midia.imagens;
+    if (Array.isArray(imagens)) {
+      pushArray(imagens);
+    } else if (imagens && typeof imagens === 'object') {
+      if (Array.isArray(imagens.internas)) {
+        const sortedInternas = [...imagens.internas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
         for (const imgObj of sortedInternas) {
-          if (imgObj && typeof imgObj === 'object') {
-            push(imgObj.linkMiniatura || imgObj.thumbnail, true);
+          if (typeof imgObj === 'string') {
+            push(imgObj);
+          } else if (imgObj && typeof imgObj === 'object') {
+            push(imgObj.link || imgObj.url);
           }
         }
       }
-      if (Array.isArray(item.midia.imagens.externas)) {
-        const sortedExternas = [...item.midia.imagens.externas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
+      if (Array.isArray(imagens.externas)) {
+        const sortedExternas = [...imagens.externas].sort((a: any, b: any) => (a?.ordem ?? 0) - (b?.ordem ?? 0));
         for (const imgObj of sortedExternas) {
-          if (imgObj && typeof imgObj === 'object') {
-            push(imgObj.linkMiniatura || imgObj.thumbnail, true);
+          if (typeof imgObj === 'string') {
+            push(imgObj);
+          } else if (imgObj && typeof imgObj === 'object') {
+            push(imgObj.link || imgObj.url);
           }
         }
       }
+      pushArray(imagens.imagensURL);
+      pushArray(imagens.url);
     }
-    if (item.imagens && typeof item.imagens === 'object' && !Array.isArray(item.imagens)) {
-      if (Array.isArray(item.imagens.internas)) pushArray(item.imagens.internas, true);
-      if (Array.isArray(item.imagens.externas)) pushArray(item.imagens.externas, true);
+    if (Array.isArray(item.midia.fotos)) {
+      pushArray(item.midia.fotos);
     }
-    push(item.thumbnail, true);
+  }
+
+  if (Array.isArray(item.imagens)) {
+    pushArray(item.imagens);
+  } else if (item.imagens && typeof item.imagens === 'object') {
+    if (Array.isArray(item.imagens.internas)) pushArray(item.imagens.internas);
+    if (Array.isArray(item.imagens.externas)) pushArray(item.imagens.externas);
+    if (Array.isArray(item.imagens.imagensURL)) pushArray(item.imagens.imagensURL);
+  }
+
+  push(item.imagemURL);
+  push(item.urlImagem);
+  push(item.imagem);
+
+  if (Array.isArray(item.anexos)) pushArray(item.anexos);
+  if (item.anexo) push(item.anexo);
+
+  if (Array.isArray(item.fotos)) {
+    pushArray(item.fotos);
+  } else if (item.fotos && typeof item.fotos === 'object' && Array.isArray(item.fotos.foto)) {
+    pushArray(item.fotos.foto);
   }
 }
 
 /**
- * Extracts all valid image URLs from any Bling API v3 or webhook product payload.
- * Always prioritizes original high-resolution URLs (midia.imagens.internas[x].link / externas[x].link),
- * leaving linkMiniatura strictly as a last-resort fallback when .link is empty.
+ * Computes a summary change-detection signature from Bling list payloads (including imagemURL path hashes)
+ * without returning thumbnail URLs into the storefront catalog.
+ */
+export function getBlingSummaryMediaSignature(rawItem: any): string {
+  if (!rawItem) return '';
+  const item = rawItem?.data && typeof rawItem.data === 'object' && !Array.isArray(rawItem.data)
+    ? rawItem.data
+    : rawItem;
+  const rawUrls: string[] = [];
+  extractImagesFromSingleObject(item, rawUrls);
+  if (Array.isArray(item.variacoes)) {
+    for (const v of item.variacoes) {
+      if (v?.situacao === 'I' || v?.situacao === 'E') continue;
+      extractImagesFromSingleObject(v, rawUrls);
+    }
+  }
+  return Array.from(new Set(rawUrls.map(getCanonicalImageKey).filter(Boolean)))
+    .sort()
+    .slice(0, 5)
+    .join('|');
+}
+
+/**
+ * Extracts all valid full-resolution image URLs from any Bling API v3 or webhook product payload.
+ * Exclusively returns original full-resolution URLs (midia.imagens.internas[x].link / externas[x].link / main URL)
+ * and NEVER returns linkMiniatura or /t/ thumbnails.
  */
 export function extractImagesFromBlingItem(rawItem: any, includeVariations: boolean = true): string[] {
   if (!rawItem) return [];
@@ -455,46 +449,28 @@ export function extractImagesFromBlingItem(rawItem: any, includeVariations: bool
     : rawItem;
 
   const highResUrls: string[] = [];
-  extractImagesFromSingleObject(item, highResUrls, false);
+  extractImagesFromSingleObject(item, highResUrls);
 
   if (includeVariations && Array.isArray(item.variacoes)) {
     for (const v of item.variacoes) {
       if (v?.situacao === 'I' || v?.situacao === 'E') continue;
-      extractImagesFromSingleObject(v, highResUrls, false);
+      extractImagesFromSingleObject(v, highResUrls);
     }
   }
 
-  const nonThumbHighRes = highResUrls.filter(u => !isThumbnailLikeUrl(u) && !isExpiredPresignedUrl(u));
-  if (nonThumbHighRes.length > 0) {
-    return nonThumbHighRes;
-  }
-  const nonExpiredHighRes = highResUrls.filter(u => !isExpiredPresignedUrl(u));
-  if (nonExpiredHighRes.length > 0) {
-    return nonExpiredHighRes;
-  }
-
-  const fallbackUrls: string[] = [];
-  extractImagesFromSingleObject(item, fallbackUrls, true);
-  if (includeVariations && Array.isArray(item.variacoes)) {
-    for (const v of item.variacoes) {
-      if (v?.situacao === 'I' || v?.situacao === 'E') continue;
-      extractImagesFromSingleObject(v, fallbackUrls, true);
-    }
-  }
-
-  return fallbackUrls.filter(u => !isExpiredPresignedUrl(u));
+  return highResUrls.filter(
+    (u) => !isThumbnailLikeUrl(u) && !isPlaceholderImageUrl(u) && !isExpiredPresignedUrl(u)
+  );
 }
 
 function replaceWithIncomingImages(incoming: string[]): string[] {
   const cleanedIncoming = incoming
     .map(u => stripResizeAndCompressionParams(u))
-    .filter(img => Boolean(img) && !isPlaceholderImageUrl(img) && !isExpiredPresignedUrl(img));
+    .filter(img => Boolean(img) && !isPlaceholderImageUrl(img) && !isExpiredPresignedUrl(img) && !isThumbnailLikeUrl(img));
 
-  const incomingHasFullRes = cleanedIncoming.some(u => !isThumbnailLikeUrl(u));
   const result: string[] = [];
   const seenKeys = new Set<string>();
   for (const img of cleanedIncoming) {
-    if (incomingHasFullRes && isThumbnailLikeUrl(img)) continue;
     const key = getCanonicalImageKey(img);
     if (!seenKeys.has(key)) {
       seenKeys.add(key);
@@ -515,8 +491,8 @@ export function applyImageRecordToStore(
 ): boolean {
   if (!images || images.length === 0) return false;
   const validImages = images
-    .map(u => normalizeImageUrl(u, true))
-    .filter((u): u is string => Boolean(u) && !isPlaceholderImageUrl(u!) && !isExpiredPresignedUrl(u!));
+    .map(u => normalizeImageUrl(u))
+    .filter((u): u is string => Boolean(u) && !isPlaceholderImageUrl(u!) && !isExpiredPresignedUrl(u!) && !isThumbnailLikeUrl(u!));
 
   const replaced = replaceWithIncomingImages(validImages);
   if (replaced.length === 0) return false;
@@ -568,12 +544,11 @@ export function getBlingImagesForProduct(product: Partial<Product> | any): strin
         typeof u === 'string' &&
         u.trim().length > 0 &&
         !isPlaceholderImageUrl(u) &&
-        !isExpiredPresignedUrl(u)
+        !isExpiredPresignedUrl(u) &&
+        !isThumbnailLikeUrl(u)
       )
       .map(u => stripResizeAndCompressionParams(u));
-    if (cleaned.length === 0) return null;
-    const fullRes = cleaned.filter(u => !isThumbnailLikeUrl(u));
-    return fullRes.length > 0 ? fullRes : cleaned;
+    return cleaned.length > 0 ? cleaned : null;
   };
 
   // 1. By SKU
@@ -652,46 +627,58 @@ export function applyBlingImageOverrides<T extends { images?: string[]; [key: st
 
     const realImagesRaw = getBlingImagesForProduct(product);
     const realImages = realImagesRaw ? replaceWithIncomingImages(realImagesRaw) : null;
+
+    let chosenImages = existingClean;
     if (realImages && realImages.length > 0) {
       if (options?.preferStore) {
-        return {
-          ...product,
-          images: realImages,
-        };
+        chosenImages = realImages;
+      } else {
+        const realCanonicalSet = new Set(realImages.map(getCanonicalImageKey));
+        const existingHasNewLivePhoto = existingFullRes.some(
+          (u) => !realCanonicalSet.has(getCanonicalImageKey(u))
+        );
+
+        if (existingHasNewLivePhoto || product._liveDetailFetched) {
+          chosenImages = existingFullRes.length > 0 ? existingFullRes : realImages;
+        } else if (existingFullRes.length === 1 && realImages.length > 1) {
+          chosenImages = realImages;
+        } else if (existingFullRes.length > 0) {
+          chosenImages = existingFullRes;
+        } else {
+          chosenImages = realImages;
+        }
       }
-
-      const realCanonicalSet = new Set(realImages.map(getCanonicalImageKey));
-      const existingHasNewLivePhoto = existingFullRes.some(
-        (u) => !realCanonicalSet.has(getCanonicalImageKey(u))
-      );
-
-      if (existingHasNewLivePhoto || product._liveDetailFetched) {
-        return {
-          ...product,
-          images: existingFullRes.length > 0 ? existingFullRes : realImages,
-        };
-      }
-
-      if (existingFullRes.length === 1 && realImages.length > 1) {
-        return {
-          ...product,
-          images: realImages,
-        };
-      }
-
-      if (existingFullRes.length > 0) {
-        return {
-          ...product,
-          images: existingFullRes,
-        };
-      }
-
-      return {
-        ...product,
-        images: realImages,
-      };
     }
-    return existingClean.length > 0 ? { ...product, images: existingClean } : product;
+
+    const updatedVariantsList = Array.isArray(product.variantsList)
+      ? product.variantsList.map((v: any) => {
+          const vStoreImgs = getBlingImagesForProduct({
+            sku: v?.sku,
+            blingId: v?.id ? String(v.id) : undefined,
+          });
+          const vExistingClean = replaceWithIncomingImages([
+            ...(Array.isArray(v?.images) ? v.images : []),
+            ...(v?.image ? [v.image] : []),
+          ]);
+          const nextVImgs =
+            vStoreImgs && vStoreImgs.length > 0
+              ? vStoreImgs
+              : vExistingClean.length > 0
+              ? vExistingClean
+              : chosenImages;
+          return {
+            ...v,
+            ...(nextVImgs[0] ? { image: nextVImgs[0] } : {}),
+            ...(nextVImgs.length > 0 ? { images: nextVImgs } : {}),
+          };
+        })
+      : product.variantsList;
+
+    return {
+      ...product,
+      images: chosenImages,
+      ...(updatedVariantsList ? { variantsList: updatedVariantsList } : {}),
+    };
   });
 }
 
@@ -769,7 +756,7 @@ export async function syncImagesFromBling(options?: {
     let blingCount = 0;
     let detailedFetched = 0;
     let prunedDeletedCount = 0;
-    const maxDetailFetches = options?.maxDetailFetches ?? (bypassCache ? 200 : 45);
+    const maxDetailFetches = options?.maxDetailFetches ?? (bypassCache ? 200 : 120);
 
     if (isBlingDailyQuotaExceeded()) {
       const totalWithImages = Object.keys(store.bySku).length + Object.keys(store.byName).length;
@@ -859,7 +846,7 @@ export async function syncImagesFromBling(options?: {
 
       for (const item of allItems) {
         const summaryExtracted = extractImagesFromBlingItem(item);
-        const summarySignature = summaryExtracted.map(getCanonicalImageKey).slice(0, 3).join('|');
+        const summarySignature = getBlingSummaryMediaSignature(item);
         const idStr = item.id ? String(item.id) : '';
         const prevSignature = idStr ? store.summaryKeyById[idStr] : '';
         const summaryChanged = Boolean(idStr && summarySignature && prevSignature && summarySignature !== prevSignature);
@@ -935,7 +922,9 @@ export async function syncImagesFromBling(options?: {
       };
 
       const nowTs = Date.now();
-      const allTargets = Array.from(detailTargetMap.values());
+      const allTargets = Array.from(detailTargetMap.values()).filter(
+        (t) => !isExcludedCatalogItem({ name: t?.nome, integration: { sku: t?.codigo } })
+      );
       const missingOrStaleTargets = allTargets.filter((t) => {
         if (changedSummaryIds.has(Number(t.id))) return true;
         if (!hasFullResInStore(t)) {
@@ -973,8 +962,10 @@ export async function syncImagesFromBling(options?: {
 
       for (let idx = 0; idx < detailTargets.length; idx++) {
         if (isBlingDailyQuotaExceeded()) break;
-        while (catalogFetchInProgress) {
-          await sleep(300);
+        let waitedMs = 0;
+        while (catalogFetchInProgress && waitedMs < 2000) {
+          await sleep(150);
+          waitedMs += 150;
         }
         const item = detailTargets[idx];
         try {

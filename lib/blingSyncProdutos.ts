@@ -214,6 +214,13 @@ function isThumbnailLikeUrl(url: string): boolean {
   return false;
 }
 
+const SYNC_RESIZE_QUERY_PARAMS = new Set([
+  'w', 'h', 'width', 'height', 'max-w', 'max-h', 'maxwidth', 'maxheight',
+  'size', 'resize', 'quality', 'q', 'auto', 'fit', 'crop', 'dpr',
+  'compress', 'compression', 'format', 'fm', 'fl', 'scale',
+  'thumb', 'thumbnail', 'mini', 'miniatura', 'mode', 'blur', 'pixel', 'opt', 'optimize',
+]);
+
 function cleanBlingImageUrl(url?: string): string {
   const raw = String(url || '').trim();
   if (!raw || isPlaceholderImageUrl(raw) || isExpiredPresignedUrl(raw)) return '';
@@ -223,10 +230,14 @@ function cleanBlingImageUrl(url?: string): string {
   }
   try {
     const parsed = new URL(raw);
-    for (const key of ['w', 'h', 'width', 'height', 'size', 'quality', 'q', 'resize', 'fit', 'thumb', 'mini']) {
-      parsed.searchParams.delete(key);
+    let mutated = false;
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (SYNC_RESIZE_QUERY_PARAMS.has(key.toLowerCase())) {
+        parsed.searchParams.delete(key);
+        mutated = true;
+      }
     }
-    return parsed.toString();
+    return mutated ? parsed.toString() : raw;
   } catch {
     return raw;
   }
@@ -342,19 +353,34 @@ function pickBestSingleImage(
   return cleanIn || cleanEx || '';
 }
 
-function extractAllImageUrls(item: BlingProdutoRaw): string[] {
-  const highRes: string[] = [];
-  const thumbs: string[] = [];
-  const seenHighRes = new Set<string>();
-  const seenThumbs = new Set<string>();
-
-  const pushUrl = (raw: string | undefined, target: string[], seenSet: Set<string>) => {
+function extractSummarySignatureKeys(item: BlingProdutoRaw): string[] {
+  const keys: string[] = [];
+  const pushKey = (raw?: string) => {
     const cleaned = cleanBlingImageUrl(raw);
     if (!cleaned) return;
+    const k = getCanonicalImageKey(cleaned);
+    if (k && !keys.includes(k)) keys.push(k);
+  };
+  const internas = Array.isArray(item.midia?.imagens?.internas) ? item.midia!.imagens!.internas! : [];
+  const externas = Array.isArray(item.midia?.imagens?.externas) ? item.midia!.imagens!.externas! : [];
+  for (const entry of [...internas, ...externas]) {
+    pushKey(entry?.link || entry?.url);
+  }
+  pushKey(item.imagemURL);
+  return keys;
+}
+
+function extractAllImageUrls(item: BlingProdutoRaw): string[] {
+  const highRes: string[] = [];
+  const seenHighRes = new Set<string>();
+
+  const pushUrl = (raw: string | undefined) => {
+    const cleaned = cleanBlingImageUrl(raw);
+    if (!cleaned || isThumbnailLikeUrl(cleaned)) return;
     const key = getCanonicalImageKey(cleaned);
-    if (key && !seenSet.has(key)) {
-      seenSet.add(key);
-      target.push(cleaned);
+    if (key && !seenHighRes.has(key)) {
+      seenHighRes.add(key);
+      highRes.push(cleaned);
     }
   };
 
@@ -368,26 +394,15 @@ function extractAllImageUrls(item: BlingProdutoRaw): string[] {
   for (const entry of [...internas, ...externas]) {
     const full = entry?.link || entry?.url;
     if (full) {
-      if (isThumbnailLikeUrl(full)) {
-        pushUrl(full, thumbs, seenThumbs);
-      } else {
-        pushUrl(full, highRes, seenHighRes);
-      }
-    }
-    if (entry?.linkMiniatura) {
-      pushUrl(entry.linkMiniatura, thumbs, seenThumbs);
+      pushUrl(full);
     }
   }
 
   if (item.imagemURL) {
-    if (isThumbnailLikeUrl(item.imagemURL)) {
-      pushUrl(item.imagemURL, thumbs, seenThumbs);
-    } else {
-      pushUrl(item.imagemURL, highRes, seenHighRes);
-    }
+    pushUrl(item.imagemURL);
   }
 
-  return highRes.length > 0 ? highRes : thumbs;
+  return highRes;
 }
 
 export interface InMemoryImageStoreSnapshot {
@@ -662,9 +677,9 @@ export async function syncBlingProdutosPageToFirestore(
     const stock = readStockWithLog(item);
     const price = Number(item.preco || 0);
     const directItemImgs = extractAllImageUrls(item);
-    for (const rawUrl of directItemImgs) {
-      if (!group.summaryRawUrls.includes(rawUrl)) {
-        group.summaryRawUrls.push(rawUrl);
+    for (const rawKey of extractSummarySignatureKeys(item)) {
+      if (!group.summaryRawUrls.includes(rawKey)) {
+        group.summaryRawUrls.push(rawKey);
       }
     }
     const itemImgs = mergeImages([], directItemImgs);
@@ -698,9 +713,9 @@ export async function syncBlingProdutosPageToFirestore(
           const vStock = readStockWithLog(v);
           const vPrice = Number(v.preco || price || 0);
           const vImgs = extractAllImageUrls(v);
-          for (const rawUrl of vImgs) {
-            if (!group.summaryRawUrls.includes(rawUrl)) {
-              group.summaryRawUrls.push(rawUrl);
+          for (const rawKey of extractSummarySignatureKeys(v)) {
+            if (!group.summaryRawUrls.includes(rawKey)) {
+              group.summaryRawUrls.push(rawKey);
             }
           }
           const vImg = vImgs[0] || primaryImg;
@@ -793,6 +808,16 @@ export async function syncBlingProdutosPageToFirestore(
       .filter((g) => {
         if (g.deletedInBling) return false;
         const existingData = existingByDocId.get(g.docId);
+        if (
+          isExcludedCatalogItem({
+            name: String(g.nome || existingData?.nome || ''),
+            integration: { sku: String(g.codigo || existingData?.codigo || '') },
+            category: String(g.categoriaStore || existingData?.categoriaStore || ''),
+            subcategory: String(g.subcategoriaStore || existingData?.subcategoriaStore || ''),
+          })
+        ) {
+          return false;
+        }
         const prevSummaryKey = typeof existingData?.summaryImageKey === 'string' ? existingData.summaryImageKey : '';
         const summaryChanged = Boolean(g.summaryImageKey && prevSummaryKey && g.summaryImageKey !== prevSummaryKey);
         const lastChecked = Number(existingData?.detailCheckedAt || 0);
@@ -819,7 +844,7 @@ export async function syncBlingProdutosPageToFirestore(
         return aChecked - bChecked;
       });
 
-    const maxToEnrich = forceRefresh ? (process.env.VERCEL ? 20 : 45) : (process.env.VERCEL ? 18 : 30);
+    const maxToEnrich = forceRefresh ? (process.env.VERCEL ? 25 : 100) : (process.env.VERCEL ? 20 : 60);
     const targets = candidates.slice(0, maxToEnrich);
     const CONCURRENCY = 1;
 
@@ -1003,20 +1028,25 @@ export async function syncBlingProdutosPageToFirestore(
       );
       const shouldReplaceRemote = Boolean(group.replaceRemoteImages || summaryChanged || forceRefresh || group.hasParentRecord);
 
-      const mergedImagens = mergeImagesSafe(group.imagens, [], { replaceRemoteBling: true });
-      const mergedImagemURL = mergedImagens[0] || cleanBlingImageUrl(group.imagemURL) || '';
+      const mergedImagens = mergeImagesSafe(group.imagens, [], { replaceRemoteBling: true }).filter(
+        (u) => !isThumbnailLikeUrl(u)
+      );
+      const mergedImagemURL = mergedImagens[0] || (group.imagemURL && !isThumbnailLikeUrl(group.imagemURL) ? cleanBlingImageUrl(group.imagemURL) : '') || '';
 
       if (mergedImagemURL) {
         for (const vKey of Object.keys(mergedVariacoes)) {
-          if (getImageQualityTier(mergedVariacoes[vKey].imagemURL) < 0) {
+          if (getImageQualityTier(mergedVariacoes[vKey].imagemURL) < 2) {
             mergedVariacoes[vKey].imagemURL = mergedImagemURL;
           }
         }
       }
 
+      const existingHasFullRes = Array.isArray(existingData?.imagens)
+        ? (existingData.imagens as string[]).some((u) => getImageQualityTier(u) >= 2 && !isExpiredPresignedUrl(u))
+        : false;
       const shouldUpdateImages =
         group.replaceRemoteImages ||
-        (mergedImagens.length > 0 && (group.hasParentRecord || shouldReplaceRemote || !existingData));
+        (mergedImagens.length > 0 && (group.hasParentRecord || shouldReplaceRemote || !existingData || !existingHasFullRes));
 
       const existingSizes = Array.isArray(existingData?.tamanhos)
         ? (existingData.tamanhos as string[]).filter((s) => typeof s === 'string' && s.trim() !== '')
@@ -1365,14 +1395,11 @@ export async function syncImageStoreToFirestore(imageSeed?: InMemoryImageStoreSn
       }
     }
 
-    const replaced = mergeImagesSafe(
-      candidatePools.filter((u) => getImageQualityTier(u) >= 2),
+    const activeImages = mergeImagesSafe(
+      candidatePools.filter((u) => getImageQualityTier(u) >= 2 && !isThumbnailLikeUrl(u)),
       [],
       { replaceRemoteBling: true }
     );
-    const activeImages = replaced.length > 0
-      ? replaced
-      : mergeImagesSafe(candidatePools, [], { replaceRemoteBling: true });
     if (activeImages.length === 0) return;
 
     const existingImagens = Array.isArray(d.imagens)

@@ -611,14 +611,31 @@ const FRONTEND_RESIZE_PARAMS = new Set([
   'height',
   'max-w',
   'max-h',
+  'maxwidth',
+  'maxheight',
   'size',
   'resize',
   'quality',
   'q',
+  'auto',
   'fit',
+  'crop',
+  'dpr',
+  'compress',
+  'compression',
+  'format',
+  'fm',
+  'fl',
+  'scale',
   'thumb',
+  'thumbnail',
   'mini',
   'miniatura',
+  'mode',
+  'blur',
+  'pixel',
+  'opt',
+  'optimize',
 ]);
 
 export function cleanHighResImageUrl(url?: string): string {
@@ -626,12 +643,14 @@ export function cleanHighResImageUrl(url?: string): string {
   if (!raw || raw.startsWith('data:image') || raw.startsWith('/')) return raw;
   try {
     const parsed = new URL(raw);
+    let mutated = false;
     for (const k of Array.from(parsed.searchParams.keys())) {
       if (FRONTEND_RESIZE_PARAMS.has(k.toLowerCase())) {
         parsed.searchParams.delete(k);
+        mutated = true;
       }
     }
-    return parsed.toString();
+    return mutated ? parsed.toString() : raw;
   } catch {
     return raw;
   }
@@ -801,7 +820,11 @@ export function getImagesForColor(
 
   const resolved = sortPreferredProductImages(fromMap, fromVars);
   if (resolved.length > 0) {
-    return resolved;
+    const resolvedHasFull = resolved.some((u) => !isLowResThumbnailUrl(u));
+    const baseHasFull = baseProductImages.some((u) => !isLowResThumbnailUrl(u));
+    if (resolvedHasFull || !baseHasFull) {
+      return resolved;
+    }
   }
 
   if (otherColorCanonicalKeys.size > 0) {

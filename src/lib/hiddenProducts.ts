@@ -210,6 +210,21 @@ export function isExcludedCatalogItem(product: Partial<Product> | any): boolean 
     return true;
   }
 
+  // 13f. Suéter Importado
+  if (/\bsueter\s+importad[ao]\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 13g. Oversized Lisa (inclui Oversized Lisa e Oversized Lisa Suedine; preserva Camiseta Chronic Lisa e Oversized estampadas)
+  if (/\boversized\s+lisa\b/i.test(allCatalogText)) {
+    return true;
+  }
+
+  // 13h. Boné Anth Co
+  if (/\b(?:bone[\s_-]*)?anth[\s._-]*co\b/i.test(allCatalogText)) {
+    return true;
+  }
+
   // 14. Chronic multi color e Camisetas Chronic / Tripside originais multi-cor
   const isChronic = /\bchronic\b/i.test(allCatalogText);
   const isMultiColor = /\b(multi[\s-]*(?:cor(?:es)?|color(?:ido|ida|s)?)|multicolor(?:ido|ida)?)\b/i.test(allCatalogText);

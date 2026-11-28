@@ -296,16 +296,19 @@ export function CatalogSection({
       const existingFp = firestoreByKey.get(key);
       const apiSorted = sortPreferredProductImages(ap.images);
       const apiHasGood = apiSorted.some((u) => !isLowResOrBrokenImage(u));
-      if (apiHasGood || !existingFp || isCatalogLive) {
+      const fpSorted = existingFp ? sortPreferredProductImages(existingFp.images) : [];
+      const fpHasGood = fpSorted.some((u) => !isLowResOrBrokenImage(u));
+
+      if (apiHasGood || !fpHasGood) {
         mergedByKey.set(key, {
           ...ap,
           images: apiSorted.length > 0 ? apiSorted : ap.images,
         });
       } else {
-        const fpSorted = sortPreferredProductImages(existingFp.images);
         mergedByKey.set(key, {
           ...ap,
-          images: fpSorted.length > 0 ? fpSorted : apiSorted,
+          images: fpSorted,
+          ...(existingFp?.colorImages ? { colorImages: existingFp.colorImages } : {}),
         });
       }
     }

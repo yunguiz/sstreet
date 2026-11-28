@@ -72,7 +72,7 @@ export function ProductCard({
           candidates={activeImages}
           priority={priority}
           alt={product.name}
-          className={`w-full h-full object-cover object-center group-hover:scale-[1.03] transition-transform duration-300 ease-out [backface-visibility:hidden] ${
+          className={`w-full h-full object-cover object-center group-hover:scale-[1.03] transition-transform duration-300 ease-out ${
             isOutOfStock ? 'grayscale-[40%] contrast-90' : ''
           }`}
         />
@@ -82,7 +82,7 @@ export function ProductCard({
 
         {/* Out of Stock Darkened Overlay & Badge */}
         {isOutOfStock && (
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-[1px] flex flex-col items-center justify-center p-2 z-10 pointer-events-none">
+          <div className="absolute inset-0 bg-black/65 flex flex-col items-center justify-center p-2 z-10 pointer-events-none">
             <div className="px-2.5 py-1 rounded-md bg-black/90 border border-red-700/80 text-[#E50914] font-black text-[10px] sm:text-xs uppercase tracking-widest shadow-xl text-center font-oswald">
               SEM ESTOQUE
             </div>
